@@ -7,7 +7,7 @@ name = "diarize"
 version = "0.1.0"
 description = "Pure Python WhisperX diarization to Obsidian markdown"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 dependencies = [
   "whisperx==3.8.*",
   "mlx-whisper>=0.4.2; platform_system == 'Darwin' and platform_machine == 'arm64'",

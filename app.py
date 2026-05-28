@@ -20,12 +20,12 @@ import importlib
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
-
 
 HERE = Path(__file__).resolve().parent
 
@@ -82,11 +82,7 @@ def default_config_path() -> Path:
         return Path.home() / ".config" / "diarize" / "config.json"
     if sys.platform == "darwin":
         return (
-            Path.home()
-            / "Library"
-            / "Application Support"
-            / "diarize"
-            / "config.json"
+            Path.home() / "Library" / "Application Support" / "diarize" / "config.json"
         )
     if os.name == "nt":
         appdata = os.environ.get("APPDATA")
@@ -124,7 +120,10 @@ def save_config_data(config_path: Path, data: dict[str, Any]) -> None:
 
 
 def prompt_for_required_config(
-    config_path: Path, data: dict[str, Any], require_hf_token: bool
+    config_path: Path,
+    data: dict[str, Any],
+    require_hf_token: bool,
+    non_interactive: bool = False,
 ) -> dict[str, Any]:
     required = list(REQUIRED_ALWAYS)
     if require_hf_token:
@@ -140,6 +139,14 @@ def prompt_for_required_config(
         current = str(data.get(key, "")).strip()
         if current:
             continue
+
+        if non_interactive:
+            print(
+                f"!! Required config missing: {key} — cannot proceed"
+                " non-interactively.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
 
         print(f"\n==> Required config missing: {key}")
         while True:
@@ -218,7 +225,9 @@ def load_speaker_mapping(path: Path) -> dict[str, str]:
         return {}
     if not isinstance(data, dict):
         return {}
-    return {k: v for k, v in data.items() if not k.startswith("_") and isinstance(v, str)}
+    return {
+        k: v for k, v in data.items() if not k.startswith("_") and isinstance(v, str)
+    }
 
 
 def save_speaker_mapping(path: Path, mapping: dict[str, str]) -> None:
@@ -333,10 +342,15 @@ def run_whisperx(wav_path: Path, cfg: AppConfig, out_dir: Path) -> None:
 
 
 def is_apple_silicon() -> bool:
-    return sys.platform == "darwin" and platform.machine().lower() in {"arm64", "aarch64"}
+    return sys.platform == "darwin" and platform.machine().lower() in {
+        "arm64",
+        "aarch64",
+    }
 
 
-def _segment_overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
+def _segment_overlap(
+    a_start: float, a_end: float, b_start: float, b_end: float
+) -> float:
     return max(0.0, min(a_end, b_end) - max(a_start, b_start))
 
 
@@ -368,7 +382,9 @@ def run_mlx_whisper_pipeline(wav_path: Path, cfg: AppConfig, out_dir: Path) -> N
         ) from err
 
     if not cfg.hf_token.strip():
-        raise RuntimeError("hf_token is required for diarization when using mlx-whisper.")
+        raise RuntimeError(
+            "hf_token is required for diarization when using mlx-whisper."
+        )
 
     print("==> Running mlx-whisper (Apple Silicon)")
     print(f"    model: {cfg.mlx_model}")
@@ -486,7 +502,9 @@ def run_mlx_whisper_pipeline(wav_path: Path, cfg: AppConfig, out_dir: Path) -> N
     vtt_path.write_text("\n".join(vtt_lines).rstrip() + "\n")
 
 
-def run_transcription_and_diarization(wav_path: Path, cfg: AppConfig, out_dir: Path) -> None:
+def run_transcription_and_diarization(
+    wav_path: Path, cfg: AppConfig, out_dir: Path
+) -> None:
     prefer_mlx = cfg.use_mlx_whisper_on_apple_silicon and is_apple_silicon()
     if prefer_mlx:
         try:
@@ -512,14 +530,112 @@ def load_segments(json_path: Path) -> list[dict[str, Any]]:
     return segments
 
 
-def prompt_for_speakers(detected: list[str], existing: dict[str, str]) -> dict[str, str]:
+def _extract_json(text: str) -> Any:
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if m:
+        return json.loads(m.group(1))
+    m = re.search(r"\{[^{}]*\}", text, re.DOTALL)
+    if m:
+        return json.loads(m.group(0))
+    raise ValueError("No JSON object found in Claude response")
+
+
+def guess_speakers_with_claude(
+    detected: list[str], segments: list[dict[str, Any]]
+) -> dict[str, str]:
+    lines: list[str] = []
+    for seg in segments[:120]:
+        label = str(seg.get("speaker") or "UNKNOWN")
+        text = str(seg.get("text") or "").strip()
+        if text:
+            lines.append(f"{fmt_ts(seg.get('start'))} {label}: {text}")
+
+    prompt = (
+        "The following is an excerpt from a diarized transcript. "
+        f"Speaker labels present: {', '.join(detected)}.\n"
+        "Based on any names, titles, or context clues in the transcript, "
+        "guess the real name of each speaker. "
+        "If you cannot determine a real name, use a short descriptive label "
+        "(e.g. 'Facilitator', 'Presenter', 'Participant 1').\n\n"
+        "Return ONLY a valid JSON object mapping each label to a guessed name. "
+        "No other text, no markdown.\n\n"
+        "Transcript excerpt:\n" + "\n".join(lines)
+    )
+
+    print("==> Asking Claude to guess speaker names...")
+    try:
+        result = subprocess.run(
+            ["claude", "-p", prompt],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
+        )
+    except FileNotFoundError as err:
+        raise RuntimeError("'claude' not found in PATH") from err
+    except subprocess.TimeoutExpired as err:
+        raise RuntimeError("Claude CLI timed out") from err
+    except subprocess.CalledProcessError as err:
+        raise RuntimeError(f"Claude CLI exited {err.returncode}") from err
+
+    try:
+        mapping = _extract_json(result.stdout)
+        if not isinstance(mapping, dict):
+            raise ValueError("Response was not a JSON object")
+    except (json.JSONDecodeError, ValueError) as err:
+        raise RuntimeError(f"Could not parse Claude response: {err}") from err
+
+    guesses = {k: str(v) for k, v in mapping.items() if k in detected}
+    if guesses:
+        print("    Guesses:")
+        for label, name in sorted(guesses.items()):
+            print(f"      {label} -> {name}")
+    return guesses
+
+
+def prompt_for_speakers(
+    detected: list[str],
+    existing: dict[str, str],
+    segments: list[dict[str, Any]],
+    transcript_path: Path | None = None,
+    non_interactive: bool = False,
+) -> dict[str, str]:
     print("\n==> Speaker labeling")
-    print("Enter a display name for each detected speaker label.")
-    print("Press Enter to keep current/default value shown in brackets.")
+    if transcript_path and transcript_path.exists():
+        print(f"    Full transcript: {transcript_path}")
+
+    speaker_segs: dict[str, list[dict[str, Any]]] = {}
+    for seg in segments:
+        label = str(seg.get("speaker") or "UNKNOWN")
+        if str(seg.get("text") or "").strip():
+            speaker_segs.setdefault(label, []).append(seg)
+
+    sample: dict[str, str] = {}
+    for label, segs in speaker_segs.items():
+        pick = segs[len(segs) // 3]
+        sample[label] = (
+            f"{fmt_ts(pick.get('start'))} {str(pick.get('text') or '').strip()}"
+        )
 
     result = dict(existing)
+    if non_interactive:
+        for label in detected:
+            if label not in result:
+                result[label] = label
+            print(f"  {label} -> {result[label]}")
+        return result
+
+    print("Enter a display name for each detected speaker label.")
+    print("Press Enter to keep current/default value shown in brackets.")
     for label in detected:
         default = existing.get(label, label)
+        if label in sample:
+            print(f"\n  Example: {sample[label]}")
         while True:
             typed = input(f"  {label} [{default}]: ").strip()
             chosen = typed or default
@@ -588,6 +704,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Skip WhisperX run and only relabel from existing JSON output",
     )
+    parser.add_argument(
+        "--claude-guess",
+        action="store_true",
+        help="Ask the Claude CLI to guess speaker names from the transcript",
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Non-interactive: accept all defaults without prompting",
+    )
     return parser.parse_args(argv[1:])
 
 
@@ -601,6 +728,7 @@ def main(argv: list[str]) -> int:
         cfg_path,
         data,
         require_hf_token=not args.skip_whisperx,
+        non_interactive=args.yes,
     )
     save_config_data(cfg_path, data)
     cfg = load_config(cfg_path)
@@ -624,7 +752,18 @@ def main(argv: list[str]) -> int:
     detected = sorted({str(seg.get("speaker") or "UNKNOWN") for seg in segments})
 
     existing_map = load_speaker_mapping(speakers_path)
-    updated_map = prompt_for_speakers(detected, existing_map)
+    if args.claude_guess:
+        guesses = guess_speakers_with_claude(detected, segments)
+        for label, name in guesses.items():
+            if label not in existing_map:
+                existing_map[label] = name
+    updated_map = prompt_for_speakers(
+        detected,
+        existing_map,
+        segments,
+        out_dir / f"{wav_path.stem}.txt",
+        non_interactive=args.yes,
+    )
     save_speaker_mapping(speakers_path, updated_map)
 
     blocks = coalesce_segments(segments, updated_map)
