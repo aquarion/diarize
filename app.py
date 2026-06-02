@@ -50,6 +50,7 @@ class AppConfig:
     vault_path: str
     vault_subdir: str
     vault_filename_template: str
+    extra_path: list[str]
 
 
 DEFAULTS: dict[str, Any] = {
@@ -71,6 +72,7 @@ DEFAULTS: dict[str, Any] = {
     "vault_path": "~/Obsidian",
     "vault_subdir": "Transcripts",
     "vault_filename_template": "{audio_stem}.md",
+    "extra_path": [],
 }
 
 REQUIRED_ALWAYS: tuple[str, ...] = ("vault_path",)
@@ -205,6 +207,7 @@ def load_config(config_path: Path) -> AppConfig:
         vault_path=str(merged["vault_path"]),
         vault_subdir=str(merged["vault_subdir"]),
         vault_filename_template=str(merged["vault_filename_template"]),
+        extra_path=[str(p) for p in merged.get("extra_path", [])],
     )
 
 
@@ -737,6 +740,11 @@ def main(argv: list[str]) -> int:
     )
     save_config_data(cfg_path, data)
     cfg = load_config(cfg_path)
+
+    if cfg.extra_path:
+        os.environ["PATH"] = (
+            os.pathsep.join(cfg.extra_path) + os.pathsep + os.environ.get("PATH", "")
+        )
 
     wav_path = _resolve_path(HERE, args.wav)
     if not wav_path.exists():

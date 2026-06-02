@@ -55,12 +55,8 @@ Override with:
 python3 app.py /path/to/audio.wav --config /path/to/config.json
 ```
 
-Speaker mapping is stored separately in config-land via `speakers_file`.
-With default settings this becomes:
-
-- Linux: `~/.config/diarize/speakers.json`
-- macOS: `~/Library/Application Support/diarize/speakers.json`
-- Windows: `%APPDATA%/diarize/speakers.json`
+Speaker mapping (`speakers.json`) is stored in each meeting's output directory
+alongside the transcript, so each recording gets its own independent mapping.
 
 ## Runtime Selection
 
@@ -104,17 +100,33 @@ Re-label from existing JSON without rerunning transcription:
 python3 app.py /path/to/audio.wav --skip-whisperx
 ```
 
+Ask Claude CLI to guess speaker names from transcript context (uses calendar/email
+MCP tools if available):
+
+```bash
+python3 app.py /path/to/audio.wav --claude-guess
+```
+
+Accept all defaults non-interactively (useful combined with `--claude-guess`):
+
+```bash
+python3 app.py /path/to/audio.wav --claude-guess --yes
+```
+
 ## Output Layout
 
-For input `my_audio.wav` and default `output_dir` of `./out`:
+For input `my_audio.wav` and default `output_dir` of `./out`, the directory
+is named with the file's creation time to avoid collisions when the same
+filename is reused (e.g. SuperWhisper always outputs `output.wav`):
 
 ```text
-./out/my_audio/
+./out/my_audio_2026-06-02_14-30-00/
   my_audio.json
   my_audio.srt
   my_audio.vtt
   my_audio.txt
   transcript.md
+  speakers.json
 ```
 
 And Obsidian export:
@@ -122,6 +134,19 @@ And Obsidian export:
 ```text
 <vault_path>/<vault_subdir>/my_audio.md
 ```
+
+## PATH Extension
+
+Some tools (e.g. ffmpeg) may need a specific version that isn't on your default
+PATH. Use `extra_path` to prepend directories:
+
+```json
+{
+  "extra_path": ["/opt/homebrew/opt/ffmpeg@7/bin"]
+}
+```
+
+Entries are prepended in order, so they take priority over system PATH.
 
 ## Recommended Accuracy Tuning
 
