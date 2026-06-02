@@ -546,7 +546,7 @@ def _extract_json(text: str) -> Any:
 
 
 def guess_speakers_with_claude(
-    detected: list[str], segments: list[dict[str, Any]]
+    detected: list[str], segments: list[dict[str, Any]], ctime: dt.datetime
 ) -> dict[str, str]:
     lines: list[str] = []
     for seg in segments[:120]:
@@ -555,8 +555,10 @@ def guess_speakers_with_claude(
         if text:
             lines.append(f"{fmt_ts(seg.get('start'))} {label}: {text}")
 
+    ctime_label = ctime.strftime("%Y-%m-%d %H:%M:%S")
     prompt = (
-        "The following is an excerpt from a diarized transcript. "
+        "The following is an excerpt from a diarized transcript of a meeting"
+        " or conversation. "
         f"Speaker labels present: {', '.join(detected)}.\n"
         "Based on any names, titles, or context clues in the transcript, "
         "guess the real name of each speaker. "
@@ -564,6 +566,9 @@ def guess_speakers_with_claude(
         "(e.g. 'Facilitator', 'Presenter', 'Participant 1').\n\n"
         "Return ONLY a valid JSON object mapping each label to a guessed name. "
         "No other text, no markdown.\n\n"
+        "If you have access to a calendar, email, or other context that can"
+        " help you make better guesses, use that information.\n"
+        f"The transcript was created on {ctime_label}.\n\n"
         "Transcript excerpt:\n" + "\n".join(lines)
     )
 
@@ -739,8 +744,13 @@ def main(argv: list[str]) -> int:
         return 2
 
     base_out_dir = _resolve_path(HERE, cfg.output_dir)
-    out_dir = base_out_dir / wav_path.stem
-    speakers_path = _resolve_config_relative(cfg_path, cfg.speakers_file)
+    wav_stat = wav_path.stat()
+    ctime = getattr(wav_stat, "st_birthtime", wav_stat.st_ctime)
+    ctime_dt = dt.datetime.fromtimestamp(ctime)
+    ctime_str = ctime_dt.strftime("%Y-%m-%d_%H-%M-%S")
+    out_dir = base_out_dir / f"{wav_path.stem}_{ctime_str}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    speakers_path = out_dir / Path(cfg.speakers_file).name
     whisper_json = out_dir / f"{wav_path.stem}.json"
 
     if not args.skip_whisperx:
@@ -753,7 +763,7 @@ def main(argv: list[str]) -> int:
 
     existing_map = load_speaker_mapping(speakers_path)
     if args.claude_guess:
-        guesses = guess_speakers_with_claude(detected, segments)
+        guesses = guess_speakers_with_claude(detected, segments, ctime_dt)
         for label, name in guesses.items():
             if label not in existing_map:
                 existing_map[label] = name
