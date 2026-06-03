@@ -30,6 +30,10 @@ from typing import Any, cast
 HERE = Path(__file__).resolve().parent
 
 
+class FatalPipelineError(Exception):
+    """Raised for environment errors that make any diarization path unviable."""
+
+
 @dataclass
 class AppConfig:
     hf_token: str
@@ -51,6 +55,7 @@ class AppConfig:
     vault_subdir: str
     vault_filename_template: str
     extra_path: list[str]
+    extra_lib_path: list[str]
 
 
 DEFAULTS: dict[str, Any] = {
@@ -73,6 +78,7 @@ DEFAULTS: dict[str, Any] = {
     "vault_subdir": "Transcripts",
     "vault_filename_template": "{audio_stem}.md",
     "extra_path": [],
+    "extra_lib_path": [],
 }
 
 REQUIRED_ALWAYS: tuple[str, ...] = ("vault_path",)
@@ -208,6 +214,7 @@ def load_config(config_path: Path) -> AppConfig:
         vault_subdir=str(merged["vault_subdir"]),
         vault_filename_template=str(merged["vault_filename_template"]),
         extra_path=[str(p) for p in merged.get("extra_path", [])],
+        extra_lib_path=[str(p) for p in merged.get("extra_lib_path", [])],
     )
 
 
@@ -389,48 +396,77 @@ def run_mlx_whisper_pipeline(wav_path: Path, cfg: AppConfig, out_dir: Path) -> N
             "hf_token is required for diarization when using mlx-whisper."
         )
 
-    print("==> Running mlx-whisper (Apple Silicon)")
-    print(f"    model: {cfg.mlx_model}")
-    raw = mlx_whisper.transcribe(str(wav_path), path_or_hf_repo=cfg.mlx_model)
-
-    raw_segments = raw.get("segments", []) if isinstance(raw, dict) else []
-    if not isinstance(raw_segments, list) or not raw_segments:
-        raise RuntimeError("mlx-whisper returned no segments.")
-
-    normalized: list[dict[str, Any]] = []
-    for idx, seg in enumerate(raw_segments):
-        if not isinstance(seg, dict):
-            continue
-        text = str(seg.get("text") or "").strip()
-        if not text:
-            continue
-        start = float(seg.get("start", 0.0))
-        end = float(seg.get("end", start))
-        if end <= start:
-            if idx + 1 < len(raw_segments) and isinstance(raw_segments[idx + 1], dict):
-                end = float(raw_segments[idx + 1].get("start", start))
-            if end <= start:
-                end = start + 0.01
-        normalized.append({"start": start, "end": end, "text": text})
-
-    if not normalized:
-        raise RuntimeError("mlx-whisper produced no usable segments.")
-
     try:
         pyannote_audio = importlib.import_module("pyannote.audio")
         pipeline_cls = getattr(pyannote_audio, "Pipeline")
+        pyannote_io = importlib.import_module("pyannote.audio.core.io")
+        if not hasattr(pyannote_io, "AudioDecoder"):
+            raise FatalPipelineError(
+                "pyannote.audio audio decoder failed to load — torchcodec "
+                "could not find ffmpeg shared libraries.\n"
+                "Fix: add the ffmpeg lib directory to extra_lib_path in "
+                "config, e.g.:\n"
+                '  "extra_lib_path": '
+                '["/opt/homebrew/opt/ffmpeg@7/lib"]'
+            )
     except (ImportError, AttributeError) as err:
         raise RuntimeError(
             "pyannote.audio is missing; install whisperx dependencies first."
         ) from err
 
-    print("==> Running pyannote diarization")
-    pretrained_kwargs: dict[str, Any] = {"use_auth_token": cfg.hf_token}
+    print("==> Loading pyannote diarization model")
+    pretrained_kwargs: dict[str, Any] = {"token": cfg.hf_token}
     pipeline = cast(Any, pipeline_cls).from_pretrained(
         "pyannote/speaker-diarization-3.1", **pretrained_kwargs
     )
     if pipeline is None:
         raise RuntimeError("Failed to initialize pyannote diarization pipeline.")
+
+    base_name = wav_path.stem
+    transcription_checkpoint = out_dir / f"{base_name}_transcription.json"
+
+    if transcription_checkpoint.exists():
+        print(f"==> Resuming from transcription checkpoint: {transcription_checkpoint}")
+        checkpoint_data = json.loads(transcription_checkpoint.read_text())
+        normalized = checkpoint_data["segments"]
+        language = checkpoint_data.get("language", cfg.language)
+    else:
+        print("==> Running mlx-whisper (Apple Silicon)")
+        print(f"    model: {cfg.mlx_model}")
+        raw = mlx_whisper.transcribe(str(wav_path), path_or_hf_repo=cfg.mlx_model)
+
+        raw_segments = raw.get("segments", []) if isinstance(raw, dict) else []
+        if not isinstance(raw_segments, list) or not raw_segments:
+            raise RuntimeError("mlx-whisper returned no segments.")
+
+        normalized = []
+        for idx, seg in enumerate(raw_segments):
+            if not isinstance(seg, dict):
+                continue
+            text = str(seg.get("text") or "").strip()
+            if not text:
+                continue
+            start = float(seg.get("start", 0.0))
+            end = float(seg.get("end", start))
+            if end <= start:
+                if idx + 1 < len(raw_segments) and isinstance(
+                    raw_segments[idx + 1], dict
+                ):
+                    end = float(raw_segments[idx + 1].get("start", start))
+                if end <= start:
+                    end = start + 0.01
+            normalized.append({"start": start, "end": end, "text": text})
+
+        if not normalized:
+            raise RuntimeError("mlx-whisper produced no usable segments.")
+
+        language = raw.get("language") if isinstance(raw, dict) else cfg.language
+        transcription_checkpoint.write_text(
+            json.dumps({"segments": normalized, "language": language}, indent=2) + "\n"
+        )
+        print(f"    checkpoint saved: {transcription_checkpoint}")
+
+    print("==> Running pyannote diarization")
 
     diarization = cast(Any, pipeline)(
         str(wav_path),
@@ -438,8 +474,20 @@ def run_mlx_whisper_pipeline(wav_path: Path, cfg: AppConfig, out_dir: Path) -> N
         max_speakers=cfg.max_speakers,
     )
 
+    if hasattr(diarization, "itertracks"):
+        # pyannote <3.x returns Annotation directly
+        annotation = diarization
+    elif hasattr(diarization, "speaker_diarization"):
+        # pyannote 3.x returns DiarizeOutput dataclass
+        annotation = diarization.speaker_diarization
+    else:
+        attrs = [a for a in dir(diarization) if not a.startswith("_")]
+        raise RuntimeError(
+            f"Cannot extract annotation from {type(diarization).__name__}. "
+            f"Available attributes: {attrs}"
+        )
     diar_turns: list[dict[str, Any]] = []
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
+    for turn, _, speaker in annotation.itertracks(yield_label=True):
         diar_turns.append(
             {
                 "start": float(turn.start),
@@ -463,7 +511,6 @@ def run_mlx_whisper_pipeline(wav_path: Path, cfg: AppConfig, out_dir: Path) -> N
                 best_speaker = str(turn["speaker"])
         seg["speaker"] = best_speaker
 
-    base_name = wav_path.stem
     json_path = out_dir / f"{base_name}.json"
     txt_path = out_dir / f"{base_name}.txt"
     srt_path = out_dir / f"{base_name}.srt"
@@ -471,7 +518,7 @@ def run_mlx_whisper_pipeline(wav_path: Path, cfg: AppConfig, out_dir: Path) -> N
 
     payload = {
         "segments": normalized,
-        "language": raw.get("language") if isinstance(raw, dict) else cfg.language,
+        "language": language,
     }
     json_path.write_text(json.dumps(payload, indent=2) + "\n")
     txt_path.write_text("\n".join(seg["text"] for seg in normalized) + "\n")
@@ -513,6 +560,8 @@ def run_transcription_and_diarization(
         try:
             run_mlx_whisper_pipeline(wav_path, cfg, out_dir)
             return
+        except FatalPipelineError:
+            raise
         except (ImportError, RuntimeError, OSError, ValueError, TypeError) as err:
             print("!! mlx-whisper pipeline failed; falling back to WhisperX.")
             print(f"   reason: {err}")
@@ -726,7 +775,35 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv[1:])
 
 
+def _relaunch_with_lib_path(argv: list[str]) -> None:
+    """Re-exec with library path set from the start so dlopen picks it up."""
+    cfg_path = default_config_path()
+    for i, arg in enumerate(argv[1:], 1):
+        if arg == "--config" and i + 1 < len(argv):
+            cfg_path = Path(argv[i + 1]).expanduser()
+            break
+        if arg.startswith("--config="):
+            cfg_path = Path(arg.split("=", 1)[1]).expanduser()
+            break
+    try:
+        data = json.loads(cfg_path.read_text())
+    except Exception:
+        return
+    extra_lib_path = [str(p) for p in data.get("extra_lib_path", [])]
+    if not extra_lib_path:
+        return
+    lib_var = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
+    current_dirs = os.environ.get(lib_var, "").split(os.pathsep)
+    if all(p in current_dirs for p in extra_lib_path):
+        return
+    os.environ[lib_var] = (
+        os.pathsep.join(extra_lib_path) + os.pathsep + os.environ.get(lib_var, "")
+    )
+    os.execv(sys.executable, [sys.executable] + argv)
+
+
 def main(argv: list[str]) -> int:
+    _relaunch_with_lib_path(argv)
     args = parse_args(argv)
 
     cfg_path = _resolve_path(HERE, args.config)
@@ -745,7 +822,6 @@ def main(argv: list[str]) -> int:
         os.environ["PATH"] = (
             os.pathsep.join(cfg.extra_path) + os.pathsep + os.environ.get("PATH", "")
         )
-
     wav_path = _resolve_path(HERE, args.wav)
     if not wav_path.exists():
         print(f"!! Input WAV not found: {wav_path}", file=sys.stderr)
@@ -760,6 +836,16 @@ def main(argv: list[str]) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     speakers_path = out_dir / Path(cfg.speakers_file).name
     whisper_json = out_dir / f"{wav_path.stem}.json"
+
+    try:
+        vault_md = make_vault_target(cfg, wav_path.stem)
+        vault_md.parent.mkdir(parents=True, exist_ok=True)
+    except (KeyError, IndexError) as err:
+        print(f"!! Invalid vault_filename_template: {err}", file=sys.stderr)
+        return 2
+    except OSError as err:
+        print(f"!! Cannot create vault directory: {err}", file=sys.stderr)
+        return 2
 
     if not args.skip_whisperx:
         run_transcription_and_diarization(wav_path, cfg, out_dir)
@@ -791,8 +877,6 @@ def main(argv: list[str]) -> int:
     local_md.parent.mkdir(parents=True, exist_ok=True)
     local_md.write_text(markdown)
 
-    vault_md = make_vault_target(cfg, wav_path.stem)
-    vault_md.parent.mkdir(parents=True, exist_ok=True)
     vault_md.write_text(markdown)
 
     print("\n==> Complete")

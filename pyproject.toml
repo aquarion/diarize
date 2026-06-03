@@ -11,7 +11,11 @@ requires-python = ">=3.10,<3.14"
 dependencies = [
   "whisperx==3.8.*",
   "mlx-whisper>=0.4.2; platform_system == 'Darwin' and platform_machine == 'arm64'",
+  "av (>=17.0.1,<18.0.0)",
 ]
 
 [tool.setuptools]
 py-modules = ["app"]
+
+[tool.poetry]
+package-mode = false

@@ -135,18 +135,22 @@ And Obsidian export:
 <vault_path>/<vault_subdir>/my_audio.md
 ```
 
-## PATH Extension
+## PATH and Library Extension
 
 Some tools (e.g. ffmpeg) may need a specific version that isn't on your default
-PATH. Use `extra_path` to prepend directories:
+PATH. Use `extra_path` to prepend binary directories and `extra_lib_path` to
+prepend shared library directories (sets `DYLD_LIBRARY_PATH` on macOS,
+`LD_LIBRARY_PATH` on Linux):
 
 ```json
 {
-  "extra_path": ["/opt/homebrew/opt/ffmpeg@7/bin"]
+  "extra_path": ["/opt/homebrew/opt/ffmpeg@7/bin"],
+  "extra_lib_path": ["/opt/homebrew/opt/ffmpeg@7/lib"]
 }
 ```
 
-Entries are prepended in order, so they take priority over system PATH.
+This is scoped to the diarize process only, so it won't affect other tools on
+your system. Entries are prepended in order, taking priority over system paths.
 
 ## Recommended Accuracy Tuning
 
