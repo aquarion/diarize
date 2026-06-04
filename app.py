@@ -14,6 +14,7 @@ Configuration is loaded from config.json (or --config).
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import datetime as dt
 import json
 import os
@@ -124,7 +125,7 @@ def main(argv: list[str]) -> int:
     )
     save_config_data(cfg_path, data)
     cfg = load_config(cfg_path)
-    cfg = cfg._replace(num_speakers=args.num_speakers)
+    cfg = dataclasses.replace(cfg, num_speakers=args.num_speakers)
 
     if cfg.extra_path:
         os.environ["PATH"] = (
