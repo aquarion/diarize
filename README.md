@@ -12,7 +12,11 @@ General-purpose audio transcription + diarization utility that:
 
 | File | Purpose |
 | --- | --- |
-| `app.py` | Main CLI utility. |
+| `app.py` | CLI entry point and orchestration. |
+| `config.py` | `AppConfig` dataclass, config load/save, path helpers. |
+| `render.py` | Markdown rendering, vault targeting, terminal output helpers. |
+| `speakers.py` | Speaker mapping, interactive labeling, Claude name guessing. |
+| `transcribe.py` | WhisperX and mlx-whisper+pyannote transcription pipelines. |
 | `pyproject.toml` | Project metadata and dependencies. |
 | `README.md` | Usage and configuration guide. |
 
@@ -35,7 +39,7 @@ pip install -e .
 ## Quickstart
 
 ```bash
-python3 app.py /path/to/audio.wav
+python3 app.py /path/to/audio.wav <num_speakers>
 ```
 
 On first run, the utility creates config automatically and prompts for missing
@@ -97,20 +101,26 @@ Enable mlx-whisper path:
 Re-label from existing JSON without rerunning transcription:
 
 ```bash
-python3 app.py /path/to/audio.wav --skip-whisperx
+python3 app.py /path/to/audio.wav 3 --skip-whisperx
 ```
 
 Ask Claude CLI to guess speaker names from transcript context (uses calendar/email
 MCP tools if available):
 
 ```bash
-python3 app.py /path/to/audio.wav --claude-guess
+python3 app.py /path/to/audio.wav 3 --claude-guess
 ```
 
 Accept all defaults non-interactively (useful combined with `--claude-guess`):
 
 ```bash
-python3 app.py /path/to/audio.wav --claude-guess --yes
+python3 app.py /path/to/audio.wav 3 --claude-guess --yes
+```
+
+Override the vault output path for a specific file:
+
+```bash
+python3 app.py /path/to/audio.wav 3 --vault-output ~/Obsidian/Meetings/standup.md
 ```
 
 ## Output Layout
@@ -154,6 +164,6 @@ your system. Entries are prepended in order, taking priority over system paths.
 
 ## Recommended Accuracy Tuning
 
-- Set `min_speakers` and `max_speakers` as tightly as possible.
+- Pass the exact speaker count as the `num_speakers` argument — pyannote performs best when told precisely how many speakers to find.
 - Keep `language` explicit when known.
 - Review speaker prompts carefully on first pass; mapping is persisted for reuse.
