@@ -55,6 +55,7 @@ DEFAULTS: dict[str, Any] = {
     "vault_filename_template": "{audio_stem}.md",
     "extra_path": [],
     "extra_lib_path": [],
+    "num_speakers": 2,
 }
 
 REQUIRED_ALWAYS: tuple[str, ...] = ("vault_path",)
@@ -189,4 +190,5 @@ def load_config(config_path: Path) -> AppConfig:
         vault_filename_template=str(merged["vault_filename_template"]),
         extra_path=[str(p) for p in merged.get("extra_path", [])],
         extra_lib_path=[str(p) for p in merged.get("extra_lib_path", [])],
+        num_speakers=int(merged.get("num_speakers", 2)),
     )
