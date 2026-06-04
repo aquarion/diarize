@@ -51,15 +51,25 @@ def _extract_json(text: str) -> Any:
     raise ValueError("No JSON object found in Claude response")
 
 
+_CLAUDE_GUESS_CHAR_BUDGET = 2000
+_CLAUDE_GUESS_TIMEOUT = 120
+
+
 def guess_speakers_with_claude(
     detected: list[str], segments: list[dict[str, Any]], ctime: dt.datetime
 ) -> dict[str, str]:
     lines: list[str] = []
-    for seg in segments[:120]:
+    chars = 0
+    for seg in segments:
         label = str(seg.get("speaker") or "UNKNOWN")
         text = str(seg.get("text") or "").strip()
-        if text:
-            lines.append(f"{fmt_ts(seg.get('start'))} {label}: {text}")
+        if not text:
+            continue
+        line = f"{fmt_ts(seg.get('start'))} {label}: {text}"
+        chars += len(line) + 1
+        if chars > _CLAUDE_GUESS_CHAR_BUDGET:
+            break
+        lines.append(line)
 
     ctime_label = ctime.strftime("%Y-%m-%d %H:%M:%S")
     prompt = (
@@ -85,12 +95,13 @@ def guess_speakers_with_claude(
             capture_output=True,
             text=True,
             check=True,
-            timeout=60,
+            timeout=_CLAUDE_GUESS_TIMEOUT,
         )
     except FileNotFoundError as err:
         raise RuntimeError("'claude' not found in PATH") from err
-    except subprocess.TimeoutExpired as err:
-        raise RuntimeError("Claude CLI timed out") from err
+    except subprocess.TimeoutExpired:
+        print("!! Claude CLI timed out — skipping speaker name guesses.")
+        return {}
     except subprocess.CalledProcessError as err:
         raise RuntimeError(f"Claude CLI exited {err.returncode}") from err
 
