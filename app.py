@@ -40,8 +40,6 @@ class AppConfig:
     whisperx_bin: str
     model: str
     language: str
-    min_speakers: int
-    max_speakers: int
     use_mlx_whisper_on_apple_silicon: bool
     mlx_model: str
     use_cuda_if_available: bool
@@ -56,6 +54,7 @@ class AppConfig:
     vault_filename_template: str
     extra_path: list[str]
     extra_lib_path: list[str]
+    num_speakers: int = 2
 
 
 DEFAULTS: dict[str, Any] = {
@@ -63,8 +62,6 @@ DEFAULTS: dict[str, Any] = {
     "whisperx_bin": "whisperx",
     "model": "medium",
     "language": "en",
-    "min_speakers": 5,
-    "max_speakers": 7,
     "use_mlx_whisper_on_apple_silicon": False,
     "mlx_model": "mlx-community/whisper-large-v3-turbo",
     "use_cuda_if_available": True,
@@ -197,8 +194,6 @@ def load_config(config_path: Path) -> AppConfig:
         whisperx_bin=str(merged["whisperx_bin"]),
         model=str(merged["model"]),
         language=str(merged["language"]),
-        min_speakers=int(merged["min_speakers"]),
-        max_speakers=int(merged["max_speakers"]),
         use_mlx_whisper_on_apple_silicon=bool(
             merged["use_mlx_whisper_on_apple_silicon"]
         ),
@@ -216,6 +211,13 @@ def load_config(config_path: Path) -> AppConfig:
         extra_path=[str(p) for p in merged.get("extra_path", [])],
         extra_lib_path=[str(p) for p in merged.get("extra_lib_path", [])],
     )
+
+
+def terminal_link(path: Path) -> str:
+    """Return an OSC 8 hyperlink for ``path`` that macOS Terminal renders as clickable."""
+    url = path.resolve().as_uri()
+    label = str(path)
+    return f"\033]8;;{url}\033\\{label}\033]8;;\033\\"
 
 
 def fmt_ts(seconds: float | None) -> str:
@@ -305,9 +307,9 @@ def _build_whisperx_cmd(
         "--hf_token",
         cfg.hf_token,
         "--min_speakers",
-        str(cfg.min_speakers),
+        str(cfg.num_speakers),
         "--max_speakers",
-        str(cfg.max_speakers),
+        str(cfg.num_speakers),
         "--compute_type",
         compute_type,
         "--batch_size",
@@ -399,6 +401,10 @@ def run_mlx_whisper_pipeline(wav_path: Path, cfg: AppConfig, out_dir: Path) -> N
     try:
         pyannote_audio = importlib.import_module("pyannote.audio")
         pipeline_cls = getattr(pyannote_audio, "Pipeline")
+        pyannote_hook_mod = importlib.import_module(
+            "pyannote.audio.pipelines.utils.hook"
+        )
+        ProgressHook = getattr(pyannote_hook_mod, "ProgressHook")
         pyannote_io = importlib.import_module("pyannote.audio.core.io")
         if not hasattr(pyannote_io, "AudioDecoder"):
             raise FatalPipelineError(
@@ -424,6 +430,7 @@ def run_mlx_whisper_pipeline(wav_path: Path, cfg: AppConfig, out_dir: Path) -> N
 
     base_name = wav_path.stem
     transcription_checkpoint = out_dir / f"{base_name}_transcription.json"
+    diarization_checkpoint = out_dir / f"{base_name}_diarization.json"
 
     if transcription_checkpoint.exists():
         print(f"==> Resuming from transcription checkpoint: {transcription_checkpoint}")
@@ -433,7 +440,9 @@ def run_mlx_whisper_pipeline(wav_path: Path, cfg: AppConfig, out_dir: Path) -> N
     else:
         print("==> Running mlx-whisper (Apple Silicon)")
         print(f"    model: {cfg.mlx_model}")
-        raw = mlx_whisper.transcribe(str(wav_path), path_or_hf_repo=cfg.mlx_model)
+        raw = mlx_whisper.transcribe(
+            str(wav_path), path_or_hf_repo=cfg.mlx_model, verbose=False
+        )
 
         raw_segments = raw.get("segments", []) if isinstance(raw, dict) else []
         if not isinstance(raw_segments, list) or not raw_segments:
@@ -466,35 +475,45 @@ def run_mlx_whisper_pipeline(wav_path: Path, cfg: AppConfig, out_dir: Path) -> N
         )
         print(f"    checkpoint saved: {transcription_checkpoint}")
 
-    print("==> Running pyannote diarization")
-
-    diarization = cast(Any, pipeline)(
-        str(wav_path),
-        min_speakers=cfg.min_speakers,
-        max_speakers=cfg.max_speakers,
-    )
-
-    if hasattr(diarization, "itertracks"):
-        # pyannote <3.x returns Annotation directly
-        annotation = diarization
-    elif hasattr(diarization, "speaker_diarization"):
-        # pyannote 3.x returns DiarizeOutput dataclass
-        annotation = diarization.speaker_diarization
+    if diarization_checkpoint.exists():
+        print(f"==> Resuming from diarization checkpoint: {diarization_checkpoint}")
+        diar_turns: list[dict[str, Any]] = json.loads(
+            diarization_checkpoint.read_text()
+        )
     else:
-        attrs = [a for a in dir(diarization) if not a.startswith("_")]
-        raise RuntimeError(
-            f"Cannot extract annotation from {type(diarization).__name__}. "
-            f"Available attributes: {attrs}"
-        )
-    diar_turns: list[dict[str, Any]] = []
-    for turn, _, speaker in annotation.itertracks(yield_label=True):
-        diar_turns.append(
-            {
-                "start": float(turn.start),
-                "end": float(turn.end),
-                "speaker": str(speaker),
-            }
-        )
+        print("==> Running pyannote diarization")
+
+        with ProgressHook() as hook:
+            diarization = cast(Any, pipeline)(
+                str(wav_path),
+                min_speakers=cfg.num_speakers,
+                max_speakers=cfg.num_speakers,
+                hook=hook,
+            )
+
+        if hasattr(diarization, "itertracks"):
+            # pyannote <3.x returns Annotation directly
+            annotation = diarization
+        elif hasattr(diarization, "speaker_diarization"):
+            # pyannote 3.x returns DiarizeOutput dataclass
+            annotation = diarization.speaker_diarization
+        else:
+            attrs = [a for a in dir(diarization) if not a.startswith("_")]
+            raise RuntimeError(
+                f"Cannot extract annotation from {type(diarization).__name__}. "
+                f"Available attributes: {attrs}"
+            )
+        diar_turns = []
+        for turn, _, speaker in annotation.itertracks(yield_label=True):
+            diar_turns.append(
+                {
+                    "start": float(turn.start),
+                    "end": float(turn.end),
+                    "speaker": str(speaker),
+                }
+            )
+        diarization_checkpoint.write_text(json.dumps(diar_turns, indent=2) + "\n")
+        print(f"    checkpoint saved: {diarization_checkpoint}")
 
     for seg in normalized:
         best_speaker = "UNKNOWN"
@@ -664,7 +683,8 @@ def prompt_for_speakers(
 ) -> dict[str, str]:
     print("\n==> Speaker labeling")
     if transcript_path and transcript_path.exists():
-        print(f"    Full transcript: {transcript_path}")
+        print(f"    Full transcript: {terminal_link(transcript_path)}")
+    print(f"    Detected speakers: {', '.join(sorted(detected))}")
 
     speaker_segs: dict[str, list[dict[str, Any]]] = {}
     for seg in segments:
@@ -672,12 +692,14 @@ def prompt_for_speakers(
         if str(seg.get("text") or "").strip():
             speaker_segs.setdefault(label, []).append(seg)
 
-    sample: dict[str, str] = {}
+    sample: dict[str, list[str]] = {}
     for label, segs in speaker_segs.items():
-        pick = segs[len(segs) // 3]
-        sample[label] = (
+        n = len(segs)
+        picks = [segs[n // 6], segs[n // 2], segs[(5 * n) // 6]]
+        sample[label] = [
             f"{fmt_ts(pick.get('start'))} {str(pick.get('text') or '').strip()}"
-        )
+            for pick in picks
+        ]
 
     result = dict(existing)
     if non_interactive:
@@ -692,7 +714,9 @@ def prompt_for_speakers(
     for label in detected:
         default = existing.get(label, label)
         if label in sample:
-            print(f"\n  Example: {sample[label]}")
+            print(f"\n  Examples:")
+            for s in sample[label]:
+                print(f"    {s}")
         while True:
             typed = input(f"  {label} [{default}]: ").strip()
             chosen = typed or default
@@ -772,6 +796,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Non-interactive: accept all defaults without prompting",
     )
+    parser.add_argument(
+        "--vault-output",
+        metavar="PATH",
+        help="Override the vault destination path for this file (e.g. ~/Obsidian/Meetings/standup.md)",
+    )
+    parser.add_argument(
+        "num_speakers",
+        type=int,
+        help="Number of speakers in the recording",
+    )
     return parser.parse_args(argv[1:])
 
 
@@ -817,6 +851,7 @@ def main(argv: list[str]) -> int:
     )
     save_config_data(cfg_path, data)
     cfg = load_config(cfg_path)
+    cfg = cfg._replace(num_speakers=args.num_speakers)
 
     if cfg.extra_path:
         os.environ["PATH"] = (
@@ -838,7 +873,10 @@ def main(argv: list[str]) -> int:
     whisper_json = out_dir / f"{wav_path.stem}.json"
 
     try:
-        vault_md = make_vault_target(cfg, wav_path.stem)
+        if args.vault_output:
+            vault_md = Path(args.vault_output).expanduser()
+        else:
+            vault_md = make_vault_target(cfg, wav_path.stem)
         vault_md.parent.mkdir(parents=True, exist_ok=True)
     except (KeyError, IndexError) as err:
         print(f"!! Invalid vault_filename_template: {err}", file=sys.stderr)
@@ -881,8 +919,8 @@ def main(argv: list[str]) -> int:
 
     print("\n==> Complete")
     print(f"    speaker map updated: {speakers_path}")
-    print(f"    local transcript    : {local_md}")
-    print(f"    vault transcript    : {vault_md}")
+    print(f"    local transcript    : {terminal_link(local_md)}")
+    print(f"    vault transcript    : {terminal_link(vault_md)}")
     return 0
 
 
