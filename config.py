@@ -15,13 +15,15 @@ class FatalPipelineError(Exception):
 
 @dataclass
 class AppConfig:
+    # Backend selection: "auto" | "whisperx" | "mlx" | "assemblyai"
+    # "auto" uses mlx on Apple Silicon, whisperx elsewhere.
+    backend: str
+    assemblyai_api_key: str
     hf_token: str
     whisperx_bin: str
     model: str
     language: str
-    use_mlx_whisper_on_apple_silicon: bool
     mlx_model: str
-    use_cuda_if_available: bool
     cuda_compute_type: str
     compute_type: str
     batch_size: int
@@ -37,13 +39,13 @@ class AppConfig:
 
 
 DEFAULTS: dict[str, Any] = {
+    "backend": "auto",
+    "assemblyai_api_key": "",
     "hf_token": "",
     "whisperx_bin": "whisperx",
     "model": "medium",
     "language": "en",
-    "use_mlx_whisper_on_apple_silicon": False,
     "mlx_model": "mlx-community/whisper-large-v3-turbo",
-    "use_cuda_if_available": True,
     "cuda_compute_type": "float16",
     "compute_type": "int8",
     "batch_size": 4,
@@ -60,6 +62,7 @@ DEFAULTS: dict[str, Any] = {
 
 REQUIRED_ALWAYS: tuple[str, ...] = ("vault_path",)
 REQUIRED_FOR_WHISPERX: tuple[str, ...] = ("hf_token",)
+REQUIRED_FOR_ASSEMBLYAI: tuple[str, ...] = ("assemblyai_api_key",)
 
 
 def default_config_path() -> Path:
@@ -107,16 +110,21 @@ def save_config_data(config_path: Path, data: dict[str, Any]) -> None:
 def prompt_for_required_config(
     config_path: Path,
     data: dict[str, Any],
-    require_hf_token: bool,
+    skip_transcription: bool = False,
     non_interactive: bool = False,
 ) -> dict[str, Any]:
     required = list(REQUIRED_ALWAYS)
-    if require_hf_token:
-        required.extend(REQUIRED_FOR_WHISPERX)
+    if not skip_transcription:
+        backend = str(data.get("backend", "auto"))
+        if backend == "assemblyai":
+            required.extend(REQUIRED_FOR_ASSEMBLYAI)
+        else:
+            required.extend(REQUIRED_FOR_WHISPERX)
 
     prompts: dict[str, str] = {
         "vault_path": "Obsidian vault path",
         "hf_token": "Hugging Face token",
+        "assemblyai_api_key": "AssemblyAI API key",
     }
 
     changed = False
@@ -170,16 +178,14 @@ def load_config(config_path: Path) -> AppConfig:
     merged = load_config_data(config_path)
 
     return AppConfig(
+        backend=str(merged.get("backend", "auto")),
+        assemblyai_api_key=str(merged.get("assemblyai_api_key", "")),
         hf_token=str(merged["hf_token"]),
         whisperx_bin=str(merged["whisperx_bin"]),
         model=str(merged["model"]),
         language=str(merged["language"]),
-        use_mlx_whisper_on_apple_silicon=bool(
-            merged["use_mlx_whisper_on_apple_silicon"]
-        ),
-        mlx_model=str(merged["mlx_model"]),
-        use_cuda_if_available=bool(merged["use_cuda_if_available"]),
-        cuda_compute_type=str(merged["cuda_compute_type"]),
+        mlx_model=str(merged.get("mlx_model", "mlx-community/whisper-large-v3-turbo")),
+        cuda_compute_type=str(merged.get("cuda_compute_type", "float16")),
         compute_type=str(merged["compute_type"]),
         batch_size=int(merged["batch_size"]),
         output_dir=str(merged["output_dir"]),

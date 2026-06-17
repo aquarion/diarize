@@ -22,7 +22,6 @@ import sys
 from pathlib import Path
 
 from config import (
-    AppConfig,
     _resolve_path,
     default_config_path,
     ensure_default_config,
@@ -73,7 +72,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--vault-output",
         metavar="PATH",
-        help="Override the vault destination path for this file (e.g. ~/Obsidian/Meetings/standup.md)",
+        help="Override the vault destination path for this file"
+        " (e.g. ~/Obsidian/Meetings/standup.md)",
     )
     parser.add_argument(
         "num_speakers",
@@ -120,7 +120,7 @@ def main(argv: list[str]) -> int:
     data = prompt_for_required_config(
         cfg_path,
         data,
-        require_hf_token=not args.skip_whisperx,
+        skip_transcription=args.skip_whisperx,
         non_interactive=args.yes,
     )
     save_config_data(cfg_path, data)
@@ -150,7 +150,7 @@ def main(argv: list[str]) -> int:
         if args.vault_output:
             vault_md = Path(args.vault_output).expanduser()
         else:
-            vault_md = make_vault_target(cfg, wav_path.stem)
+            vault_md = make_vault_target(cfg, f"{ctime_str}_{wav_path.stem}")
         vault_md.parent.mkdir(parents=True, exist_ok=True)
     except (KeyError, IndexError) as err:
         print(f"!! Invalid vault_filename_template: {err}", file=sys.stderr)

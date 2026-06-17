@@ -16,6 +16,7 @@ def has_cuda_available() -> bool:
     torch_mod: Any | None = None
     try:
         import torch  # type: ignore
+
         torch_mod = torch
     except ImportError:
         pass
@@ -42,7 +43,7 @@ def has_cuda_available() -> bool:
 
 
 def resolve_whisperx_runtime(cfg: AppConfig) -> tuple[str | None, str]:
-    if cfg.use_cuda_if_available and has_cuda_available():
+    if has_cuda_available():
         return "cuda", cfg.cuda_compute_type
     return None, cfg.compute_type
 
@@ -147,8 +148,8 @@ def run_mlx_whisper_pipeline(wav_path: Path, cfg: AppConfig, out_dir: Path) -> N
         import mlx_whisper  # type: ignore
     except ImportError as err:
         raise RuntimeError(
-            "mlx-whisper is not installed. Install it, or disable "
-            "use_mlx_whisper_on_apple_silicon."
+            "mlx-whisper is not installed. "
+            "Install it or set backend to 'whisperx' in config."
         ) from err
 
     if not cfg.hf_token.strip():
@@ -327,10 +328,98 @@ def run_mlx_whisper_pipeline(wav_path: Path, cfg: AppConfig, out_dir: Path) -> N
     vtt_path.write_text("\n".join(vtt_lines).rstrip() + "\n")
 
 
+def run_assemblyai_pipeline(wav_path: Path, cfg: AppConfig, out_dir: Path) -> None:
+    try:
+        import assemblyai as aai  # type: ignore
+    except ImportError as err:
+        raise RuntimeError(
+            "assemblyai package is not installed. Run: pip install assemblyai"
+        ) from err
+
+    aai.settings.api_key = cfg.assemblyai_api_key
+
+    transcription_config = aai.TranscriptionConfig(
+        speaker_labels=True,
+        speakers_expected=cfg.num_speakers,
+        language_code=cfg.language,
+    )
+
+    print("==> Running AssemblyAI transcription + diarization")
+    print(f"    file: {wav_path}")
+
+    transcriber = aai.Transcriber()
+    transcript = transcriber.transcribe(str(wav_path), config=transcription_config)
+
+    if transcript.status == aai.TranscriptStatus.error:
+        raise RuntimeError(f"AssemblyAI transcription failed: {transcript.error}")
+
+    if not transcript.utterances:
+        raise RuntimeError("AssemblyAI returned no utterances.")
+
+    speaker_index: dict[str, int] = {}
+    segments: list[dict[str, Any]] = []
+    for utt in transcript.utterances:
+        if utt.speaker not in speaker_index:
+            speaker_index[utt.speaker] = len(speaker_index)
+        speaker_label = f"SPEAKER_{speaker_index[utt.speaker]:02d}"
+        segments.append(
+            {
+                "start": utt.start / 1000.0,
+                "end": utt.end / 1000.0,
+                "text": utt.text,
+                "speaker": speaker_label,
+            }
+        )
+
+    base_name = wav_path.stem
+    json_path = out_dir / f"{base_name}.json"
+    txt_path = out_dir / f"{base_name}.txt"
+    srt_path = out_dir / f"{base_name}.srt"
+    vtt_path = out_dir / f"{base_name}.vtt"
+
+    payload = {"segments": segments, "language": cfg.language}
+    json_path.write_text(json.dumps(payload, indent=2) + "\n")
+    txt_path.write_text("\n".join(seg["text"] for seg in segments) + "\n")
+
+    srt_lines: list[str] = []
+    vtt_lines: list[str] = ["WEBVTT", ""]
+    for i, seg in enumerate(segments, start=1):
+        start = float(seg["start"])
+        end = float(seg["end"])
+        speaker = str(seg["speaker"])
+        text = str(seg["text"])
+        srt_lines.extend(
+            [
+                str(i),
+                f"{_fmt_srt_ts(start)} --> {_fmt_srt_ts(end)}",
+                f"[{speaker}] {text}",
+                "",
+            ]
+        )
+        vtt_lines.extend(
+            [
+                str(i),
+                f"{_fmt_vtt_ts(start)} --> {_fmt_vtt_ts(end)}",
+                f"[{speaker}] {text}",
+                "",
+            ]
+        )
+
+    srt_path.write_text("\n".join(srt_lines).rstrip() + "\n")
+    vtt_path.write_text("\n".join(vtt_lines).rstrip() + "\n")
+    print(f"    saved: {json_path}")
+
+
 def run_transcription_and_diarization(
     wav_path: Path, cfg: AppConfig, out_dir: Path
 ) -> None:
-    prefer_mlx = cfg.use_mlx_whisper_on_apple_silicon and is_apple_silicon()
+    backend = cfg.backend
+
+    if backend == "assemblyai":
+        run_assemblyai_pipeline(wav_path, cfg, out_dir)
+        return
+
+    prefer_mlx = backend == "mlx" or (backend == "auto" and is_apple_silicon())
     if prefer_mlx:
         try:
             run_mlx_whisper_pipeline(wav_path, cfg, out_dir)
@@ -338,6 +427,8 @@ def run_transcription_and_diarization(
         except FatalPipelineError:
             raise
         except (ImportError, RuntimeError, OSError, ValueError, TypeError) as err:
+            if backend == "mlx":
+                raise
             print("!! mlx-whisper pipeline failed; falling back to WhisperX.")
             print(f"   reason: {err}")
 
