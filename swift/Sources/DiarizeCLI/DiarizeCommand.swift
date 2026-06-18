@@ -89,8 +89,10 @@ struct DiarizeCommand: AsyncParsableCommand {
 
         let blocks = SpeakerMapper.coalesce(segments: pipelineResult.segments, mapping: finalMapping)
         let stem = audioURL.deletingPathExtension().lastPathComponent
+        let dirName = pipelineResult.outputDirectoryURL.lastPathComponent
+        let dateStr = String(dirName.dropFirst(stem.count + 1))
         let vaultTarget = vaultOutput.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
-            ?? VaultExporter.makeVaultTarget(config: cfg, audioStem: stem)
+            ?? VaultExporter.makeVaultTarget(config: cfg, audioStem: "\(dateStr)_\(stem)")
 
         try VaultExporter.writeOutputs(
             segments: pipelineResult.segments, blocks: blocks, config: cfg,

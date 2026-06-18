@@ -10,8 +10,8 @@ public actor WhisperKitTranscriber: TranscriberProtocol {
         whisperKit = try await WhisperKit(model: model)
     }
 
-    public nonisolated func transcribe(audioURL: URL) async throws -> [Segment] {
-        guard let wk = await whisperKit else {
+    public func transcribe(audioURL: URL) async throws -> [Segment] {
+        guard let wk = whisperKit else {
             throw DiarizeError.transcriptionFailed("Call loadModel() before transcribe()")
         }
         let results: [TranscriptionResult] = try await wk.transcribe(audioPath: audioURL.path)

@@ -62,12 +62,3 @@ public struct Pipeline {
         return PipelineResult(segments: labeled, outputDirectoryURL: outputDir)
     }
 }
-
-extension Pipeline {
-    public static func makeDefault(config: AppConfig) -> Pipeline {
-        Pipeline(
-            transcriber: WhisperKitTranscriber(),
-            diarizer: SpeakerKitDiarizer()
-        )
-    }
-}

@@ -79,7 +79,9 @@ public final class AppState: ObservableObject {
                 try SpeakerMapper.saveMapping(speakerNames, to: mappingURL)
                 let blocks = SpeakerMapper.coalesce(segments: result.segments, mapping: speakerNames)
                 let stem = audioURL.deletingPathExtension().lastPathComponent
-                let vault = VaultExporter.makeVaultTarget(config: config, audioStem: stem)
+                let dirName = result.outputDirectoryURL.lastPathComponent
+                let dateStr = String(dirName.dropFirst(stem.count + 1))
+                let vault = VaultExporter.makeVaultTarget(config: config, audioStem: "\(dateStr)_\(stem)")
                 try VaultExporter.writeOutputs(
                     segments: result.segments, blocks: blocks, config: config,
                     audioURL: audioURL, outputDir: result.outputDirectoryURL, vaultURL: vault)
