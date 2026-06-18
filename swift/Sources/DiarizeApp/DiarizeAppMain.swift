@@ -5,7 +5,7 @@ struct DiarizeAppApp: App {
     @StateObject private var state = AppState()
     var body: some Scene {
         WindowGroup {
-            Text("Loading…")
+            ContentView()
                 .environmentObject(state)
                 .onAppear { state.loadConfig() }
         }
