@@ -30,7 +30,7 @@ public struct AppConfig: Sendable {
         "language": "en", "whisperkit_model": "openai_whisper-large-v3-turbo",
         "anthropic_api_key": "", "output_dir": "./out",
         "transcript_title": "Session Transcript", "vault_path": "~/Obsidian",
-        "vault_subdir": "Transcripts", "vault_filename_template": "{audio_stem}.md",
+        "vault_subdir": "Transcripts", "vault_filename_template": "{audio_stem}.md"
     ]
 }
 

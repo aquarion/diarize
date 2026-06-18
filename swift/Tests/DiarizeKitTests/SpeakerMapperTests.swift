@@ -6,7 +6,7 @@ final class SpeakerMapperTests: XCTestCase {
         let segments = [Segment(start: 1.0, end: 3.0, text: "Hello", speaker: "UNKNOWN")]
         let turns = [
             Turn(start: 0.0, end: 2.0, speaker: "SPEAKER_00"),
-            Turn(start: 1.5, end: 4.0, speaker: "SPEAKER_01"),
+            Turn(start: 1.5, end: 4.0, speaker: "SPEAKER_01")
         ]
         // SPEAKER_00 overlaps [1.0, 2.0] = 1.0s; SPEAKER_01 overlaps [1.5, 3.0] = 1.5s
         let result = SpeakerMapper.assignSpeakers(to: segments, from: turns)
@@ -24,7 +24,7 @@ final class SpeakerMapperTests: XCTestCase {
         let segments = [
             Segment(start: 0, end: 1, text: "Hello", speaker: "SPEAKER_00"),
             Segment(start: 1, end: 2, text: "world.", speaker: "SPEAKER_00"),
-            Segment(start: 2, end: 3, text: "Bye.", speaker: "SPEAKER_01"),
+            Segment(start: 2, end: 3, text: "Bye.", speaker: "SPEAKER_01")
         ]
         let mapping = ["SPEAKER_00": "Alice", "SPEAKER_01": "Bob"]
         let blocks = SpeakerMapper.coalesce(segments: segments, mapping: mapping)
@@ -37,7 +37,7 @@ final class SpeakerMapperTests: XCTestCase {
     func testCoalesceSkipsEmptySegments() {
         let segments = [
             Segment(start: 0, end: 1, text: "  ", speaker: "SPEAKER_00"),
-            Segment(start: 1, end: 2, text: "Hello.", speaker: "SPEAKER_00"),
+            Segment(start: 1, end: 2, text: "Hello.", speaker: "SPEAKER_00")
         ]
         let blocks = SpeakerMapper.coalesce(segments: segments, mapping: [:])
         XCTAssertEqual(blocks.count, 1)
