@@ -14,11 +14,11 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 500, minHeight: 400)
-        .alert("Error", isPresented: .constant(state.errorMessage != nil)) {
-            Button("OK") {
-                state.errorMessage = nil
-                state.screen = .drop
-            }
+        .alert("Error", isPresented: Binding(
+            get: { state.errorMessage != nil },
+            set: { if !$0 { state.errorMessage = nil; state.screen = .drop } }
+        )) {
+            Button("OK") { }
         } message: {
             Text(state.errorMessage ?? "")
         }

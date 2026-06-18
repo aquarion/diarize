@@ -40,15 +40,16 @@ struct SpeakerLabelView: View {
         )
     }
 
-    private func samples(for label: String) -> [String] {
+    private func samples(for label: String) -> [(id: Int, text: String)] {
         guard let result = state.pipelineResult else { return [] }
         let segs = result.segments.filter {
             $0.speaker == label && !$0.text.trimmingCharacters(in: .whitespaces).isEmpty
         }
         guard !segs.isEmpty else { return [] }
         let n = segs.count
-        return [segs[n / 6], segs[n / 2], segs[(5 * n) / 6]].map {
-            "\(Renderer.formatTimestamp($0.start)) \($0.text.trimmingCharacters(in: .whitespaces))"
+        let indices = Array(Set([n / 6, n / 2, (5 * n) / 6])).sorted()
+        return indices.map { i in
+            (id: i, text: "\(Renderer.formatTimestamp(segs[i].start)) \(segs[i].text.trimmingCharacters(in: .whitespaces))")
         }
     }
 }
@@ -56,7 +57,7 @@ struct SpeakerLabelView: View {
 struct SpeakerCard: View {
     let label: String
     @Binding var name: String
-    let samples: [String]
+    let samples: [(id: Int, text: String)]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -67,8 +68,8 @@ struct SpeakerCard: View {
                     .textFieldStyle(.roundedBorder)
                     .frame(maxWidth: 200)
             }
-            ForEach(samples, id: \.self) { sample in
-                Text(sample)
+            ForEach(samples, id: \.id) { s in
+                Text(s.text)
                     .font(.caption2)
                     .foregroundColor(.secondary)
                     .lineLimit(2)
