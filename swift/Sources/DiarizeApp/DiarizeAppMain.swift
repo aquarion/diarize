@@ -1,3 +1,13 @@
-import Foundation
+import SwiftUI
 
-@main struct DiarizeAppMain { static func main() {} }
+@main
+struct DiarizeAppApp: App {
+    @StateObject private var state = AppState()
+    var body: some Scene {
+        WindowGroup {
+            Text("Loading…")
+                .environmentObject(state)
+                .onAppear { state.loadConfig() }
+        }
+    }
+}
