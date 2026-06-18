@@ -50,3 +50,11 @@ repos:
     rev: 7.1.2
     hooks:
       - id: flake8
+
+  - repo: local
+    hooks:
+      - id: swiftlint
+        name: SwiftLint
+        language: system
+        entry: swiftlint lint --quiet --config swift/.swiftlint.yml
+        types: [swift]

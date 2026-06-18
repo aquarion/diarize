@@ -1,10 +1,10 @@
 # speakers.py
 from __future__ import annotations
 
+import datetime as dt
 import json
 import re
 import subprocess
-import datetime as dt
 from pathlib import Path
 from typing import Any
 
@@ -160,7 +160,7 @@ def prompt_for_speakers(
     for label in detected:
         default = existing.get(label, label)
         if label in sample:
-            print(f"\n  Examples:")
+            print("\n  Examples:")
             for s in sample[label]:
                 print(f"    {s}")
         while True:
