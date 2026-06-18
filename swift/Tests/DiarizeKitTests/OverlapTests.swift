@@ -1,6 +1,31 @@
 import XCTest
 @testable import DiarizeKit
 
+final class ClaudeGuesserTests: XCTestCase {
+    func testExtractJSONFromPlainResponse() throws {
+        let text = #"{"SPEAKER_00": "Alice", "SPEAKER_01": "Bob"}"#
+        let result = try ClaudeGuesser.extractJSON(from: text, labels: ["SPEAKER_00", "SPEAKER_01"])
+        XCTAssertEqual(result["SPEAKER_00"], "Alice")
+        XCTAssertEqual(result["SPEAKER_01"], "Bob")
+    }
+
+    func testExtractJSONFromMarkdownCodeBlock() throws {
+        let text = "```json\n{\"SPEAKER_00\": \"Alice\"}\n```"
+        let result = try ClaudeGuesser.extractJSON(from: text, labels: ["SPEAKER_00"])
+        XCTAssertEqual(result["SPEAKER_00"], "Alice")
+    }
+
+    func testExtractJSONFiltersUnknownLabels() throws {
+        let text = #"{"SPEAKER_00": "Alice", "SPEAKER_99": "Ghost"}"#
+        let result = try ClaudeGuesser.extractJSON(from: text, labels: ["SPEAKER_00"])
+        XCTAssertNil(result["SPEAKER_99"])
+    }
+
+    func testExtractJSONThrowsOnGarbage() {
+        XCTAssertThrowsError(try ClaudeGuesser.extractJSON(from: "not json at all", labels: []))
+    }
+}
+
 final class VaultExporterTests: XCTestCase {
     func testMakeVaultTarget() {
         let config = AppConfig(
