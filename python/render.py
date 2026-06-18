@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 
 def terminal_link(path: Path) -> str:
-    """Return an OSC 8 hyperlink for ``path`` that macOS Terminal renders as clickable."""
+    """Return an OSC 8 hyperlink that macOS Terminal renders as clickable."""
     url = path.resolve().as_uri()
     label = str(path)
     return f"\033]8;;{url}\033\\{label}\033]8;;\033\\"
