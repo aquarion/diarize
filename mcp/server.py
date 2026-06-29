@@ -34,7 +34,7 @@ def select_backend() -> tuple[str, list[str]] | None:
 def parse_transcript_path(stdout: str, backend: str) -> str | None:
     """Extract the absolute local transcript path from CLI stdout."""
     if backend == "python":
-        for line in stdout.split("\n"):
+        for line in stdout.splitlines():
             if "local transcript" in line:
                 m = re.search(r"\x1b\]8;;file://([^\x1b]+)\x1b\\", line)
                 if m:
