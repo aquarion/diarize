@@ -12,7 +12,7 @@ public struct AppConfig: Sendable {
 
     public init(
         language: String = "en",
-        whisperkitModel: String = "openai_whisper-large-v3-turbo",
+        whisperkitModel: String = "openai_whisper-large-v3_turbo",
         anthropicAPIKey: String = "",
         outputDir: String = "./out",
         transcriptTitle: String = "Session Transcript",
@@ -27,7 +27,7 @@ public struct AppConfig: Sendable {
     }
 
     static let jsonDefaults: [String: Any] = [
-        "language": "en", "whisperkit_model": "openai_whisper-large-v3-turbo",
+        "language": "en", "whisperkit_model": "openai_whisper-large-v3_turbo",
         "anthropic_api_key": "", "output_dir": "./out",
         "transcript_title": "Session Transcript", "vault_path": "~/Obsidian",
         "vault_subdir": "Transcripts", "vault_filename_template": "{audio_stem}.md"
@@ -50,7 +50,7 @@ public enum ConfigLoader {
         }
         let config = AppConfig(
             language: raw["language"] as? String ?? "en",
-            whisperkitModel: raw["whisperkit_model"] as? String ?? "openai_whisper-large-v3-turbo",
+            whisperkitModel: raw["whisperkit_model"] as? String ?? "openai_whisper-large-v3_turbo",
             anthropicAPIKey: raw["anthropic_api_key"] as? String ?? "",
             outputDir: raw["output_dir"] as? String ?? "./out",
             transcriptTitle: raw["transcript_title"] as? String ?? "Session Transcript",
