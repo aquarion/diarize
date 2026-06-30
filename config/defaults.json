@@ -1,0 +1,10 @@
+{
+  "language": "en",
+  "mlx_model": "mlx-community/whisper-large-v3-turbo",
+  "output_dir": "./out",
+  "transcript_title": "Session Transcript",
+  "vault_filename_template": "{audio_stem}.md",
+  "vault_path": "~/Obsidian",
+  "vault_subdir": "Transcripts",
+  "whisperkit_model": "openai_whisper-large-v3_turbo"
+}

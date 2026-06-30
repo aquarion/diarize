@@ -55,8 +55,31 @@ public enum ConfigLoader {
             .appendingPathComponent("diarize/config.json")
     }
 
+    private static func repoDefaultsURL() -> URL? {
+        let filename = "config/defaults.json"
+        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(filename)
+        if FileManager.default.fileExists(atPath: cwd.path) { return cwd }
+        // Binary-relative: handles swift/.build/release/diarize in development
+        if let arg = CommandLine.arguments.first {
+            let candidate = URL(fileURLWithPath: arg).standardizedFileURL
+                .deletingLastPathComponent()  // release
+                .deletingLastPathComponent()  // .build
+                .deletingLastPathComponent()  // swift
+                .deletingLastPathComponent()  // repo root
+                .appendingPathComponent(filename)
+            if FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+        }
+        return nil
+    }
+
     public static func load(from url: URL = configURL) throws -> (AppConfig, [String: Any]) {
         var raw: [String: Any] = AppConfig.jsonDefaults
+        if let repoURL = repoDefaultsURL(),
+           let data = try? Data(contentsOf: repoURL),
+           let repoDefaults = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            for (k, v) in repoDefaults { raw[k] = v }
+        }
         if FileManager.default.fileExists(atPath: url.path) {
             let data = try Data(contentsOf: url)
             if let loaded = try JSONSerialization.jsonObject(with: data) as? [String: Any] {

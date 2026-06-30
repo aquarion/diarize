@@ -60,6 +60,8 @@ DEFAULTS: dict[str, Any] = {
     "num_speakers": 2,
 }
 
+_REPO_DEFAULTS = Path(__file__).parent.parent / "config" / "defaults.json"
+
 REQUIRED_ALWAYS: tuple[str, ...] = ("vault_path",)
 REQUIRED_FOR_WHISPERX: tuple[str, ...] = ("hf_token",)
 REQUIRED_FOR_ASSEMBLYAI: tuple[str, ...] = ("assemblyai_api_key",)
@@ -90,6 +92,12 @@ def ensure_default_config(path: Path) -> None:
 
 def load_config_data(config_path: Path) -> dict[str, Any]:
     merged = dict(DEFAULTS)
+    try:
+        repo = json.loads(_REPO_DEFAULTS.read_text())
+        if isinstance(repo, dict):
+            merged.update(repo)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
     if config_path.exists():
         try:
             loaded = json.loads(config_path.read_text())
