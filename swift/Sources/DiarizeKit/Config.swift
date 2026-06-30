@@ -1,6 +1,17 @@
 import Foundation
 
 public struct AppConfig: Sendable {
+    public enum Defaults {
+        public static let language               = "en"
+        public static let whisperkitModel        = "openai_whisper-large-v3_turbo"
+        public static let anthropicAPIKey        = ""
+        public static let outputDir              = "./out"
+        public static let transcriptTitle        = "Session Transcript"
+        public static let vaultPath              = "~/Obsidian"
+        public static let vaultSubdir            = "Transcripts"
+        public static let vaultFilenameTemplate  = "{audio_stem}.md"
+    }
+
     public var language: String
     public var whisperkitModel: String
     public var anthropicAPIKey: String
@@ -11,14 +22,14 @@ public struct AppConfig: Sendable {
     public var vaultFilenameTemplate: String
 
     public init(
-        language: String = "en",
-        whisperkitModel: String = "openai_whisper-large-v3_turbo",
-        anthropicAPIKey: String = "",
-        outputDir: String = "./out",
-        transcriptTitle: String = "Session Transcript",
-        vaultPath: String = "~/Obsidian",
-        vaultSubdir: String = "Transcripts",
-        vaultFilenameTemplate: String = "{audio_stem}.md"
+        language: String = Defaults.language,
+        whisperkitModel: String = Defaults.whisperkitModel,
+        anthropicAPIKey: String = Defaults.anthropicAPIKey,
+        outputDir: String = Defaults.outputDir,
+        transcriptTitle: String = Defaults.transcriptTitle,
+        vaultPath: String = Defaults.vaultPath,
+        vaultSubdir: String = Defaults.vaultSubdir,
+        vaultFilenameTemplate: String = Defaults.vaultFilenameTemplate
     ) {
         self.language = language; self.whisperkitModel = whisperkitModel
         self.anthropicAPIKey = anthropicAPIKey; self.outputDir = outputDir
@@ -27,10 +38,14 @@ public struct AppConfig: Sendable {
     }
 
     static let jsonDefaults: [String: Any] = [
-        "language": "en", "whisperkit_model": "openai_whisper-large-v3_turbo",
-        "anthropic_api_key": "", "output_dir": "./out",
-        "transcript_title": "Session Transcript", "vault_path": "~/Obsidian",
-        "vault_subdir": "Transcripts", "vault_filename_template": "{audio_stem}.md"
+        "language": Defaults.language,
+        "whisperkit_model": Defaults.whisperkitModel,
+        "anthropic_api_key": Defaults.anthropicAPIKey,
+        "output_dir": Defaults.outputDir,
+        "transcript_title": Defaults.transcriptTitle,
+        "vault_path": Defaults.vaultPath,
+        "vault_subdir": Defaults.vaultSubdir,
+        "vault_filename_template": Defaults.vaultFilenameTemplate,
     ]
 }
 
@@ -49,14 +64,14 @@ public enum ConfigLoader {
             }
         }
         let config = AppConfig(
-            language: raw["language"] as? String ?? "en",
-            whisperkitModel: raw["whisperkit_model"] as? String ?? "openai_whisper-large-v3_turbo",
-            anthropicAPIKey: raw["anthropic_api_key"] as? String ?? "",
-            outputDir: raw["output_dir"] as? String ?? "./out",
-            transcriptTitle: raw["transcript_title"] as? String ?? "Session Transcript",
-            vaultPath: raw["vault_path"] as? String ?? "~/Obsidian",
-            vaultSubdir: raw["vault_subdir"] as? String ?? "Transcripts",
-            vaultFilenameTemplate: raw["vault_filename_template"] as? String ?? "{audio_stem}.md"
+            language: raw["language"] as? String ?? AppConfig.Defaults.language,
+            whisperkitModel: raw["whisperkit_model"] as? String ?? AppConfig.Defaults.whisperkitModel,
+            anthropicAPIKey: raw["anthropic_api_key"] as? String ?? AppConfig.Defaults.anthropicAPIKey,
+            outputDir: raw["output_dir"] as? String ?? AppConfig.Defaults.outputDir,
+            transcriptTitle: raw["transcript_title"] as? String ?? AppConfig.Defaults.transcriptTitle,
+            vaultPath: raw["vault_path"] as? String ?? AppConfig.Defaults.vaultPath,
+            vaultSubdir: raw["vault_subdir"] as? String ?? AppConfig.Defaults.vaultSubdir,
+            vaultFilenameTemplate: raw["vault_filename_template"] as? String ?? AppConfig.Defaults.vaultFilenameTemplate
         )
         return (config, raw)
     }
