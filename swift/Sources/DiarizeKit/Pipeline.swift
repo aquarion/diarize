@@ -16,6 +16,8 @@ public struct Pipeline {
         config: AppConfig,
         progress: AsyncStream<PipelineProgress>.Continuation
     ) async throws -> PipelineResult {
+        defer { progress.finish() }
+
         guard FileManager.default.fileExists(atPath: audioURL.path) else {
             throw DiarizeError.audioFileNotFound(audioURL)
         }
@@ -57,8 +59,6 @@ public struct Pipeline {
         try jsonData.write(to: outputDir.appendingPathComponent("\(stem).json"))
 
         progress.yield(.init(stage: .complete, fraction: 1.0, message: "Pipeline complete"))
-        progress.finish()
-
         return PipelineResult(segments: labeled, outputDirectoryURL: outputDir)
     }
 }

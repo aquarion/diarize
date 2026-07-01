@@ -91,6 +91,8 @@ def transcribe(file_path: str, num_speakers: int) -> dict:
         cmd + [str(p), str(num_speakers), "--yes"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        cwd=str(REPO_ROOT),
     )
     job_id = str(uuid.uuid4())
     jobs[job_id] = Job(proc=proc, backend=backend_name)
