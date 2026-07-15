@@ -1,7 +1,18 @@
+import io
+import threading
 import time
 from unittest.mock import MagicMock, patch
 
 import server
+
+
+def _make_proc(stdout: bytes, stderr: bytes, returncode: int) -> MagicMock:
+    proc = MagicMock()
+    proc.stdout = io.BytesIO(stdout)
+    proc.stderr = io.BytesIO(stderr)
+    proc.returncode = returncode
+    proc.wait.return_value = returncode
+    return proc
 
 
 def _wait(job, timeout: float = 2.0) -> None:
@@ -30,9 +41,7 @@ def test_transcribe_no_backend(tmp_path, monkeypatch):
 def test_transcribe_starts_job(tmp_path):
     audio = tmp_path / "audio.wav"
     audio.touch()
-    mock_proc = MagicMock()
-    mock_proc.communicate.return_value = (b"    local       : /tmp/t.md\n", b"")
-    mock_proc.returncode = 0
+    mock_proc = _make_proc(b"    local       : /tmp/t.md\n", b"", 0)
 
     with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
         "subprocess.Popen", return_value=mock_proc
@@ -50,19 +59,24 @@ def test_get_transcript_unknown_job():
 
 
 def test_get_transcript_running():
-    mock_proc = MagicMock()
-    import threading
-
     unblock = threading.Event()
 
-    def slow_communicate():
-        unblock.wait()
-        return (b"", b"")
+    class _BlockingStdout:
+        """Blocks iteration until released, simulating an in-progress process."""
 
-    mock_proc.communicate.side_effect = slow_communicate
-    mock_proc.returncode = None
+        def __iter__(self):
+            unblock.wait()
+            return iter([])
 
-    job = server.Job(proc=mock_proc, backend="swift")
+        def close(self):
+            pass
+
+    proc = MagicMock()
+    proc.stdout = _BlockingStdout()
+    proc.stderr = io.BytesIO(b"")
+    proc.returncode = 0
+
+    job = server.Job(proc=proc, backend="swift")
     server.jobs["running-id"] = job
 
     result = server.get_transcript("running-id")
@@ -70,18 +84,44 @@ def test_get_transcript_running():
     unblock.set()
 
 
+def test_get_transcript_running_with_message():
+    unblock = threading.Event()
+    first_line_seen = threading.Event()
+
+    class _BlockingStdout:
+        def __iter__(self):
+            yield b"==> Transcribing audio...\n"
+            first_line_seen.set()
+            unblock.wait()
+
+        def close(self):
+            pass
+
+    proc = MagicMock()
+    proc.stdout = _BlockingStdout()
+    proc.stderr = io.BytesIO(b"")
+    proc.returncode = 0
+
+    job = server.Job(proc=proc, backend="swift")
+    server.jobs["running-msg-id"] = job
+
+    first_line_seen.wait(timeout=2.0)
+    result = server.get_transcript("running-msg-id")
+    assert result["status"] == "running"
+    assert result["message"] == "Transcribing audio..."
+    unblock.set()
+
+
 def test_get_transcript_done(tmp_path):
     transcript = tmp_path / "transcript.md"
     transcript.write_text("# Meeting\n\nAlice: Hello.\nBob: Hi.")
 
-    mock_proc = MagicMock()
-    mock_proc.communicate.return_value = (
+    proc = _make_proc(
         f"==> Complete\n    local       : {transcript}\n".encode(),
         b"",
+        0,
     )
-    mock_proc.returncode = 0
-
-    job = server.Job(proc=mock_proc, backend="swift")
+    job = server.Job(proc=proc, backend="swift")
     server.jobs["done-id"] = job
     _wait(job)
 
@@ -92,11 +132,8 @@ def test_get_transcript_done(tmp_path):
 
 
 def test_get_transcript_failed():
-    mock_proc = MagicMock()
-    mock_proc.communicate.return_value = (b"", b"WhisperKit load error\n")
-    mock_proc.returncode = 1
-
-    job = server.Job(proc=mock_proc, backend="swift")
+    proc = _make_proc(b"", b"WhisperKit load error\n", 1)
+    job = server.Job(proc=proc, backend="swift")
     server.jobs["fail-id"] = job
     _wait(job)
 
@@ -106,11 +143,8 @@ def test_get_transcript_failed():
 
 
 def test_get_transcript_missing_path(tmp_path):
-    mock_proc = MagicMock()
-    mock_proc.communicate.return_value = (b"==> Complete\n(no local line)\n", b"")
-    mock_proc.returncode = 0
-
-    job = server.Job(proc=mock_proc, backend="swift")
+    proc = _make_proc(b"==> Complete\n(no local line)\n", b"", 0)
+    job = server.Job(proc=proc, backend="swift")
     server.jobs["nopath-id"] = job
     _wait(job)
 

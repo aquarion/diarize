@@ -55,17 +55,29 @@ class Job:
     backend: str
     stdout: str = field(default="", init=False)
     stderr: str = field(default="", init=False)
+    last_message: str = field(default="", init=False)
     _done: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
-        t = threading.Thread(target=self._collect, daemon=True)
-        t.start()
+        threading.Thread(target=self._collect_stdout, daemon=True).start()
+        threading.Thread(target=self._collect_stderr, daemon=True).start()
 
-    def _collect(self) -> None:
-        out, err = self.proc.communicate()
-        self.stdout = out.decode(errors="replace")
-        self.stderr = err.decode(errors="replace")
+    def _collect_stdout(self) -> None:
+        assert self.proc.stdout is not None
+        for raw in self.proc.stdout:
+            line = raw.decode(errors="replace")
+            self.stdout += line
+            stripped = line.strip()
+            if stripped.startswith("==>"):
+                self.last_message = stripped[3:].strip()
+        self.proc.stdout.close()
+        self.proc.wait()
         self._done = True
+
+    def _collect_stderr(self) -> None:
+        assert self.proc.stderr is not None
+        self.stderr = self.proc.stderr.read().decode(errors="replace")
+        self.proc.stderr.close()
 
     def is_complete(self) -> bool:
         return self._done
@@ -113,7 +125,10 @@ def get_transcript(job_id: str) -> dict:
     if job is None:
         return {"status": "failed", "error": "unknown job_id"}
     if not job.is_complete():
-        return {"status": "running"}
+        result: dict = {"status": "running"}
+        if job.last_message:
+            result["message"] = job.last_message
+        return result
     if job.proc.returncode != 0:
         return {
             "status": "failed",
