@@ -75,6 +75,7 @@ def test_get_transcript_running():
     proc.stdout = _BlockingStdout()
     proc.stderr = io.BytesIO(b"")
     proc.returncode = 0
+    proc.poll.return_value = None
 
     job = server.Job(proc=proc, backend="swift")
     server.jobs["running-id"] = job
@@ -101,6 +102,7 @@ def test_get_transcript_running_with_message():
     proc.stdout = _BlockingStdout()
     proc.stderr = io.BytesIO(b"")
     proc.returncode = 0
+    proc.poll.return_value = None
 
     job = server.Job(proc=proc, backend="swift")
     server.jobs["running-msg-id"] = job
@@ -151,3 +153,191 @@ def test_get_transcript_missing_path(tmp_path):
     result = server.get_transcript("nopath-id")
     assert result["status"] == "failed"
     assert "transcript path" in result["error"]
+
+
+def test_get_transcript_waits_for_slow_stderr():
+    """Job must not report failure with a truncated error while stderr is
+    still being collected, even though stdout finishes first."""
+    release_stderr = threading.Event()
+
+    class _SlowStderr:
+        def read(self):
+            release_stderr.wait(timeout=2.0)
+            return b"WhisperKit load error\n"
+
+        def close(self):
+            pass
+
+    proc = MagicMock()
+    proc.stdout = io.BytesIO(b"")
+    proc.stderr = _SlowStderr()
+    proc.returncode = 1
+    proc.wait.return_value = 1
+
+    job = server.Job(proc=proc, backend="swift")
+    server.jobs["slow-stderr-id"] = job
+
+    # stdout collection finishes almost immediately, but stderr is still
+    # blocked, so the job must not yet be reported as complete/failed.
+    deadline = time.monotonic() + 1.0
+    while not job._stdout_done.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert job._stdout_done.is_set()
+    assert not job.is_complete()
+    assert server.get_transcript("slow-stderr-id") == {"status": "running"}
+
+    release_stderr.set()
+    _wait(job)
+
+    result = server.get_transcript("slow-stderr-id")
+    assert result["status"] == "failed"
+    assert "WhisperKit load error" in result["error"]
+
+
+def test_get_transcript_stdout_collector_exception():
+    class _BrokenStdout:
+        def __iter__(self):
+            raise OSError("broken pipe")
+
+        def close(self):
+            pass
+
+    proc = MagicMock()
+    proc.stdout = _BrokenStdout()
+    proc.stderr = io.BytesIO(b"")
+    proc.returncode = 0
+
+    job = server.Job(proc=proc, backend="swift")
+    server.jobs["broken-stdout-id"] = job
+    _wait(job)
+
+    assert job.is_complete()
+    result = server.get_transcript("broken-stdout-id")
+    assert result["status"] == "failed"
+    assert "internal error collecting job output" in result["error"]
+    assert "broken pipe" in result["error"]
+
+
+def test_get_transcript_stalled_collector_reports_failure():
+    """If the process has exited but the collectors never finish (e.g. a
+    future bug reintroduces a stuck reader thread), get_transcript must
+    eventually report failure instead of hanging on 'running' forever."""
+
+    never_release = threading.Event()
+
+    class _NeverEndingReader:
+        def __iter__(self):
+            never_release.wait()
+            return iter([])
+
+        def read(self):
+            never_release.wait()
+            return b""
+
+        def close(self):
+            pass
+
+    proc = MagicMock()
+    proc.stdout = _NeverEndingReader()
+    proc.stderr = _NeverEndingReader()
+    proc.returncode = 1
+    proc.poll.return_value = 1
+
+    job = server.Job(proc=proc, backend="swift")
+    server.jobs["stalled-id"] = job
+
+    assert not job.is_complete()
+    assert job.stalled() is False  # first observation just records exit time
+    job._exit_seen_at = time.monotonic() - (server.COLLECTOR_STALL_TIMEOUT + 1)
+    assert job.stalled() is True
+
+    result = server.get_transcript("stalled-id")
+    assert result["status"] == "failed"
+    assert "internal bug" in result["error"]
+
+    never_release.set()
+
+
+def test_get_transcript_stderr_collector_exception():
+    class _BrokenStderr:
+        def read(self):
+            raise OSError("broken pipe")
+
+        def close(self):
+            pass
+
+    proc = _make_proc(b"==> Complete\n    local       : /tmp/t.md\n", b"", 0)
+    proc.stderr = _BrokenStderr()
+
+    job = server.Job(proc=proc, backend="swift")
+    server.jobs["broken-stderr-id"] = job
+    _wait(job)
+
+    assert job.is_complete()
+    result = server.get_transcript("broken-stderr-id")
+    assert result["status"] == "failed"
+    assert "internal error collecting job output" in result["error"]
+    assert "broken pipe" in result["error"]
+
+
+def test_get_transcript_both_collectors_raise_simultaneously():
+    """Both collector errors must be surfaced, not just the first one to
+    set collector_error, and the result must stay a single coherent dict."""
+    barrier = threading.Barrier(2)
+
+    class _BrokenStdout:
+        def __iter__(self):
+            barrier.wait(timeout=2.0)
+            raise OSError("stdout broke")
+
+        def close(self):
+            pass
+
+    class _BrokenStderr:
+        def read(self):
+            barrier.wait(timeout=2.0)
+            raise OSError("stderr broke")
+
+        def close(self):
+            pass
+
+    proc = MagicMock()
+    proc.stdout = _BrokenStdout()
+    proc.stderr = _BrokenStderr()
+    proc.returncode = 0
+    proc.poll.return_value = 0
+
+    job = server.Job(proc=proc, backend="swift")
+    server.jobs["both-broken-id"] = job
+    _wait(job)
+
+    assert job.is_complete()
+    result = server.get_transcript("both-broken-id")
+    assert result["status"] == "failed"
+    assert "stdout broke" in result["error"]
+    assert "stderr broke" in result["error"]
+
+
+def test_collector_error_kills_still_running_process():
+    """If a collector dies while the child is still alive, nothing would
+    otherwise drain its pipe - kill the child so the sibling collector and
+    the child itself can't block forever."""
+
+    class _BrokenStdout:
+        def __iter__(self):
+            raise OSError("broken pipe")
+
+        def close(self):
+            pass
+
+    proc = MagicMock()
+    proc.stdout = _BrokenStdout()
+    proc.stderr = io.BytesIO(b"")
+    proc.returncode = None
+    proc.poll.return_value = None  # still running when the error occurs
+
+    job = server.Job(proc=proc, backend="swift")
+    _wait(job)
+
+    assert job.is_complete()
+    proc.kill.assert_called_once()
