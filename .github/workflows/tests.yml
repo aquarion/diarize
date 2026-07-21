@@ -45,7 +45,7 @@ jobs:
       # actions/setup-python needed. Uses uv/uv.lock directly rather than
       # a bare `pip install`, so CI validates the same lockfile real users
       # get via `uv sync`.
-      - uses: astral-sh/setup-uv@v9
+      - uses: astral-sh/setup-uv@v9.0.0
       - run: uv sync --extra dev
       - run: uv run pytest -v
 
