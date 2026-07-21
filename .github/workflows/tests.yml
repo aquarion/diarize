@@ -55,5 +55,10 @@ jobs:
         working-directory: swift
     steps:
       - uses: actions/checkout@v7
+      # MediaExtractorTests needs real ffmpeg-generated fixtures to
+      # meaningfully exercise AVFoundation behavior (XCTSkip covers CI
+      # environments where this isn't available, but it's worth actually
+      # running for real here rather than perpetually skipping).
+      - run: brew install ffmpeg
       - run: swift build
       - run: swift test
