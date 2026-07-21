@@ -17,8 +17,8 @@ jobs:
       run:
         working-directory: python
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       # Deliberately not `pip install -e .` - the full dependency list
@@ -40,9 +40,20 @@ jobs:
       run:
         working-directory: mcp
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
       - run: pytest -v
+
+  swift:
+    name: swift (macos-latest)
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: swift
+    steps:
+      - uses: actions/checkout@v7
+      - run: swift build
+      - run: swift test
