@@ -50,6 +50,14 @@ public enum MediaExtractor {
             )
         }
 
+        do {
+            try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+        } catch {
+            throw DiarizeError.mediaExtractionFailed(
+                "Could not create output directory \(outDir.path): \(error.localizedDescription)"
+            )
+        }
+
         let dest = outDir.appendingPathComponent(src.deletingPathExtension().lastPathComponent + ".m4a")
         if FileManager.default.fileExists(atPath: dest.path) {
             do {
