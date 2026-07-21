@@ -9,6 +9,7 @@ description = "MCP server for the diarize tool"
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.0",
+    "platformdirs>=4.0",
 ]
 
 [project.optional-dependencies]

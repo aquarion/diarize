@@ -229,3 +229,6 @@ Thumbs.db
 # Local useful files
 out/
 config.json
+
+# Swift Package Manager
+.build/
