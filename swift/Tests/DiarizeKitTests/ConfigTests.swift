@@ -59,4 +59,16 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(masked["anthropic_api_key"] as? String, "*******1234")
         XCTAssertEqual(masked["language"] as? String, "en")
     }
+
+    func testValidKeysCoversAllConfigFields() {
+        let expected: Set<String> = [
+            "language", "whisperkit_model", "anthropic_api_key", "output_dir",
+            "transcript_title", "vault_path", "vault_subdir", "vault_filename_template",
+        ]
+        XCTAssertEqual(AppConfig.validKeys, expected)
+    }
+
+    func testValidKeysRejectsUnknownKey() {
+        XCTAssertFalse(AppConfig.validKeys.contains("not_a_real_key"))
+    }
 }

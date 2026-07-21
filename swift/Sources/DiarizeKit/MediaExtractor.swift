@@ -1,5 +1,6 @@
 // swift/Sources/DiarizeKit/MediaExtractor.swift
 import AVFoundation
+import CoreMedia
 import Foundation
 
 /// Detects video input and extracts its audio track before transcription,
@@ -10,12 +11,33 @@ import Foundation
 /// tools that default to .mkv (e.g. OBS) need to be exported as .mp4/.mov
 /// first for this to help.
 public enum MediaExtractor {
-    /// Returns true if the asset has a real video track, meaning its audio
-    /// needs to be extracted before transcription.
+    /// Video codecs used for still-image "attached picture" tracks (e.g.
+    /// embedded cover art on .m4a/.mp3), as opposed to real video content.
+    /// AVFoundation has no direct equivalent of ffprobe's `attached_pic`
+    /// disposition flag, so this is the closest available signal.
+    private static let stillImageCodecs: Set<CMVideoCodecType> = [kCMVideoCodecType_JPEG]
+
+    /// Returns true if the asset has a real (non-cover-art) video track,
+    /// meaning its audio needs to be extracted before transcription.
     public static func hasVideoTrack(at url: URL) async throws -> Bool {
-        let asset = AVURLAsset(url: url)
-        let videoTracks = try await asset.loadTracks(withMediaType: .video)
-        return !videoTracks.isEmpty
+        do {
+            let asset = AVURLAsset(url: url)
+            let videoTracks = try await asset.loadTracks(withMediaType: .video)
+            for track in videoTracks {
+                let formatDescriptions = try await track.load(.formatDescriptions)
+                let isCoverArt = !formatDescriptions.isEmpty && formatDescriptions.allSatisfy { desc in
+                    stillImageCodecs.contains(CMFormatDescriptionGetMediaSubType(desc))
+                }
+                if !isCoverArt {
+                    return true
+                }
+            }
+            return false
+        } catch {
+            throw DiarizeError.mediaExtractionFailed(
+                "Could not inspect \(url.lastPathComponent): \(error.localizedDescription)"
+            )
+        }
     }
 
     /// Extracts the audio track from `src` into an .m4a file inside `outDir`.
@@ -29,7 +51,15 @@ public enum MediaExtractor {
         }
 
         let dest = outDir.appendingPathComponent(src.deletingPathExtension().lastPathComponent + ".m4a")
-        try? FileManager.default.removeItem(at: dest)
+        if FileManager.default.fileExists(atPath: dest.path) {
+            do {
+                try FileManager.default.removeItem(at: dest)
+            } catch {
+                throw DiarizeError.mediaExtractionFailed(
+                    "Could not remove existing file at \(dest.path): \(error.localizedDescription)"
+                )
+            }
+        }
         exportSession.outputURL = dest
         exportSession.outputFileType = .m4a
 

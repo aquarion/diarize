@@ -47,13 +47,14 @@ struct ConfigCommand: AsyncParsableCommand {
         @Option(name: .long, help: "Path to config JSON file") var config: String?
 
         mutating func run() async throws {
-            guard AppConfig.jsonDefaults.keys.contains(key) else {
+            guard AppConfig.validKeys.contains(key) else {
                 throw unknownKeyError(key)
             }
             let configURL = config.map { URL(fileURLWithPath: $0) } ?? ConfigLoader.configURL
+            // ConfigLoader.load seeds `raw` from jsonDefaults before merging
+            // repo/user config on top, so a known key is always present here.
             let (_, raw) = try ConfigLoader.load(from: configURL)
-            let value = (raw[key] as? String) ?? (AppConfig.jsonDefaults[key] as? String) ?? ""
-            print(value)
+            print(raw[key] as? String ?? "")
         }
     }
 
@@ -66,7 +67,7 @@ struct ConfigCommand: AsyncParsableCommand {
         @Option(name: .long, help: "Path to config JSON file") var config: String?
 
         mutating func run() async throws {
-            guard AppConfig.jsonDefaults.keys.contains(key) else {
+            guard AppConfig.validKeys.contains(key) else {
                 throw unknownKeyError(key)
             }
             let configURL = config.map { URL(fileURLWithPath: $0) } ?? ConfigLoader.configURL
@@ -79,7 +80,7 @@ struct ConfigCommand: AsyncParsableCommand {
 }
 
 private func unknownKeyError(_ key: String) -> Error {
-    let validKeys = AppConfig.jsonDefaults.keys.sorted().joined(separator: ", ")
-    fputs("!! Unknown config key: \(key)\n    Valid keys: \(validKeys)\n", stderr)
+    let keyList = AppConfig.validKeys.sorted().joined(separator: ", ")
+    fputs("!! Unknown config key: \(key)\n    Valid keys: \(keyList)\n", stderr)
     return ExitCode(2)
 }

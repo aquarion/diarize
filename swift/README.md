@@ -76,7 +76,10 @@ uses (respects `--config` the same way):
 
 `get`/`set` validate the key against the known config fields. The secret
 field (`anthropic_api_key`) is masked in `show` and in `set`'s confirmation
-output — only the last 4 characters are shown.
+output — only the last 4 characters are shown (secrets 4 characters or
+shorter are fully masked). `config get anthropic_api_key` is unmasked by
+design, matching Python's `config get` — it's for scripting against a
+specific value you already know you want, not for display.
 
 ## Config Location
 
@@ -93,7 +96,7 @@ Override with `--config /path/to/config.json`.
 ```json
 {
   "language": "en",
-  "whisperkit_model": "openai_whisper-large-v3-turbo",
+  "whisperkit_model": "openai_whisper-large-v3_turbo",
   "anthropic_api_key": "",
   "output_dir": "./out",
   "transcript_title": "Session Transcript",

@@ -37,7 +37,7 @@ public struct AppConfig: Sendable {
         self.vaultSubdir = vaultSubdir; self.vaultFilenameTemplate = vaultFilenameTemplate
     }
 
-    public static let jsonDefaults: [String: Any] = [
+    static let jsonDefaults: [String: Any] = [
         "language": Defaults.language,
         "whisperkit_model": Defaults.whisperkitModel,
         "anthropic_api_key": Defaults.anthropicAPIKey,
@@ -47,6 +47,11 @@ public struct AppConfig: Sendable {
         "vault_subdir": Defaults.vaultSubdir,
         "vault_filename_template": Defaults.vaultFilenameTemplate,
     ]
+
+    /// The known config keys, for CLI validation. Derived from
+    /// `jsonDefaults` rather than duplicated, and exposed as a clean
+    /// `Set<String>` rather than the raw untyped defaults dict.
+    public static var validKeys: Set<String> { Set(jsonDefaults.keys) }
 }
 
 public enum ConfigLoader {
