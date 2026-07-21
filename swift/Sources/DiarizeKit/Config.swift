@@ -125,7 +125,7 @@ public enum ConfigLoader {
     public static func maskSecret(key: String, value: String) -> String {
         guard secretKeys.contains(key), !value.isEmpty else { return value }
         guard value.count > 4 else { return String(repeating: "*", count: value.count) }
-        return String(repeating: "*", count: value.count - 4) + value.suffix(4)
+        return String(repeating: "*", count: value.count - 4) + String(value.suffix(4))
     }
 
     /// Masks all secret fields in a raw config dictionary, for display only.

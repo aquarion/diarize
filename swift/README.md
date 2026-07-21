@@ -48,11 +48,11 @@ first.
 open .build/release/DiarizeApp.app
 ```
 
-Or open the `swift/` directory in Xcode and run the `DiarizeApp` scheme. Drag a WAV file onto the window, set the speaker count, and click **Transcribe & Diarize**.
+Or open the `swift/` directory in Xcode and run the `DiarizeApp` scheme. Drag an audio or video file onto the window, set the speaker count, and click **Transcribe & Diarize**.
 
 ## CLI Options
 
-`diarize <wav> <num_speakers>` implicitly runs the `transcribe` subcommand
+`diarize <file> <num_speakers>` implicitly runs the `transcribe` subcommand
 (the default), so existing invocations keep working unchanged.
 
 ```
