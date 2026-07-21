@@ -42,23 +42,31 @@ if not logger.handlers:
     logger.addHandler(_handler)
 
 
-def select_backend() -> tuple[str, list[str]] | None:
-    """Return (backend_name, argv_prefix) or None if no backend is available."""
+class BackendUnavailableError(Exception):
+    """Raised by select_backend() with a precise reason no backend could be
+    selected (not just a generic "no backend available")."""
+
+
+def select_backend() -> tuple[str, list[str]]:
+    """Return (backend_name, argv_prefix).
+
+    Raises BackendUnavailableError if no backend can be used.
+    """
     if platform.system() == "Darwin":
         swift_cli = REPO_ROOT / "swift" / ".build" / "release" / "diarize"
         if swift_cli.exists():
             return "swift", [str(swift_cli)]
     python_dir = REPO_ROOT / "python"
-    if (python_dir / "app.py").exists():
-        uv_exe = shutil.which("uv")
-        if uv_exe is None:
-            logger.error("python backend found at %s but uv is not on PATH", python_dir)
-            return None
-        # `uv run` resolves/syncs python/.venv from pyproject.toml + uv.lock
-        # on every invocation (self-healing - no stale or missing venv to
-        # silently fall back from, unlike the old manual venv-path lookup).
-        return "python", [uv_exe, "run", "--directory", str(python_dir), "app.py"]
-    return None
+    app_py = python_dir / "app.py"
+    if not app_py.exists():
+        raise BackendUnavailableError(f"neither the Swift CLI nor {app_py} was found")
+    uv_exe = shutil.which("uv")
+    if uv_exe is None:
+        raise BackendUnavailableError(f"found {app_py} but uv is not on PATH to run it")
+    # `uv run` resolves/syncs python/.venv from pyproject.toml + uv.lock on
+    # every invocation (self-healing - no stale or missing venv to silently
+    # fall back from, unlike the old manual venv-path lookup).
+    return "python", [uv_exe, "run", "--directory", str(python_dir), "app.py"]
 
 
 def parse_transcript_path(stdout: str, backend: str) -> str | None:
@@ -207,13 +215,11 @@ def transcribe(file_path: str, num_speakers: int) -> dict:
     p = Path(file_path).expanduser()
     if not p.exists():
         return {"error": f"file not found: {file_path}"}
-    backend_info = select_backend()
-    if backend_info is None:
-        logger.error("no backend available for %s", p)
-        return {
-            "error": "no backend available (Swift CLI not built, Python CLI not found)"
-        }
-    backend_name, cmd = backend_info
+    try:
+        backend_name, cmd = select_backend()
+    except BackendUnavailableError as e:
+        logger.error("no backend available for %s: %s", p, e)
+        return {"error": f"no backend available: {e}"}
     proc = subprocess.Popen(
         cmd + [str(p), str(num_speakers), "--yes"],
         stdout=subprocess.PIPE,
@@ -301,13 +307,11 @@ def get_config(key: str) -> dict:
     or {"error": "<message>"} on failure (e.g. unknown key - the error
     lists the valid keys).
     """
-    backend_info = select_backend()
-    if backend_info is None:
-        logger.error("no backend available for get_config(%s)", key)
-        return {
-            "error": "no backend available (Swift CLI not built, Python CLI not found)"
-        }
-    backend_name, cmd = backend_info
+    try:
+        backend_name, cmd = select_backend()
+    except BackendUnavailableError as e:
+        logger.error("no backend available for get_config(%s): %s", key, e)
+        return {"error": f"no backend available: {e}"}
     try:
         result = subprocess.run(
             cmd + ["config", "get", key],
@@ -337,13 +341,11 @@ def set_config(key: str, value: str) -> dict:
     or {"error": "<message>"} on failure (e.g. unknown key, wrong type -
     the error explains which).
     """
-    backend_info = select_backend()
-    if backend_info is None:
-        logger.error("no backend available for set_config(%s)", key)
-        return {
-            "error": "no backend available (Swift CLI not built, Python CLI not found)"
-        }
-    backend_name, cmd = backend_info
+    try:
+        backend_name, cmd = select_backend()
+    except BackendUnavailableError as e:
+        logger.error("no backend available for set_config(%s): %s", key, e)
+        return {"error": f"no backend available: {e}"}
     try:
         result = subprocess.run(
             cmd + ["config", "set", key, value],

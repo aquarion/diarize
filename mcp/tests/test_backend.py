@@ -1,5 +1,6 @@
 from unittest.mock import patch
 
+import pytest
 import server
 
 
@@ -25,10 +26,8 @@ def test_falls_back_to_python_when_swift_missing(tmp_path, monkeypatch):
     with patch("platform.system", return_value="Darwin"), patch(
         "shutil.which", return_value="/usr/local/bin/uv"
     ):
-        result = server.select_backend()
+        name, cmd = server.select_backend()
 
-    assert result is not None
-    name, cmd = result
     assert name == "python"
     assert cmd == [
         "/usr/local/bin/uv",
@@ -57,7 +56,7 @@ def test_python_backend_runs_via_uv_on_any_platform(tmp_path, monkeypatch):
         assert cmd[1:3] == ["run", "--directory"]
 
 
-def test_returns_none_when_python_found_but_uv_missing(tmp_path, monkeypatch):
+def test_raises_precise_error_when_python_found_but_uv_missing(tmp_path, monkeypatch):
     app_py = tmp_path / "python" / "app.py"
     app_py.parent.mkdir(parents=True)
     app_py.touch()
@@ -66,15 +65,15 @@ def test_returns_none_when_python_found_but_uv_missing(tmp_path, monkeypatch):
     with patch("platform.system", return_value="Linux"), patch(
         "shutil.which", return_value=None
     ):
-        result = server.select_backend()
+        with pytest.raises(server.BackendUnavailableError, match="uv is not on PATH"):
+            server.select_backend()
 
-    assert result is None
 
-
-def test_returns_none_when_nothing_available(tmp_path, monkeypatch):
+def test_raises_precise_error_when_nothing_available(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "REPO_ROOT", tmp_path)
 
     with patch("platform.system", return_value="Linux"):
-        result = server.select_backend()
-
-    assert result is None
+        with pytest.raises(
+            server.BackendUnavailableError, match="neither the Swift CLI nor"
+        ):
+            server.select_backend()
