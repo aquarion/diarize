@@ -30,6 +30,19 @@ python -m pip install --upgrade pip
 pip install -e .
 ```
 
+## Testing
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+Covers `config.py`, `render.py`, `speakers.py`, `transcribe.py`, `media.py`,
+and `app.py`'s CLI/config-subcommand layer, all via mocked subprocess calls
+so no GPU, HF token, or real audio file is needed. `media.py` additionally
+gets a handful of real integration tests against actual `ffmpeg`/`ffprobe`
+output, which skip automatically if those aren't on `PATH`.
+
 ## Prerequisites
 
 1. Hugging Face token with read access.

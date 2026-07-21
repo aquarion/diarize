@@ -1,0 +1,59 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    name: python (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      # Deliberately not `pip install -e .` - the full dependency list
+      # (whisperx, torch, ...) is only ever imported lazily inside function
+      # bodies, and the test suite mocks every subprocess/model call, so
+      # pytest alone is enough. Keeps CI fast and avoids fighting per-OS
+      # CUDA/mlx wheel resolution for a test run that doesn't need them.
+      - run: pip install pytest
+      - run: pytest -v
+
+  mcp:
+    name: mcp (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: mcp
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: pytest -v
+
+  swift:
+    name: swift (macos-latest)
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: swift
+    steps:
+      - uses: actions/checkout@v7
+      - run: swift build
+      - run: swift test
