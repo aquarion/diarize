@@ -12,6 +12,7 @@ dependencies = [
   "whisperx==3.8.*",
   "mlx-whisper>=0.4.2; platform_system == 'Darwin' and platform_machine == 'arm64'",
   "av (>=17.0.1,<18.0.0)",
+  "hf_xet",
 ]
 
 [tool.setuptools]

@@ -48,6 +48,18 @@ def resolve_whisperx_runtime(cfg: AppConfig) -> tuple[str | None, str]:
     return None, cfg.compute_type
 
 
+def _resolve_whisperx_bin(whisperx_bin: str) -> str:
+    """Resolve the whisperx console script, preferring the one next to this
+    interpreter (its venv's Scripts/bin dir isn't necessarily on PATH)."""
+    if Path(whisperx_bin).is_absolute():
+        return whisperx_bin
+    exe_suffix = ".exe" if sys.platform == "win32" else ""
+    sibling = Path(sys.executable).parent / f"{whisperx_bin}{exe_suffix}"
+    if sibling.exists():
+        return str(sibling)
+    return whisperx_bin
+
+
 def _build_whisperx_cmd(
     wav_path: Path,
     cfg: AppConfig,
@@ -56,7 +68,7 @@ def _build_whisperx_cmd(
     device: str | None,
 ) -> list[str]:
     cmd = [
-        cfg.whisperx_bin,
+        _resolve_whisperx_bin(cfg.whisperx_bin),
         str(wav_path),
         "--model",
         cfg.model,

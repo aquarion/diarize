@@ -47,6 +47,22 @@ def test_uses_venv_python_when_present(tmp_path, monkeypatch):
     assert cmd[0] == str(venv_py)
 
 
+def test_uses_windows_venv_python_when_present(tmp_path, monkeypatch):
+    app_py = tmp_path / "python" / "app.py"
+    app_py.parent.mkdir(parents=True)
+    app_py.touch()
+    venv_py = tmp_path / "python" / ".venv" / "Scripts" / "python.exe"
+    venv_py.parent.mkdir(parents=True)
+    venv_py.touch()
+    monkeypatch.setattr(server, "REPO_ROOT", tmp_path)
+
+    with patch("platform.system", return_value="Windows"):
+        name, cmd = server.select_backend()
+
+    assert name == "python"
+    assert cmd[0] == str(venv_py)
+
+
 def test_returns_none_when_nothing_available(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "REPO_ROOT", tmp_path)
 

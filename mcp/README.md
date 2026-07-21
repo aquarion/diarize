@@ -4,6 +4,8 @@ MCP server that exposes `transcribe` and `get_transcript` tools to Claude Deskto
 
 ## Setup
 
+macOS / Linux:
+
 ```bash
 cd mcp
 python -m venv .venv
@@ -11,9 +13,18 @@ source .venv/bin/activate
 pip install -e .
 ```
 
+Windows:
+
+```powershell
+cd mcp
+python -m venv .venv
+.venv\Scripts\activate
+pip install -e .
+```
+
 ## Claude Desktop Configuration
 
-Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
+macOS — edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ```json
 {
@@ -27,6 +38,19 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 ```
 
 Replace `/absolute/path/to/diarize` with the actual repo path (e.g. `/Users/yourname/code/aquarion/diarize`).
+
+Windows — edit `%APPDATA%\Claude\claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "diarize": {
+      "command": "C:\\absolute\\path\\to\\diarize\\mcp\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\absolute\\path\\to\\diarize\\mcp\\server.py"]
+    }
+  }
+}
+```
 
 ## Tools
 
@@ -48,7 +72,8 @@ Returns one of:
 ## Backend Selection
 
 1. macOS + `swift/.build/release/diarize` exists → Swift CLI
-2. Otherwise → Python CLI via `python/.venv/bin/python python/app.py` (or system Python if no venv)
+2. Otherwise → Python CLI via the `python/.venv` interpreter (`bin/python` on macOS/Linux,
+   `Scripts\python.exe` on Windows), or system Python if that venv doesn't exist
 
 ## Usage Example
 

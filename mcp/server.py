@@ -25,7 +25,11 @@ def select_backend() -> tuple[str, list[str]] | None:
             return "swift", [str(swift_cli)]
     app_py = REPO_ROOT / "python" / "app.py"
     if app_py.exists():
-        venv_py = REPO_ROOT / "python" / ".venv" / "bin" / "python"
+        venv_dir = REPO_ROOT / "python" / ".venv"
+        if platform.system() == "Windows":
+            venv_py = venv_dir / "Scripts" / "python.exe"
+        else:
+            venv_py = venv_dir / "bin" / "python"
         python_exe = str(venv_py) if venv_py.exists() else sys.executable
         return "python", [python_exe, str(app_py)]
     return None
