@@ -5,8 +5,8 @@ import logging.handlers
 import os
 import platform
 import re
+import shutil
 import subprocess
-import sys
 import threading
 import time
 import uuid
@@ -42,25 +42,31 @@ if not logger.handlers:
     logger.addHandler(_handler)
 
 
-def select_backend() -> tuple[str, list[str]] | None:
-    """Return (backend_name, argv_prefix) or None if no backend is available."""
+class BackendUnavailableError(Exception):
+    """Raised by select_backend() with a precise reason no backend could be
+    selected (not just a generic "no backend available")."""
+
+
+def select_backend() -> tuple[str, list[str]]:
+    """Return (backend_name, argv_prefix).
+
+    Raises BackendUnavailableError if no backend can be used.
+    """
     if platform.system() == "Darwin":
         swift_cli = REPO_ROOT / "swift" / ".build" / "release" / "diarize"
         if swift_cli.exists():
             return "swift", [str(swift_cli)]
-    app_py = REPO_ROOT / "python" / "app.py"
-    if app_py.exists():
-        venv_dir = REPO_ROOT / "python" / ".venv"
-        if platform.system() == "Windows":
-            venv_py = venv_dir / "Scripts" / "python.exe"
-        else:
-            venv_py = venv_dir / "bin" / "python"
-        python_exe = str(venv_py) if venv_py.exists() else sys.executable
-        # -u: CPython fully buffers stdout when it isn't a tty (i.e. when
-        # piped, as here), which would otherwise hold back every "==> ..."
-        # progress line until the process exits - defeating live streaming.
-        return "python", [python_exe, "-u", str(app_py)]
-    return None
+    python_dir = REPO_ROOT / "python"
+    app_py = python_dir / "app.py"
+    if not app_py.exists():
+        raise BackendUnavailableError(f"neither the Swift CLI nor {app_py} was found")
+    uv_exe = shutil.which("uv")
+    if uv_exe is None:
+        raise BackendUnavailableError(f"found {app_py} but uv is not on PATH to run it")
+    # `uv run` resolves/syncs python/.venv from pyproject.toml + uv.lock on
+    # every invocation (self-healing - no stale or missing venv to silently
+    # fall back from, unlike the old manual venv-path lookup).
+    return "python", [uv_exe, "run", "--directory", str(python_dir), "app.py"]
 
 
 def parse_transcript_path(stdout: str, backend: str) -> str | None:
@@ -209,19 +215,23 @@ def transcribe(file_path: str, num_speakers: int) -> dict:
     p = Path(file_path).expanduser()
     if not p.exists():
         return {"error": f"file not found: {file_path}"}
-    backend_info = select_backend()
-    if backend_info is None:
-        logger.error("no backend available for %s", p)
-        return {
-            "error": "no backend available (Swift CLI not built, Python CLI not found)"
-        }
-    backend_name, cmd = backend_info
+    try:
+        backend_name, cmd = select_backend()
+    except BackendUnavailableError as e:
+        logger.error("no backend available for %s: %s", p, e)
+        return {"error": f"no backend available: {e}"}
     proc = subprocess.Popen(
         cmd + [str(p), str(num_speakers), "--yes"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         stdin=subprocess.DEVNULL,
         cwd=str(REPO_ROOT),
+        # CPython fully buffers stdout when it isn't a tty (i.e. when piped,
+        # as here), which would otherwise hold back every "==> ..." progress
+        # line until the process exits - defeating live streaming. Set via
+        # env rather than a `python -u` flag since `uv run` owns the actual
+        # interpreter invocation now. Harmless no-op for the Swift backend.
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
     )
     job_id = str(uuid.uuid4())
     jobs[job_id] = Job(proc=proc, backend=backend_name, job_id=job_id)
@@ -297,13 +307,11 @@ def get_config(key: str) -> dict:
     or {"error": "<message>"} on failure (e.g. unknown key - the error
     lists the valid keys).
     """
-    backend_info = select_backend()
-    if backend_info is None:
-        logger.error("no backend available for get_config(%s)", key)
-        return {
-            "error": "no backend available (Swift CLI not built, Python CLI not found)"
-        }
-    backend_name, cmd = backend_info
+    try:
+        backend_name, cmd = select_backend()
+    except BackendUnavailableError as e:
+        logger.error("no backend available for get_config(%s): %s", key, e)
+        return {"error": f"no backend available: {e}"}
     try:
         result = subprocess.run(
             cmd + ["config", "get", key],
@@ -333,13 +341,11 @@ def set_config(key: str, value: str) -> dict:
     or {"error": "<message>"} on failure (e.g. unknown key, wrong type -
     the error explains which).
     """
-    backend_info = select_backend()
-    if backend_info is None:
-        logger.error("no backend available for set_config(%s)", key)
-        return {
-            "error": "no backend available (Swift CLI not built, Python CLI not found)"
-        }
-    backend_name, cmd = backend_info
+    try:
+        backend_name, cmd = select_backend()
+    except BackendUnavailableError as e:
+        logger.error("no backend available for set_config(%s): %s", key, e)
+        return {"error": f"no backend available: {e}"}
     try:
         result = subprocess.run(
             cmd + ["config", "set", key, value],

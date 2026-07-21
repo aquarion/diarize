@@ -1,5 +1,6 @@
 from unittest.mock import patch
 
+import pytest
 import server
 
 
@@ -22,51 +23,57 @@ def test_falls_back_to_python_when_swift_missing(tmp_path, monkeypatch):
     app_py.touch()
     monkeypatch.setattr(server, "REPO_ROOT", tmp_path)
 
-    with patch("platform.system", return_value="Darwin"):
-        result = server.select_backend()
-
-    assert result is not None
-    name, cmd = result
-    assert name == "python"
-    assert str(app_py) in " ".join(cmd)
-
-
-def test_uses_venv_python_when_present(tmp_path, monkeypatch):
-    app_py = tmp_path / "python" / "app.py"
-    app_py.parent.mkdir(parents=True)
-    app_py.touch()
-    venv_py = tmp_path / "python" / ".venv" / "bin" / "python"
-    venv_py.parent.mkdir(parents=True)
-    venv_py.touch()
-    monkeypatch.setattr(server, "REPO_ROOT", tmp_path)
-
-    with patch("platform.system", return_value="Linux"):
+    with patch("platform.system", return_value="Darwin"), patch(
+        "shutil.which", return_value="/usr/local/bin/uv"
+    ):
         name, cmd = server.select_backend()
 
     assert name == "python"
-    assert cmd[0] == str(venv_py)
+    assert cmd == [
+        "/usr/local/bin/uv",
+        "run",
+        "--directory",
+        str(app_py.parent),
+        "app.py",
+    ]
 
 
-def test_uses_windows_venv_python_when_present(tmp_path, monkeypatch):
+def test_python_backend_runs_via_uv_on_any_platform(tmp_path, monkeypatch):
+    """uv itself resolves/syncs the venv, so backend selection no longer
+    branches on OS to find a venv interpreter - one code path everywhere."""
     app_py = tmp_path / "python" / "app.py"
     app_py.parent.mkdir(parents=True)
     app_py.touch()
-    venv_py = tmp_path / "python" / ".venv" / "Scripts" / "python.exe"
-    venv_py.parent.mkdir(parents=True)
-    venv_py.touch()
     monkeypatch.setattr(server, "REPO_ROOT", tmp_path)
 
-    with patch("platform.system", return_value="Windows"):
-        name, cmd = server.select_backend()
+    for os_name in ("Windows", "Linux", "Darwin"):
+        with patch("platform.system", return_value=os_name), patch(
+            "shutil.which", return_value="/path/to/uv"
+        ):
+            name, cmd = server.select_backend()
+        assert name == "python"
+        assert cmd[0] == "/path/to/uv"
+        assert cmd[1:3] == ["run", "--directory"]
 
-    assert name == "python"
-    assert cmd[0] == str(venv_py)
+
+def test_raises_precise_error_when_python_found_but_uv_missing(tmp_path, monkeypatch):
+    app_py = tmp_path / "python" / "app.py"
+    app_py.parent.mkdir(parents=True)
+    app_py.touch()
+    monkeypatch.setattr(server, "REPO_ROOT", tmp_path)
+
+    with patch("platform.system", return_value="Linux"), patch(
+        "shutil.which", return_value=None
+    ):
+        with pytest.raises(server.BackendUnavailableError, match="uv is not on PATH"):
+            server.select_backend()
 
 
-def test_returns_none_when_nothing_available(tmp_path, monkeypatch):
+def test_raises_precise_error_when_nothing_available(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "REPO_ROOT", tmp_path)
 
     with patch("platform.system", return_value="Linux"):
-        result = server.select_backend()
-
-    assert result is None
+        with pytest.raises(
+            server.BackendUnavailableError, match="neither the Swift CLI nor"
+        ):
+            server.select_backend()
