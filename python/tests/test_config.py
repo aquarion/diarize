@@ -1,8 +1,18 @@
 import json
+import sys
 
 import pytest
 
 import config
+
+# Python's pathlib refuses to actually instantiate a WindowsPath on a real
+# POSIX system (NotImplementedError), even with os.name monkeypatched to
+# "nt" - so these two can only run for real on an actual Windows host. The
+# windows-latest CI job covers them natively there without any monkeypatch
+# inconsistency to trip over.
+windows_only = pytest.mark.skipif(
+    sys.platform != "win32", reason="Path() can't construct a WindowsPath off Windows"
+)
 
 # --- mask_secret ---
 
@@ -74,6 +84,7 @@ def test_default_config_path_darwin(monkeypatch):
     )
 
 
+@windows_only
 def test_default_config_path_windows_uses_appdata(monkeypatch):
     # Forward slashes throughout: backslash literals would only parse as
     # separators on WindowsPath, breaking this test on POSIX test runners.
@@ -85,6 +96,7 @@ def test_default_config_path_windows_uses_appdata(monkeypatch):
     )
 
 
+@windows_only
 def test_default_config_path_windows_falls_back_without_appdata(monkeypatch):
     monkeypatch.setattr(config.sys, "platform", "win32")
     monkeypatch.setattr(config.os, "name", "nt")
