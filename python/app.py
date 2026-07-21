@@ -21,15 +21,7 @@ import os
 import sys
 from pathlib import Path
 
-from config import (
-    _resolve_path,
-    default_config_path,
-    ensure_default_config,
-    load_config,
-    load_config_data,
-    prompt_for_required_config,
-    save_config_data,
-)
+from media import MediaProbeError, extract_audio, has_video_stream
 from render import make_vault_target, render_markdown, terminal_link
 from speakers import (
     coalesce_segments,
@@ -40,47 +32,105 @@ from speakers import (
 )
 from transcribe import load_segments, run_transcription_and_diarization
 
+from config import (
+    DEFAULTS,
+    _resolve_path,
+    coerce_config_value,
+    default_config_path,
+    ensure_default_config,
+    load_config,
+    load_config_data,
+    mask_secret,
+    prompt_for_required_config,
+    save_config_data,
+)
+
 HERE = Path(__file__).resolve().parent
+
+
+def _normalize_argv(argv: list[str]) -> list[str]:
+    """Default to the 'transcribe' subcommand so `app.py <wav> <n>` (the
+    original invocation, predating the 'config' subcommand) keeps working."""
+    if len(argv) > 1 and argv[1] in ("transcribe", "config", "-h", "--help"):
+        return argv
+    return [argv[0], "transcribe"] + argv[1:]
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run diarization and export an Obsidian markdown transcript."
     )
-    parser.add_argument("wav", help="Path to input WAV file")
-    parser.add_argument(
+    subparsers = parser.add_subparsers(dest="command")
+
+    transcribe_parser = subparsers.add_parser(
+        "transcribe", help="Transcribe and diarize an audio or video file (default)"
+    )
+    transcribe_parser.add_argument(
+        "wav",
+        help="Path to input audio file, or a video file (audio is extracted"
+        " automatically)",
+    )
+    transcribe_parser.add_argument(
+        "num_speakers",
+        type=int,
+        help="Number of speakers in the recording",
+    )
+    transcribe_parser.add_argument(
         "--config",
         default=str(default_config_path()),
         help="Path to JSON config (default: OS user config location)",
     )
-    parser.add_argument(
+    transcribe_parser.add_argument(
         "--skip-whisperx",
         action="store_true",
         help="Skip WhisperX run and only relabel from existing JSON output",
     )
-    parser.add_argument(
+    transcribe_parser.add_argument(
         "--claude-guess",
         action="store_true",
         help="Ask the Claude CLI to guess speaker names from the transcript",
     )
-    parser.add_argument(
+    transcribe_parser.add_argument(
         "--yes",
         "-y",
         action="store_true",
         help="Non-interactive: accept all defaults without prompting",
     )
-    parser.add_argument(
+    transcribe_parser.add_argument(
         "--vault-output",
         metavar="PATH",
         help="Override the vault destination path for this file"
         " (e.g. ~/Obsidian/Meetings/standup.md)",
     )
-    parser.add_argument(
-        "num_speakers",
-        type=int,
-        help="Number of speakers in the recording",
+
+    config_common = argparse.ArgumentParser(add_help=False)
+    config_common.add_argument(
+        "--config",
+        default=str(default_config_path()),
+        help="Path to JSON config (default: OS user config location)",
     )
-    return parser.parse_args(argv[1:])
+
+    config_parser = subparsers.add_parser("config", help="View or edit configuration")
+    config_sub = config_parser.add_subparsers(dest="config_command", required=True)
+    config_sub.add_parser(
+        "show",
+        parents=[config_common],
+        help="Print the effective config (secrets masked)",
+    )
+    config_sub.add_parser(
+        "path", parents=[config_common], help="Print the config file path"
+    )
+    get_parser = config_sub.add_parser(
+        "get", parents=[config_common], help="Print one config value"
+    )
+    get_parser.add_argument("key", help="Config key, e.g. model")
+    set_parser = config_sub.add_parser(
+        "set", parents=[config_common], help="Set one config value and save"
+    )
+    set_parser.add_argument("key", help="Config key, e.g. model")
+    set_parser.add_argument("value", help="New value (comma-separated for list fields)")
+
+    return parser.parse_args(_normalize_argv(argv)[1:])
 
 
 def _relaunch_with_lib_path(argv: list[str]) -> None:
@@ -110,10 +160,61 @@ def _relaunch_with_lib_path(argv: list[str]) -> None:
     os.execv(sys.executable, [sys.executable] + argv)
 
 
-def main(argv: list[str]) -> int:
-    _relaunch_with_lib_path(argv)
-    args = parse_args(argv)
+def _config_show(args: argparse.Namespace) -> int:
+    cfg_path = _resolve_path(HERE, args.config)
+    data = load_config_data(cfg_path)
+    masked = {key: mask_secret(key, value) for key, value in sorted(data.items())}
+    print(f"Config file: {cfg_path}")
+    print(json.dumps(masked, indent=2))
+    return 0
 
+
+def _config_path(args: argparse.Namespace) -> int:
+    print(_resolve_path(HERE, args.config))
+    return 0
+
+
+def _config_get(args: argparse.Namespace) -> int:
+    if args.key not in DEFAULTS:
+        print(f"!! Unknown config key: {args.key}", file=sys.stderr)
+        print(f"    Valid keys: {', '.join(sorted(DEFAULTS))}", file=sys.stderr)
+        return 2
+    data = load_config_data(_resolve_path(HERE, args.config))
+    value = data.get(args.key, DEFAULTS[args.key])
+    print(value if isinstance(value, str) else json.dumps(value))
+    return 0
+
+
+def _config_set(args: argparse.Namespace) -> int:
+    if args.key not in DEFAULTS:
+        print(f"!! Unknown config key: {args.key}", file=sys.stderr)
+        print(f"    Valid keys: {', '.join(sorted(DEFAULTS))}", file=sys.stderr)
+        return 2
+    try:
+        value = coerce_config_value(args.key, args.value)
+    except ValueError as err:
+        print(f"!! {err}", file=sys.stderr)
+        return 2
+    cfg_path = _resolve_path(HERE, args.config)
+    ensure_default_config(cfg_path)
+    data = load_config_data(cfg_path)
+    data[args.key] = value
+    save_config_data(cfg_path, data)
+    print(f"==> Set {args.key} = {mask_secret(args.key, value)} in {cfg_path}")
+    return 0
+
+
+def run_config_command(args: argparse.Namespace) -> int:
+    handlers = {
+        "show": _config_show,
+        "path": _config_path,
+        "get": _config_get,
+        "set": _config_set,
+    }
+    return handlers[args.config_command](args)
+
+
+def run_transcribe(args: argparse.Namespace) -> int:
     cfg_path = _resolve_path(HERE, args.config)
     ensure_default_config(cfg_path)
     data = load_config_data(cfg_path)
@@ -145,6 +246,16 @@ def main(argv: list[str]) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     speakers_path = out_dir / Path(cfg.speakers_file).name
     whisper_json = out_dir / f"{wav_path.stem}.json"
+
+    if not args.skip_whisperx:
+        try:
+            if has_video_stream(wav_path):
+                print(f"==> Input has a video track; extracting audio: {wav_path}")
+                wav_path = extract_audio(wav_path, out_dir)
+                print(f"    extracted: {wav_path}")
+        except MediaProbeError as err:
+            print(f"!! {err}", file=sys.stderr)
+            return 2
 
     try:
         if args.vault_output:
@@ -196,6 +307,15 @@ def main(argv: list[str]) -> int:
     print(f"    local transcript    : {terminal_link(local_md)}")
     print(f"    vault transcript    : {terminal_link(vault_md)}")
     return 0
+
+
+def main(argv: list[str]) -> int:
+    _relaunch_with_lib_path(argv)
+    args = parse_args(argv)
+
+    if args.command == "config":
+        return run_config_command(args)
+    return run_transcribe(args)
 
 
 if __name__ == "__main__":

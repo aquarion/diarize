@@ -66,6 +66,31 @@ REQUIRED_ALWAYS: tuple[str, ...] = ("vault_path",)
 REQUIRED_FOR_WHISPERX: tuple[str, ...] = ("hf_token",)
 REQUIRED_FOR_ASSEMBLYAI: tuple[str, ...] = ("assemblyai_api_key",)
 
+SECRET_KEYS: tuple[str, ...] = ("hf_token", "assemblyai_api_key")
+
+
+def mask_secret(key: str, value: Any) -> Any:
+    """Mask secret values for display, keeping just enough of the tail to
+    confirm which one is loaded without exposing the whole thing."""
+    if key not in SECRET_KEYS or not isinstance(value, str) or not value:
+        return value
+    if len(value) <= 4:
+        return "*" * len(value)
+    return f"{'*' * (len(value) - 4)}{value[-4:]}"
+
+
+def coerce_config_value(key: str, raw: str) -> Any:
+    """Coerce a CLI-supplied string into the type `key` is stored as."""
+    default = DEFAULTS.get(key)
+    if isinstance(default, int):
+        try:
+            return int(raw)
+        except ValueError as err:
+            raise ValueError(f"{key} must be an integer") from err
+    if isinstance(default, list):
+        return [item.strip() for item in raw.split(",") if item.strip()]
+    return raw
+
 
 def default_config_path() -> Path:
     if sys.platform.startswith("linux"):

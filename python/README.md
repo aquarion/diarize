@@ -2,7 +2,7 @@
 
 General-purpose audio transcription + diarization utility that:
 
-1. Transcribes a WAV file.
+1. Transcribes an audio (or video) file.
 2. Detects speakers (diarization).
 3. Prompts you to name each detected speaker label.
 4. Produces a cleaned markdown transcript.
@@ -14,6 +14,7 @@ General-purpose audio transcription + diarization utility that:
 | --- | --- |
 | `app.py` | CLI entry point and orchestration. |
 | `config.py` | `AppConfig` dataclass, config load/save, path helpers. |
+| `media.py` | Detects video input and extracts its audio track before transcription. |
 | `render.py` | Markdown rendering, vault targeting, terminal output helpers. |
 | `speakers.py` | Speaker mapping, interactive labeling, Claude name guessing. |
 | `transcribe.py` | WhisperX and mlx-whisper+pyannote transcription pipelines. |
@@ -42,6 +43,11 @@ pip install -e .
 python3 app.py /path/to/audio.wav <num_speakers>
 ```
 
+You can also point it at a video file (e.g. an OBS recording) directly — if
+the input has a video track, its audio is automatically extracted to a WAV
+in the run's output directory before transcription. Requires `ffmpeg`/
+`ffprobe` on `PATH` (or in `extra_path`, see below).
+
 On first run, the utility creates config automatically and prompts for missing
 required values (such as Hugging Face token and vault path).
 
@@ -56,11 +62,29 @@ Default config path:
 Override with:
 
 ```bash
-python3 app.py /path/to/audio.wav --config /path/to/config.json
+python3 app.py /path/to/audio.wav <num_speakers> --config /path/to/config.json
 ```
 
 Speaker mapping (`speakers.json`) is stored in each meeting's output directory
 alongside the transcript, so each recording gets its own independent mapping.
+
+## Config Management
+
+The `config` subcommand reads and edits the same config file `transcribe`
+uses (respects `--config` the same way):
+
+```bash
+python3 app.py config path                  # print the config file location
+python3 app.py config show                  # print the effective config (secrets masked)
+python3 app.py config get model              # print one value
+python3 app.py config set model large-v3     # set one value and save
+python3 app.py config set extra_path "/a,/b" # list fields take comma-separated values
+```
+
+`get`/`set` validate the key against the known config fields and reject
+anything else. Secret fields (`hf_token`, `assemblyai_api_key`) are masked in
+`show` and in `set`'s confirmation output — only the last 4 characters are
+shown, enough to confirm which value is loaded without exposing it.
 
 ## Runtime Selection
 
