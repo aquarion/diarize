@@ -9,7 +9,7 @@ final class ConfigTests: XCTestCase {
 
         let (config, _) = try ConfigLoader.load(from: url)
         XCTAssertEqual(config.language, "en")
-        XCTAssertEqual(config.whisperkitModel, "openai_whisper-large-v3-turbo")
+        XCTAssertEqual(config.whisperkitModel, "openai_whisper-large-v3_turbo")
         XCTAssertEqual(config.vaultFilenameTemplate, "{audio_stem}.md")
     }
 
