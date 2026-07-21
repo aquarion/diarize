@@ -7,10 +7,19 @@ import Foundation
 struct DiarizeCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "diarize",
-        abstract: "Transcribe and diarize a WAV file, export to Obsidian."
+        abstract: "Transcribe and diarize audio/video files, export to Obsidian.",
+        subcommands: [Transcribe.self, ConfigCommand.self],
+        defaultSubcommand: Transcribe.self
+    )
+}
+
+struct Transcribe: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "transcribe",
+        abstract: "Transcribe and diarize an audio or video file (default)."
     )
 
-    @Argument(help: "Path to the WAV audio file") var wav: String
+    @Argument(help: "Path to the audio or video file") var wav: String
     @Argument(help: "Number of speakers in the recording") var numSpeakers: Int
 
     @Flag(name: .long, help: "Ask Claude to guess speaker names") var claudeGuess = false

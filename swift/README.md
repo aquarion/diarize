@@ -35,6 +35,13 @@ This builds both the `diarize` CLI and the `DiarizeApp` bundle.
 
 On first run, config is created automatically and you are prompted for any missing required values (vault path).
 
+You can also point it at a video file directly — if the input has a video
+track, its audio is extracted automatically (via AVFoundation, no external
+tools) before transcription. This only covers QuickTime-family containers
+(`.mp4`, `.mov`, `.m4v`, ...) — AVFoundation has no native `.mkv` support, so
+tools that default to `.mkv` (e.g. OBS) need to export as `.mp4`/`.mov`
+first.
+
 **App:**
 
 ```bash
@@ -45,12 +52,31 @@ Or open the `swift/` directory in Xcode and run the `DiarizeApp` scheme. Drag a 
 
 ## CLI Options
 
+`diarize <wav> <num_speakers>` implicitly runs the `transcribe` subcommand
+(the default), so existing invocations keep working unchanged.
+
 ```
 --claude-guess      Ask Claude to guess speaker names from transcript context
 -y, --yes           Non-interactive: accept all defaults
 --vault-output      Override vault output path for this file
 --config            Path to config JSON file
 ```
+
+## Config Management
+
+The `config` subcommand reads and edits the same config file `transcribe`
+uses (respects `--config` the same way):
+
+```bash
+.build/release/diarize config path                    # print the config file location
+.build/release/diarize config show                     # print the effective config (secrets masked)
+.build/release/diarize config get language              # print one value
+.build/release/diarize config set language fr            # set one value and save
+```
+
+`get`/`set` validate the key against the known config fields. The secret
+field (`anthropic_api_key`) is masked in `show` and in `set`'s confirmation
+output — only the last 4 characters are shown.
 
 ## Config Location
 

@@ -59,6 +59,7 @@ public enum DiarizeError: Error, LocalizedError {
     case vaultWriteFailed(URL, any Error)
     case claudeAPIFailed(String)
     case configMissing(String)
+    case mediaExtractionFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -69,6 +70,7 @@ public enum DiarizeError: Error, LocalizedError {
         case .vaultWriteFailed(let u, let e): return "Failed to write vault at \(u.path): \(e)"
         case .claudeAPIFailed(let m): return "Claude API error: \(m)"
         case .configMissing(let k): return "Required config missing: \(k)"
+        case .mediaExtractionFailed(let m): return "Media extraction failed: \(m)"
         }
     }
 }
