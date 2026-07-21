@@ -23,18 +23,24 @@ General-purpose audio transcription + diarization utility that:
 
 ## Installation
 
+Uses [uv](https://docs.astral.sh/uv/) to manage the Python version and
+dependencies — no manual venv to create, activate, or let drift.
+[Install uv](https://docs.astral.sh/uv/getting-started/installation/) if you
+don't have it, then just run the tool:
+
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-pip install -e .
+uv run app.py /path/to/audio.wav <num_speakers>
 ```
+
+`uv run` resolves and syncs `.venv` from `pyproject.toml`/`uv.lock` (pinned to
+Python 3.13 via `.python-version`) on every invocation — self-healing, so
+there's no stale or missing environment to debug. This is also how the MCP
+server invokes this backend (see `mcp/server.py`).
 
 ## Testing
 
 ```bash
-pip install -e ".[dev]"
-pytest
+uv run --extra dev pytest
 ```
 
 Covers `config.py`, `render.py`, `speakers.py`, `transcribe.py`, `media.py`,
@@ -53,7 +59,7 @@ output, which skip automatically if those aren't on `PATH`.
 ## Quickstart
 
 ```bash
-python3 app.py /path/to/audio.wav <num_speakers>
+uv run app.py /path/to/audio.wav <num_speakers>
 ```
 
 You can also point it at a video file (e.g. an OBS recording) directly — if
@@ -75,7 +81,7 @@ Default config path:
 Override with:
 
 ```bash
-python3 app.py /path/to/audio.wav <num_speakers> --config /path/to/config.json
+uv run app.py /path/to/audio.wav <num_speakers> --config /path/to/config.json
 ```
 
 Speaker mapping (`speakers.json`) is stored in each meeting's output directory
@@ -87,11 +93,11 @@ The `config` subcommand reads and edits the same config file `transcribe`
 uses (respects `--config` the same way):
 
 ```bash
-python3 app.py config path                  # print the config file location
-python3 app.py config show                  # print the effective config (secrets masked)
-python3 app.py config get model              # print one value
-python3 app.py config set model large-v3     # set one value and save
-python3 app.py config set extra_path "/a,/b" # list fields take comma-separated values
+uv run app.py config path                  # print the config file location
+uv run app.py config show                  # print the effective config (secrets masked)
+uv run app.py config get model              # print one value
+uv run app.py config set model large-v3     # set one value and save
+uv run app.py config set extra_path "/a,/b" # list fields take comma-separated values
 ```
 
 `get`/`set` validate the key against the known config fields and reject
@@ -138,26 +144,26 @@ Enable mlx-whisper path:
 Re-label from existing JSON without rerunning transcription:
 
 ```bash
-python3 app.py /path/to/audio.wav 3 --skip-whisperx
+uv run app.py /path/to/audio.wav 3 --skip-whisperx
 ```
 
 Ask Claude CLI to guess speaker names from transcript context (uses calendar/email
 MCP tools if available):
 
 ```bash
-python3 app.py /path/to/audio.wav 3 --claude-guess
+uv run app.py /path/to/audio.wav 3 --claude-guess
 ```
 
 Accept all defaults non-interactively (useful combined with `--claude-guess`):
 
 ```bash
-python3 app.py /path/to/audio.wav 3 --claude-guess --yes
+uv run app.py /path/to/audio.wav 3 --claude-guess --yes
 ```
 
 Override the vault output path for a specific file:
 
 ```bash
-python3 app.py /path/to/audio.wav 3 --vault-output ~/Obsidian/Meetings/standup.md
+uv run app.py /path/to/audio.wav 3 --vault-output ~/Obsidian/Meetings/standup.md
 ```
 
 ## Output Layout

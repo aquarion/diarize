@@ -87,8 +87,11 @@ Returns `{"status": "ok", "message": "<confirmation>"}` or `{"error": "<message>
 ## Backend Selection
 
 1. macOS + `swift/.build/release/diarize` exists → Swift CLI
-2. Otherwise → Python CLI via the `python/.venv` interpreter (`bin/python` on macOS/Linux,
-   `Scripts\python.exe` on Windows), or system Python if that venv doesn't exist
+2. Otherwise → Python CLI via `uv run --directory python app.py`. Requires
+   [uv](https://docs.astral.sh/uv/) on `PATH` — it resolves/syncs
+   `python/.venv` from `python/pyproject.toml` + `python/uv.lock` on every
+   invocation, so there's no separately-managed venv to set up or for this
+   server to go stale against.
 
 ## Usage Example
 

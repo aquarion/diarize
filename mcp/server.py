@@ -5,8 +5,8 @@ import logging.handlers
 import os
 import platform
 import re
+import shutil
 import subprocess
-import sys
 import threading
 import time
 import uuid
@@ -48,18 +48,16 @@ def select_backend() -> tuple[str, list[str]] | None:
         swift_cli = REPO_ROOT / "swift" / ".build" / "release" / "diarize"
         if swift_cli.exists():
             return "swift", [str(swift_cli)]
-    app_py = REPO_ROOT / "python" / "app.py"
-    if app_py.exists():
-        venv_dir = REPO_ROOT / "python" / ".venv"
-        if platform.system() == "Windows":
-            venv_py = venv_dir / "Scripts" / "python.exe"
-        else:
-            venv_py = venv_dir / "bin" / "python"
-        python_exe = str(venv_py) if venv_py.exists() else sys.executable
-        # -u: CPython fully buffers stdout when it isn't a tty (i.e. when
-        # piped, as here), which would otherwise hold back every "==> ..."
-        # progress line until the process exits - defeating live streaming.
-        return "python", [python_exe, "-u", str(app_py)]
+    python_dir = REPO_ROOT / "python"
+    if (python_dir / "app.py").exists():
+        uv_exe = shutil.which("uv")
+        if uv_exe is None:
+            logger.error("python backend found at %s but uv is not on PATH", python_dir)
+            return None
+        # `uv run` resolves/syncs python/.venv from pyproject.toml + uv.lock
+        # on every invocation (self-healing - no stale or missing venv to
+        # silently fall back from, unlike the old manual venv-path lookup).
+        return "python", [uv_exe, "run", "--directory", str(python_dir), "app.py"]
     return None
 
 
@@ -222,6 +220,12 @@ def transcribe(file_path: str, num_speakers: int) -> dict:
         stderr=subprocess.PIPE,
         stdin=subprocess.DEVNULL,
         cwd=str(REPO_ROOT),
+        # CPython fully buffers stdout when it isn't a tty (i.e. when piped,
+        # as here), which would otherwise hold back every "==> ..." progress
+        # line until the process exits - defeating live streaming. Set via
+        # env rather than a `python -u` flag since `uv run` owns the actual
+        # interpreter invocation now. Harmless no-op for the Swift backend.
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
     )
     job_id = str(uuid.uuid4())
     jobs[job_id] = Job(proc=proc, backend=backend_name, job_id=job_id)
