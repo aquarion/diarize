@@ -23,7 +23,21 @@ cd swift
 swift build -c release
 ```
 
-This builds both the `diarize` CLI and the `DiarizeApp` bundle.
+This builds both the `diarize` CLI and the `DiarizeApp` bundle as separate
+products (a plain SwiftPM build does not embed one in the other).
+
+To get a single `DiarizeApp.app` that carries the CLI with it, build via the
+helper script instead, which copies `diarize` into the app bundle's
+`Contents/Resources/` after building both:
+
+```bash
+./scripts/build-app.sh
+```
+
+Once installed, use the app's **Install 'diarize' Command in Terminal** menu
+item to symlink the bundled CLI onto `PATH` (`/usr/local/bin/diarize`) — it
+tries a plain symlink first and falls back to prompting for your password
+only if that directory isn't writable.
 
 ## Quickstart
 

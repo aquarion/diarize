@@ -13,6 +13,7 @@ struct DiarizeAppApp: App {
             CommandGroup(after: .appSettings) {
                 Button("Settings…") { state.screen = .settings }
                     .keyboardShortcut(",", modifiers: .command)
+                Button("Install 'diarize' Command in Terminal") { state.installCLI() }
             }
         }
     }
