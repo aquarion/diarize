@@ -56,7 +56,10 @@ def select_backend() -> tuple[str, list[str]] | None:
         else:
             venv_py = venv_dir / "bin" / "python"
         python_exe = str(venv_py) if venv_py.exists() else sys.executable
-        return "python", [python_exe, str(app_py)]
+        # -u: CPython fully buffers stdout when it isn't a tty (i.e. when
+        # piped, as here), which would otherwise hold back every "==> ..."
+        # progress line until the process exits - defeating live streaming.
+        return "python", [python_exe, "-u", str(app_py)]
     return None
 
 
