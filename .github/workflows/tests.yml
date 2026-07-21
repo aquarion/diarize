@@ -41,11 +41,13 @@ jobs:
         working-directory: mcp
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-      - run: pip install -e ".[dev]"
-      - run: pytest -v
+      # uv manages its own Python (per .python-version) - no
+      # actions/setup-python needed. Uses uv/uv.lock directly rather than
+      # a bare `pip install`, so CI validates the same lockfile real users
+      # get via `uv sync`.
+      - uses: astral-sh/setup-uv@v9
+      - run: uv sync --extra dev
+      - run: uv run pytest -v
 
   swift:
     name: swift (macos-latest)

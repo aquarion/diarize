@@ -4,34 +4,38 @@ MCP server that exposes `transcribe`, `get_transcript`, `get_config`, and `set_c
 
 ## Setup
 
-macOS / Linux:
+Uses [uv](https://docs.astral.sh/uv/) to manage the Python version and
+dependencies — no manual venv to create or activate.
+[Install uv](https://docs.astral.sh/uv/getting-started/installation/) if you
+don't have it:
 
 ```bash
 cd mcp
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
+uv sync
 ```
 
-Windows:
-
-```powershell
-cd mcp
-python -m venv .venv
-.venv\Scripts\activate
-pip install -e .
-```
+`uv run` (used by the Claude Desktop config below, and by `select_backend()`
+when invoking the `python/` backend) resolves/syncs `.venv` from
+`pyproject.toml` + `uv.lock` on every launch — no separately-managed venv
+that can go stale or point at a Python interpreter that's since moved
+(the original motivation for this over a plain `pip`/venv setup).
 
 ## Claude Desktop Configuration
 
-macOS — edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
+Point `command` at your `uv` binary's **absolute path**, not just `"uv"` —
+Claude Desktop launches this as a GUI subprocess, which may not inherit your
+shell's `PATH`. Find yours with `which uv` (macOS/Linux) or `where.exe uv`
+(Windows) first.
+
+macOS/Linux — edit `~/Library/Application Support/Claude/claude_desktop_config.json`
+(macOS) or the equivalent Linux client config:
 
 ```json
 {
   "mcpServers": {
     "diarize": {
-      "command": "/absolute/path/to/diarize/mcp/.venv/bin/python",
-      "args": ["/absolute/path/to/diarize/mcp/server.py"]
+      "command": "/absolute/path/to/uv",
+      "args": ["run", "--directory", "/absolute/path/to/diarize/mcp", "server.py"]
     }
   }
 }
@@ -45,8 +49,8 @@ Windows — edit `%APPDATA%\Claude\claude_desktop_config.json`:
 {
   "mcpServers": {
     "diarize": {
-      "command": "C:\\absolute\\path\\to\\diarize\\mcp\\.venv\\Scripts\\python.exe",
-      "args": ["C:\\absolute\\path\\to\\diarize\\mcp\\server.py"]
+      "command": "C:\\absolute\\path\\to\\uv.exe",
+      "args": ["run", "--directory", "C:\\absolute\\path\\to\\diarize\\mcp", "server.py"]
     }
   }
 }
