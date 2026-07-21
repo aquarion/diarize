@@ -87,6 +87,10 @@ def parse_transcript_path(stdout: str, backend: str) -> str | None:
 # exception) - surface a failure instead of hanging on "running" forever.
 COLLECTOR_STALL_TIMEOUT = 10.0
 
+# config get/set complete near-instantly (no model loading, no transcription)
+# so these run synchronously rather than through the async Job/poll pattern.
+CONFIG_COMMAND_TIMEOUT = 15.0
+
 
 @dataclass
 class Job:
@@ -283,6 +287,78 @@ def get_transcript(job_id: str) -> dict:
         return {"status": "failed", "error": str(e)}
     logger.info("job %s done, output_path=%s", job_id, path)
     return {"status": "done", "transcript": transcript_text, "output_path": path}
+
+
+@mcp.tool()
+def get_config(key: str) -> dict:
+    """Get a diarize config value (e.g. "vault_path", "model", "language").
+
+    Returns {"key": "<key>", "value": "<value>"} on success,
+    or {"error": "<message>"} on failure (e.g. unknown key - the error
+    lists the valid keys).
+    """
+    backend_info = select_backend()
+    if backend_info is None:
+        logger.error("no backend available for get_config(%s)", key)
+        return {
+            "error": "no backend available (Swift CLI not built, Python CLI not found)"
+        }
+    backend_name, cmd = backend_info
+    try:
+        result = subprocess.run(
+            cmd + ["config", "get", key],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            cwd=str(REPO_ROOT),
+            timeout=CONFIG_COMMAND_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("get_config(%s) timed out (backend=%s)", key, backend_name)
+        return {"error": f"config get timed out after {CONFIG_COMMAND_TIMEOUT}s"}
+    if result.returncode != 0:
+        logger.error(
+            "get_config(%s) failed (backend=%s): %s", key, backend_name, result.stderr
+        )
+        return {"error": result.stderr.strip() or f"exit code {result.returncode}"}
+    return {"key": key, "value": result.stdout.strip()}
+
+
+@mcp.tool()
+def set_config(key: str, value: str) -> dict:
+    """Set a diarize config value and save it.
+
+    List fields (e.g. "extra_path") take comma-separated values.
+    Returns {"status": "ok", "message": "<confirmation>"} on success,
+    or {"error": "<message>"} on failure (e.g. unknown key, wrong type -
+    the error explains which).
+    """
+    backend_info = select_backend()
+    if backend_info is None:
+        logger.error("no backend available for set_config(%s)", key)
+        return {
+            "error": "no backend available (Swift CLI not built, Python CLI not found)"
+        }
+    backend_name, cmd = backend_info
+    try:
+        result = subprocess.run(
+            cmd + ["config", "set", key, value],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            cwd=str(REPO_ROOT),
+            timeout=CONFIG_COMMAND_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("set_config(%s) timed out (backend=%s)", key, backend_name)
+        return {"error": f"config set timed out after {CONFIG_COMMAND_TIMEOUT}s"}
+    if result.returncode != 0:
+        logger.error(
+            "set_config(%s) failed (backend=%s): %s", key, backend_name, result.stderr
+        )
+        return {"error": result.stderr.strip() or f"exit code {result.returncode}"}
+    logger.info("set_config(%s) ok (backend=%s)", key, backend_name)
+    return {"status": "ok", "message": result.stdout.strip()}
 
 
 if __name__ == "__main__":

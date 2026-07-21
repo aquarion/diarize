@@ -1,6 +1,6 @@
 # Diarize MCP Server
 
-MCP server that exposes `transcribe` and `get_transcript` tools to Claude Desktop.
+MCP server that exposes `transcribe`, `get_transcript`, `get_config`, and `set_config` tools to Claude Desktop.
 
 ## Setup
 
@@ -69,6 +69,21 @@ Returns one of:
 - `{"status": "done", "transcript": "<markdown>", "output_path": "<path>"}` — finished
 - `{"status": "failed", "error": "<message>"}` — something went wrong
 
+### `get_config(key)`
+
+Reads a diarize config value (e.g. `"vault_path"`, `"model"`, `"language"`) via the
+selected backend's `config get` command.
+
+Returns `{"key": "<key>", "value": "<value>"}` or `{"error": "<message>"}` — the
+error lists valid keys if `key` is unknown.
+
+### `set_config(key, value)`
+
+Sets a diarize config value via the selected backend's `config set` command. List
+fields (e.g. `"extra_path"`) take comma-separated values.
+
+Returns `{"status": "ok", "message": "<confirmation>"}` or `{"error": "<message>"}`.
+
 ## Backend Selection
 
 1. macOS + `swift/.build/release/diarize` exists → Swift CLI
@@ -82,4 +97,16 @@ You: Transcribe /Users/me/recordings/meeting.wav, 3 speakers.
 Claude: [calls transcribe → gets job_id]
 Claude: [calls get_transcript until status is "done"]
 Claude: Here's the transcript: ...
+
+You: What's my vault path set to?
+Claude: [calls get_config("vault_path")]
+Claude: It's set to ~/Obsidian.
+
+You: Switch my transcript language to French.
+Claude: [calls set_config("language", "fr")]
+Claude: Done — language is now fr.
 ```
+
+Note: valid config keys differ between backends (e.g. Python's `model` vs Swift's
+`whisperkit_model`) — an unknown-key error lists the real keys for whichever
+backend is active.

@@ -1,4 +1,5 @@
 import io
+import subprocess
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -316,6 +317,89 @@ def test_get_transcript_both_collectors_raise_simultaneously():
     assert result["status"] == "failed"
     assert "stdout broke" in result["error"]
     assert "stderr broke" in result["error"]
+
+
+def test_get_config_success():
+    mock_result = MagicMock(stdout="en\n", stderr="", returncode=0)
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.run", return_value=mock_result
+    ) as mock_run:
+        result = server.get_config("language")
+
+    assert result == {"key": "language", "value": "en"}
+    args = mock_run.call_args[0][0]
+    assert args == ["/bin/echo", "config", "get", "language"]
+
+
+def test_get_config_unknown_key():
+    mock_result = MagicMock(
+        stdout="",
+        stderr="!! Unknown config key: bogus\n    Valid keys: language, model\n",
+        returncode=2,
+    )
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.run", return_value=mock_result
+    ):
+        result = server.get_config("bogus")
+
+    assert "error" in result
+    assert "Valid keys" in result["error"]
+
+
+def test_get_config_no_backend(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "REPO_ROOT", tmp_path)
+    with patch("platform.system", return_value="Linux"):
+        result = server.get_config("language")
+    assert "error" in result
+    assert "no backend" in result["error"]
+
+
+def test_get_config_timeout():
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.run",
+        side_effect=subprocess.TimeoutExpired(cmd="diarize", timeout=15),
+    ):
+        result = server.get_config("language")
+    assert "error" in result
+    assert "timed out" in result["error"]
+
+
+def test_set_config_success():
+    mock_result = MagicMock(
+        stdout="==> Set language = fr in /tmp/config.json\n", stderr="", returncode=0
+    )
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.run", return_value=mock_result
+    ) as mock_run:
+        result = server.set_config("language", "fr")
+
+    assert result["status"] == "ok"
+    assert "language = fr" in result["message"]
+    args = mock_run.call_args[0][0]
+    assert args == ["/bin/echo", "config", "set", "language", "fr"]
+
+
+def test_set_config_unknown_key():
+    mock_result = MagicMock(
+        stdout="",
+        stderr="!! Unknown config key: bogus\n    Valid keys: language, model\n",
+        returncode=2,
+    )
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.run", return_value=mock_result
+    ):
+        result = server.set_config("bogus", "x")
+
+    assert "error" in result
+    assert "Valid keys" in result["error"]
+
+
+def test_set_config_no_backend(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "REPO_ROOT", tmp_path)
+    with patch("platform.system", return_value="Linux"):
+        result = server.set_config("language", "fr")
+    assert "error" in result
+    assert "no backend" in result["error"]
 
 
 def test_collector_error_kills_still_running_process():
