@@ -37,7 +37,7 @@ public struct AppConfig: Sendable {
         self.vaultSubdir = vaultSubdir; self.vaultFilenameTemplate = vaultFilenameTemplate
     }
 
-    static let jsonDefaults: [String: Any] = [
+    public static let jsonDefaults: [String: Any] = [
         "language": Defaults.language,
         "whisperkit_model": Defaults.whisperkitModel,
         "anthropic_api_key": Defaults.anthropicAPIKey,
