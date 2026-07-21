@@ -47,6 +47,11 @@ public struct AppConfig: Sendable {
         "vault_subdir": Defaults.vaultSubdir,
         "vault_filename_template": Defaults.vaultFilenameTemplate,
     ]
+
+    /// The known config keys, for CLI validation. Derived from
+    /// `jsonDefaults` rather than duplicated, and exposed as a clean
+    /// `Set<String>` rather than the raw untyped defaults dict.
+    public static var validKeys: Set<String> { Set(jsonDefaults.keys) }
 }
 
 public enum ConfigLoader {
@@ -116,5 +121,26 @@ public enum ConfigLoader {
         let data = try JSONSerialization.data(withJSONObject: raw,
                                               options: [.prettyPrinted, .sortedKeys])
         try data.write(to: url)
+    }
+
+    public static let secretKeys: Set<String> = ["anthropic_api_key"]
+
+    /// Masks secret values for display, keeping just enough of the tail to
+    /// confirm which one is loaded without exposing the whole thing.
+    public static func maskSecret(key: String, value: String) -> String {
+        guard secretKeys.contains(key), !value.isEmpty else { return value }
+        guard value.count > 4 else { return String(repeating: "*", count: value.count) }
+        return String(repeating: "*", count: value.count - 4) + String(value.suffix(4))
+    }
+
+    /// Masks all secret fields in a raw config dictionary, for display only.
+    public static func maskSecrets(_ raw: [String: Any]) -> [String: Any] {
+        var masked = raw
+        for key in secretKeys {
+            if let value = masked[key] as? String {
+                masked[key] = maskSecret(key: key, value: value)
+            }
+        }
+        return masked
     }
 }

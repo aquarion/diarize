@@ -40,4 +40,35 @@ final class ConfigTests: XCTestCase {
         let result = config.vaultFilenameTemplate.replacingOccurrences(of: "{audio_stem}", with: "meeting_2026-06-17")
         XCTAssertEqual(result, "meeting_2026-06-17.md")
     }
+
+    func testMaskSecretKeepsLastFourCharacters() {
+        XCTAssertEqual(ConfigLoader.maskSecret(key: "anthropic_api_key", value: "sk-ant-1234"), "*******1234")
+    }
+
+    func testMaskSecretFullyMasksShortValues() {
+        XCTAssertEqual(ConfigLoader.maskSecret(key: "anthropic_api_key", value: "abc"), "***")
+    }
+
+    func testMaskSecretLeavesNonSecretKeysUntouched() {
+        XCTAssertEqual(ConfigLoader.maskSecret(key: "language", value: "en"), "en")
+    }
+
+    func testMaskSecretsOnlyMasksKnownSecretFields() {
+        let raw: [String: Any] = ["anthropic_api_key": "sk-ant-1234", "language": "en"]
+        let masked = ConfigLoader.maskSecrets(raw)
+        XCTAssertEqual(masked["anthropic_api_key"] as? String, "*******1234")
+        XCTAssertEqual(masked["language"] as? String, "en")
+    }
+
+    func testValidKeysCoversAllConfigFields() {
+        let expected: Set<String> = [
+            "language", "whisperkit_model", "anthropic_api_key", "output_dir",
+            "transcript_title", "vault_path", "vault_subdir", "vault_filename_template",
+        ]
+        XCTAssertEqual(AppConfig.validKeys, expected)
+    }
+
+    func testValidKeysRejectsUnknownKey() {
+        XCTAssertFalse(AppConfig.validKeys.contains("not_a_real_key"))
+    }
 }

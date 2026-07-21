@@ -27,6 +27,16 @@ public struct Pipeline {
         let txCheckpoint = outputDir.appendingPathComponent("\(stem)_transcription.json")
         let diarCheckpoint = outputDir.appendingPathComponent("\(stem)_diarization.json")
 
+        // Only touch the source file if we're actually going to read it —
+        // both stages may already be satisfied by checkpoints.
+        var sourceURL = audioURL
+        let needsAudio = !FileManager.default.fileExists(atPath: txCheckpoint.path)
+            || !FileManager.default.fileExists(atPath: diarCheckpoint.path)
+        if needsAudio, try await MediaExtractor.hasVideoTrack(at: audioURL) {
+            progress.yield(.init(stage: .transcribing, fraction: 0.0, message: "Extracting audio from video track..."))
+            sourceURL = try await MediaExtractor.extractAudio(from: audioURL, to: outputDir)
+        }
+
         // --- Transcription ---
         let segments: [Segment]
         if FileManager.default.fileExists(atPath: txCheckpoint.path) {
@@ -34,7 +44,7 @@ public struct Pipeline {
             segments = try JSONDecoder().decode([Segment].self, from: Data(contentsOf: txCheckpoint))
         } else {
             progress.yield(.init(stage: .transcribing, fraction: 0.0, message: "Transcribing audio..."))
-            let raw = try await transcriber.transcribe(audioURL: audioURL)
+            let raw = try await transcriber.transcribe(audioURL: sourceURL)
             try JSONEncoder().encode(raw).write(to: txCheckpoint)
             segments = raw
             progress.yield(.init(stage: .transcribing, fraction: 1.0, message: "Transcription complete"))
@@ -47,7 +57,7 @@ public struct Pipeline {
             turns = try JSONDecoder().decode([Turn].self, from: Data(contentsOf: diarCheckpoint))
         } else {
             progress.yield(.init(stage: .diarizing, fraction: 0.0, message: "Diarizing speakers..."))
-            let raw = try await diarizer.diarize(audioURL: audioURL, numSpeakers: numSpeakers)
+            let raw = try await diarizer.diarize(audioURL: sourceURL, numSpeakers: numSpeakers)
             try JSONEncoder().encode(raw).write(to: diarCheckpoint)
             turns = raw
             progress.yield(.init(stage: .diarizing, fraction: 1.0, message: "Diarization complete"))
