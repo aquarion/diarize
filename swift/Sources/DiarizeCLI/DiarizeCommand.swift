@@ -1,5 +1,6 @@
 // swift/Sources/DiarizeCLI/DiarizeCommand.swift
 import ArgumentParser
+import Darwin
 import DiarizeKit
 import Foundation
 
@@ -28,6 +29,12 @@ struct Transcribe: AsyncParsableCommand {
     @Option(name: .long, help: "Path to config JSON file") var config: String?
 
     mutating func run() async throws {
+        // Line-buffer stdout instead of the libc default of full block
+        // buffering when not a tty - otherwise the MCP server (which pipes
+        // this process's stdout to read "==> ..." progress lines live)
+        // wouldn't see any output until the whole run finishes.
+        setvbuf(stdout, nil, _IOLBF, 0)
+
         let configURL = config.map { URL(fileURLWithPath: $0) } ?? ConfigLoader.configURL
         var (cfg, raw) = try ConfigLoader.load(from: configURL)
 
