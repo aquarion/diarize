@@ -233,3 +233,5 @@ config.json
 # Swift Package Manager
 .build/
 swift/.build
+
+graphify-out
