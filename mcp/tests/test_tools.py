@@ -54,6 +54,57 @@ def test_transcribe_starts_job(tmp_path):
     assert result["job_id"] in server.jobs
 
 
+def test_transcribe_spawns_backend_in_own_process_group(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    mock_proc = _make_proc(b"    local       : /tmp/t.md\n", b"", 0)
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ) as mock_popen:
+        server.transcribe(str(audio), 2)
+
+    # The backend must lead its own session/process group so cleanup can
+    # signal the whole tree (the python backend's real worker is a child of
+    # the `uv run` wrapper that proc points at).
+    assert mock_popen.call_args.kwargs["start_new_session"] is True
+
+
+def test_kill_after_collector_error_signals_process_group():
+    proc = MagicMock()
+    proc.poll.return_value = None  # still alive
+    proc.pid = 4242
+
+    job = server.Job.__new__(server.Job)  # skip __post_init__ collector threads
+    job.proc = proc
+    job.job_id = "kill-id"
+
+    with patch("os.getpgid", return_value=4242) as mock_getpgid, patch(
+        "os.killpg"
+    ) as mock_killpg:
+        job._kill_after_collector_error()
+
+    mock_getpgid.assert_called_once_with(4242)
+    mock_killpg.assert_called_once_with(4242, server.signal.SIGKILL)
+    # proc.kill() must NOT be used - that would miss the orphaned worker.
+    proc.kill.assert_not_called()
+
+
+def test_kill_after_collector_error_survives_dead_process():
+    proc = MagicMock()
+    proc.poll.return_value = None  # looked alive at poll()...
+
+    job = server.Job.__new__(server.Job)
+    job.proc = proc
+    job.job_id = "dead-id"
+
+    # ...but exited before killpg: ProcessLookupError must be swallowed.
+    with patch("os.getpgid", side_effect=ProcessLookupError):
+        job._kill_after_collector_error()  # must not raise
+
+    proc.wait.assert_called_once()
+
+
 def test_get_transcript_unknown_job():
     result = server.get_transcript("no-such-id")
     assert result == {"status": "failed", "error": "unknown job_id"}
@@ -418,10 +469,14 @@ def test_collector_error_kills_still_running_process():
     proc.stdout = _BrokenStdout()
     proc.stderr = io.BytesIO(b"")
     proc.returncode = None
+    proc.pid = 4242
     proc.poll.return_value = None  # still running when the error occurs
 
-    job = server.Job(proc=proc, backend="swift")
-    _wait(job)
+    with patch("os.getpgid", return_value=4242), patch("os.killpg") as mock_killpg:
+        job = server.Job(proc=proc, backend="swift")
+        _wait(job)
 
     assert job.is_complete()
-    proc.kill.assert_called_once()
+    # The whole process group is signalled (not just proc.pid) so the real
+    # worker survives no orphaning when proc is the `uv run` wrapper.
+    mock_killpg.assert_called_once_with(4242, server.signal.SIGKILL)

@@ -6,6 +6,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -129,10 +130,19 @@ class Job:
         """Best-effort: if the child is still alive, one collector dying
         means nobody is draining its pipe anymore, which can leave the
         child blocked on a full pipe write and the sibling collector
-        blocked reading forever. Kill it so both collectors unblock."""
+        blocked reading forever. Kill it so both collectors unblock.
+
+        Signals the whole process group (proc is spawned with
+        start_new_session=True), not just proc.pid: on the python backend
+        proc is the `uv run` wrapper, so killing it alone would orphan the
+        real worker it spawned. Falls back to proc.kill() if the group can't
+        be resolved (e.g. proc already reaped)."""
         try:
             if self.proc.poll() is None:
-                self.proc.kill()
+                try:
+                    os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # already exited between poll() and here
             self.proc.wait(timeout=5)
         except Exception:
             logger.exception(
@@ -232,6 +242,12 @@ def transcribe(file_path: str, num_speakers: int) -> dict:
         # env rather than a `python -u` flag since `uv run` owns the actual
         # interpreter invocation now. Harmless no-op for the Swift backend.
         env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        # Give the backend its own process group so we can signal the whole
+        # tree on cleanup. The python backend is spawned as `uv run app.py`,
+        # so proc.pid is the uv wrapper - a SIGKILL to it alone can't be
+        # forwarded (SIGKILL is uncatchable) and would orphan the real worker.
+        # Killing the group reaches that worker (and any swift helper procs).
+        start_new_session=True,
     )
     job_id = str(uuid.uuid4())
     jobs[job_id] = Job(proc=proc, backend=backend_name, job_id=job_id)
