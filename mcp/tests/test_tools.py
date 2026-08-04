@@ -59,15 +59,17 @@ def test_transcribe_spawns_backend_in_own_process_group(tmp_path):
     audio.touch()
     mock_proc = _make_proc(b"    local       : /tmp/t.md\n", b"", 0)
 
+    # Force the non-Darwin path so the caffeinate watcher doesn't add a second
+    # Popen call - this test is only about how the backend itself is spawned.
     with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
-        "subprocess.Popen", return_value=mock_proc
-    ) as mock_popen:
+        "platform.system", return_value="Linux"
+    ), patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
         server.transcribe(str(audio), 2)
 
     # The backend must lead its own session/process group so cleanup can
     # signal the whole tree (the python backend's real worker is a child of
     # the `uv run` wrapper that proc points at).
-    assert mock_popen.call_args.kwargs["start_new_session"] is True
+    assert mock_popen.call_args_list[0].kwargs["start_new_session"] is True
 
 
 def test_kill_after_collector_error_signals_process_group():
@@ -103,6 +105,88 @@ def test_kill_after_collector_error_survives_dead_process():
         job._kill_after_collector_error()  # must not raise
 
     proc.wait.assert_called_once()
+
+
+def test_transcribe_spawns_caffeinate_watcher_on_darwin(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    mock_proc = _make_proc(b"    local       : /tmp/t.md\n", b"", 0)
+    mock_proc.pid = 4242
+    mock_caffeinate_proc = MagicMock()
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "platform.system", return_value="Darwin"
+    ), patch("shutil.which", return_value="/usr/bin/caffeinate"), patch(
+        "subprocess.Popen", side_effect=[mock_proc, mock_caffeinate_proc]
+    ) as mock_popen:
+        server.transcribe(str(audio), 2)
+
+    # The backend command itself must not be wrapped - Job.proc has to stay
+    # the real backend process so kill()/wait() target it directly.
+    backend_call_cmd = mock_popen.call_args_list[0][0][0]
+    assert backend_call_cmd[0] == "/bin/echo"
+
+    caffeinate_call_cmd = mock_popen.call_args_list[1][0][0]
+    assert caffeinate_call_cmd == ["/usr/bin/caffeinate", "-i", "-w", "4242"]
+
+    # The watcher is reaped on a daemon thread so it can't linger as a zombie;
+    # wait for that thread to call wait() rather than asserting synchronously.
+    deadline = time.monotonic() + 1.0
+    while not mock_caffeinate_proc.wait.called and time.monotonic() < deadline:
+        time.sleep(0.01)
+    mock_caffeinate_proc.wait.assert_called_once()
+
+
+def test_transcribe_skips_caffeinate_off_darwin(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    mock_proc = _make_proc(b"    local       : /tmp/t.md\n", b"", 0)
+
+    # Off macOS the platform guard must short-circuit before shutil.which is
+    # even consulted - only the backend process should be spawned.
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "platform.system", return_value="Linux"
+    ), patch("shutil.which") as mock_which, patch(
+        "subprocess.Popen", return_value=mock_proc
+    ) as mock_popen:
+        server.transcribe(str(audio), 2)
+
+    assert mock_popen.call_count == 1
+    mock_which.assert_not_called()
+
+
+def test_transcribe_survives_caffeinate_spawn_failure(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    mock_proc = _make_proc(b"    local       : /tmp/t.md\n", b"", 0)
+    mock_proc.pid = 4242
+
+    # caffeinate is on PATH but its Popen raises - the backend job already
+    # started, so transcribe() must still register the job and return normally.
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "platform.system", return_value="Darwin"
+    ), patch("shutil.which", return_value="/usr/bin/caffeinate"), patch(
+        "subprocess.Popen", side_effect=[mock_proc, OSError("boom")]
+    ):
+        result = server.transcribe(str(audio), 2)
+
+    assert "job_id" in result
+    assert result["backend"] == "swift"
+
+
+def test_transcribe_no_caffeinate_when_unavailable(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    mock_proc = _make_proc(b"    local       : /tmp/t.md\n", b"", 0)
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "platform.system", return_value="Darwin"
+    ), patch("shutil.which", return_value=None), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ) as mock_popen:
+        server.transcribe(str(audio), 2)
+
+    assert mock_popen.call_count == 1
 
 
 def test_get_transcript_unknown_job():

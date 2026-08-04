@@ -215,6 +215,17 @@ class Job:
         return True
 
 
+def _reap_caffeinate(watcher: subprocess.Popen, pid: int) -> None:
+    """Reap the caffeinate watcher so it can't linger as a zombie after it
+    self-exits (which happens once the backend pid dies). Runs on a daemon
+    thread; route any failure to the log file rather than letting a bare
+    thread target dump a traceback to an unseen stderr."""
+    try:
+        watcher.wait()
+    except OSError as e:
+        logger.warning("caffeinate watcher for pid %s exited abnormally: %s", pid, e)
+
+
 @mcp.tool()
 def transcribe(file_path: str, num_speakers: int) -> dict:
     """Start a transcription and diarization job.
@@ -249,6 +260,38 @@ def transcribe(file_path: str, num_speakers: int) -> dict:
         # Killing the group reaches that worker (and any swift helper procs).
         start_new_session=True,
     )
+    # Transcription jobs can run long enough that macOS puts the machine to
+    # sleep mid-job. Rather than wrapping proc itself (which would make
+    # Job.proc.kill() target caffeinate instead of the real backend and
+    # leave it running orphaned), spawn caffeinate as an independent watcher
+    # tied to the backend's pid - it holds the assertion until that pid
+    # exits, however the job ends.
+    caffeinate_exe = (
+        shutil.which("caffeinate") if platform.system() == "Darwin" else None
+    )
+    if caffeinate_exe is not None:
+        # Best-effort only: if the watcher fails to spawn (e.g. OSError even
+        # though shutil.which found the binary), don't abort the backend job
+        # that already started above - just proceed without sleep prevention.
+        try:
+            caffeinate_proc = subprocess.Popen(
+                [caffeinate_exe, "-i", "-w", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+            )
+            threading.Thread(
+                target=_reap_caffeinate,
+                args=(caffeinate_proc, proc.pid),
+                daemon=True,
+            ).start()
+        except OSError as e:
+            logger.warning(
+                "could not spawn caffeinate watcher for pid %s: %s"
+                "; job will run without sleep prevention",
+                proc.pid,
+                e,
+            )
     job_id = str(uuid.uuid4())
     jobs[job_id] = Job(proc=proc, backend=backend_name, job_id=job_id)
     logger.info(
