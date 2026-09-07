@@ -60,6 +60,18 @@ public enum ConfigLoader {
             .appendingPathComponent("diarize/config.json")
     }
 
+    /// Where WhisperKit/SpeakerKit cache their downloaded Hugging Face models.
+    ///
+    /// Deliberately outside `~/Documents`: on machines where Documents is
+    /// redirected into iCloud/OneDrive, cloud sync dehydrates the large model
+    /// binaries into placeholder files, which breaks the Hub client's
+    /// metadata validation (it can't read or delete a placeholder that's
+    /// stuck mid-fetch).
+    public static var modelCacheURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("diarize/huggingface")
+    }
+
     private static func repoDefaultsURL() -> URL? {
         let filename = "config/defaults.json"
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)

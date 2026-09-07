@@ -19,7 +19,7 @@ public actor SpeakerKitDiarizer: DiarizerProtocol {
     /// Downloads (if needed) and loads the Pyannote diarization models into memory.
     /// Must be called before `diarize(audioURL:numSpeakers:)`.
     public func loadModel() async throws {
-        let config = PyannoteConfig(download: true, load: true, verbose: false)
+        let config = PyannoteConfig(downloadBase: ConfigLoader.modelCacheURL.path, download: true, load: true, verbose: false)
         speakerKit = try await SpeakerKit(config)
     }
 

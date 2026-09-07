@@ -7,7 +7,7 @@ public actor WhisperKitTranscriber: TranscriberProtocol {
     public init() {}
 
     public func loadModel(_ model: String) async throws {
-        whisperKit = try await WhisperKit(model: model)
+        whisperKit = try await WhisperKit(model: model, downloadBase: ConfigLoader.modelCacheURL)
     }
 
     public func transcribe(audioURL: URL) async throws -> [Segment] {
