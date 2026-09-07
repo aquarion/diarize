@@ -73,6 +73,9 @@ def test_transcribe_spawns_backend_in_own_process_group(tmp_path):
 
 
 def test_kill_after_collector_error_signals_process_group(monkeypatch):
+    # os.killpg/getpgid and signal.SIGKILL are all POSIX-only, so this test
+    # forces the POSIX branch and fakes all three into existence (create=True)
+    # to exercise it even when actually running on Windows CI.
     monkeypatch.setattr(server, "_HAS_PROCESS_GROUP_KILL", True)
     proc = MagicMock()
     proc.poll.return_value = None  # still alive
@@ -84,11 +87,10 @@ def test_kill_after_collector_error_signals_process_group(monkeypatch):
 
     with patch("os.getpgid", return_value=4242, create=True) as mock_getpgid, patch(
         "os.killpg", create=True
-    ) as mock_killpg:
+    ) as mock_killpg, patch("signal.SIGKILL", 9, create=True):
         job._kill_after_collector_error()
-
-    mock_getpgid.assert_called_once_with(4242)
-    mock_killpg.assert_called_once_with(4242, server.signal.SIGKILL)
+        mock_getpgid.assert_called_once_with(4242)
+        mock_killpg.assert_called_once_with(4242, 9)
     # proc.kill() must NOT be used - that would miss the orphaned worker.
     proc.kill.assert_not_called()
 
@@ -103,7 +105,12 @@ def test_kill_after_collector_error_survives_dead_process(monkeypatch):
     job.job_id = "dead-id"
 
     # ...but exited before killpg: ProcessLookupError must be swallowed.
-    with patch("os.getpgid", side_effect=ProcessLookupError, create=True):
+    # os.killpg must still exist (create=True) even though it's never
+    # reached - Python resolves it as the call target before evaluating
+    # os.getpgid(...), the argument that actually raises.
+    with patch("os.getpgid", side_effect=ProcessLookupError, create=True), patch(
+        "os.killpg", create=True
+    ):
         job._kill_after_collector_error()  # must not raise
 
     proc.wait.assert_called_once()
@@ -598,11 +605,11 @@ def test_collector_error_kills_still_running_process(monkeypatch):
 
     with patch("os.getpgid", return_value=4242, create=True), patch(
         "os.killpg", create=True
-    ) as mock_killpg:
+    ) as mock_killpg, patch("signal.SIGKILL", 9, create=True):
         job = server.Job(proc=proc, backend="swift")
         _wait(job)
 
-    assert job.is_complete()
-    # The whole process group is signalled (not just proc.pid) so the real
-    # worker survives no orphaning when proc is the `uv run` wrapper.
-    mock_killpg.assert_called_once_with(4242, server.signal.SIGKILL)
+        assert job.is_complete()
+        # The whole process group is signalled (not just proc.pid) so the
+        # real worker survives no orphaning when proc is the `uv run` wrapper.
+        mock_killpg.assert_called_once_with(4242, 9)
