@@ -72,7 +72,8 @@ def test_transcribe_spawns_backend_in_own_process_group(tmp_path):
     assert mock_popen.call_args_list[0].kwargs["start_new_session"] is True
 
 
-def test_kill_after_collector_error_signals_process_group():
+def test_kill_after_collector_error_signals_process_group(monkeypatch):
+    monkeypatch.setattr(server, "_HAS_PROCESS_GROUP_KILL", True)
     proc = MagicMock()
     proc.poll.return_value = None  # still alive
     proc.pid = 4242
@@ -81,8 +82,8 @@ def test_kill_after_collector_error_signals_process_group():
     job.proc = proc
     job.job_id = "kill-id"
 
-    with patch("os.getpgid", return_value=4242) as mock_getpgid, patch(
-        "os.killpg"
+    with patch("os.getpgid", return_value=4242, create=True) as mock_getpgid, patch(
+        "os.killpg", create=True
     ) as mock_killpg:
         job._kill_after_collector_error()
 
@@ -92,7 +93,8 @@ def test_kill_after_collector_error_signals_process_group():
     proc.kill.assert_not_called()
 
 
-def test_kill_after_collector_error_survives_dead_process():
+def test_kill_after_collector_error_survives_dead_process(monkeypatch):
+    monkeypatch.setattr(server, "_HAS_PROCESS_GROUP_KILL", True)
     proc = MagicMock()
     proc.poll.return_value = None  # looked alive at poll()...
 
@@ -101,10 +103,47 @@ def test_kill_after_collector_error_survives_dead_process():
     job.job_id = "dead-id"
 
     # ...but exited before killpg: ProcessLookupError must be swallowed.
-    with patch("os.getpgid", side_effect=ProcessLookupError):
+    with patch("os.getpgid", side_effect=ProcessLookupError, create=True):
         job._kill_after_collector_error()  # must not raise
 
     proc.wait.assert_called_once()
+
+
+def test_kill_after_collector_error_uses_taskkill_on_windows(monkeypatch):
+    monkeypatch.setattr(server, "_HAS_PROCESS_GROUP_KILL", False)
+    proc = MagicMock()
+    proc.poll.return_value = None  # still alive
+    proc.pid = 4242
+
+    job = server.Job.__new__(server.Job)
+    job.proc = proc
+    job.job_id = "kill-id"
+
+    with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+        job._kill_after_collector_error()
+
+    mock_run.assert_called_once_with(
+        ["taskkill", "/T", "/F", "/PID", "4242"], capture_output=True
+    )
+    # proc.kill() must NOT be used when taskkill succeeds - that would miss
+    # the orphaned worker taskkill /T is there to reach.
+    proc.kill.assert_not_called()
+
+
+def test_kill_after_collector_error_falls_back_when_taskkill_fails(monkeypatch):
+    monkeypatch.setattr(server, "_HAS_PROCESS_GROUP_KILL", False)
+    proc = MagicMock()
+    proc.poll.return_value = None
+    proc.pid = 4242
+
+    job = server.Job.__new__(server.Job)
+    job.proc = proc
+    job.job_id = "kill-id"
+
+    with patch("subprocess.run", return_value=MagicMock(returncode=128)):
+        job._kill_after_collector_error()
+
+    proc.kill.assert_called_once()
 
 
 def test_transcribe_spawns_caffeinate_watcher_on_darwin(tmp_path):
@@ -537,10 +576,11 @@ def test_set_config_no_backend(tmp_path, monkeypatch):
     assert "no backend" in result["error"]
 
 
-def test_collector_error_kills_still_running_process():
+def test_collector_error_kills_still_running_process(monkeypatch):
     """If a collector dies while the child is still alive, nothing would
     otherwise drain its pipe - kill the child so the sibling collector and
     the child itself can't block forever."""
+    monkeypatch.setattr(server, "_HAS_PROCESS_GROUP_KILL", True)
 
     class _BrokenStdout:
         def __iter__(self):
@@ -556,7 +596,9 @@ def test_collector_error_kills_still_running_process():
     proc.pid = 4242
     proc.poll.return_value = None  # still running when the error occurs
 
-    with patch("os.getpgid", return_value=4242), patch("os.killpg") as mock_killpg:
+    with patch("os.getpgid", return_value=4242, create=True), patch(
+        "os.killpg", create=True
+    ) as mock_killpg:
         job = server.Job(proc=proc, backend="swift")
         _wait(job)
 

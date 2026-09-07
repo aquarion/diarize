@@ -98,6 +98,10 @@ COLLECTOR_STALL_TIMEOUT = 10.0
 # so these run synchronously rather than through the async Job/poll pattern.
 CONFIG_COMMAND_TIMEOUT = 15.0
 
+# os.killpg/os.getpgid are POSIX-only - absent on Windows, where the Python
+# backend also ships. Checked once at import time rather than per-call.
+_HAS_PROCESS_GROUP_KILL = hasattr(os, "killpg")
+
 
 @dataclass
 class Job:
@@ -132,17 +136,27 @@ class Job:
         child blocked on a full pipe write and the sibling collector
         blocked reading forever. Kill it so both collectors unblock.
 
-        Signals the whole process group (proc is spawned with
-        start_new_session=True), not just proc.pid: on the python backend
-        proc is the `uv run` wrapper, so killing it alone would orphan the
-        real worker it spawned. Falls back to proc.kill() if the group can't
-        be resolved (e.g. proc already reaped)."""
+        Kills the whole process tree, not just proc.pid: on the python
+        backend proc is the `uv run` wrapper, so killing it alone would
+        orphan the real worker it spawned. On POSIX this is proc's process
+        group (spawned with start_new_session=True); Windows has no
+        equivalent, so `taskkill /T` is used instead to walk the same
+        parent-child tree. Falls back to proc.kill() if that can't be
+        resolved (e.g. proc already reaped)."""
         try:
             if self.proc.poll() is None:
-                try:
-                    os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass  # already exited between poll() and here
+                if _HAS_PROCESS_GROUP_KILL:
+                    try:
+                        os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass  # already exited between poll() and here
+                else:
+                    result = subprocess.run(
+                        ["taskkill", "/T", "/F", "/PID", str(self.proc.pid)],
+                        capture_output=True,
+                    )
+                    if result.returncode != 0:
+                        self.proc.kill()  # e.g. proc already exited
             self.proc.wait(timeout=5)
         except Exception:
             logger.exception(
