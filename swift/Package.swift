@@ -12,7 +12,7 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/argmaxinc/argmax-oss-swift.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),
-        .package(url: "https://github.com/jamesrochabrun/SwiftAnthropic.git", from: "1.0.0"),
+        .package(url: "https://github.com/jamesrochabrun/SwiftAnthropic.git", from: "2.2.2"),
     ],
     targets: [
         .target(
