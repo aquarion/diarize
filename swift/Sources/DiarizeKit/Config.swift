@@ -75,10 +75,7 @@ public enum ConfigLoader {
             .appendingPathComponent("diarize/huggingface")
     }
 
-    /// Not private, so tests can exercise the real production lookup (driven
-    /// by the actual running executable's path) rather than only the
-    /// extracted `searchUpwardForRepoFile()` helper with synthetic paths.
-    static func repoDefaultsURL() -> URL? {
+    private static func repoDefaultsURL() -> URL? {
         let filename = "config/defaults.json"
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent(filename)

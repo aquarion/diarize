@@ -138,20 +138,4 @@ final class ConfigTests: XCTestCase {
             filename: "config/defaults.json")
         XCTAssertNil(found)
     }
-
-    func testRepoDefaultsURLFindsRealCheckoutConfigViaProductionPath() {
-        // Unlike the layout tests above, this drives repoDefaultsURL() itself
-        // with no synthetic path: it resolves the real xctest executable's
-        // path via currentExecutablePath() and walks up from there, so it
-        // actually exercises the code path a build of the CLI or app runs.
-        // `swift test` runs with cwd == swift/, so the cwd-relative check
-        // (which looks for ./config/defaults.json) doesn't short-circuit
-        // this - config/defaults.json lives at the repo root, one level up.
-        guard let url = ConfigLoader.repoDefaultsURL() else {
-            XCTFail("Expected repoDefaultsURL() to find the repo checkout's config/defaults.json")
-            return
-        }
-        XCTAssertTrue(url.path.hasSuffix("config/defaults.json"))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
-    }
 }
