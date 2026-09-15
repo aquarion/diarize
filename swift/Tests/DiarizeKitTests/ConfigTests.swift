@@ -71,4 +71,71 @@ final class ConfigTests: XCTestCase {
     func testValidKeysRejectsUnknownKey() {
         XCTAssertFalse(AppConfig.validKeys.contains("not_a_real_key"))
     }
+
+    /// Returns the repo root with symlinks already resolved (e.g. macOS's
+    /// /var -> /private/var) so it matches what `searchUpwardForRepoFile`'s
+    /// own `resolvingSymlinksInPath()` call will produce - otherwise these
+    /// tests would compare an unresolved path against a resolved one.
+    private func makeRepoCheckout() throws -> URL {
+        let repoRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("repo_defaults_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: repoRoot.appendingPathComponent("config"), withIntermediateDirectories: true)
+        try "{}".write(
+            to: repoRoot.appendingPathComponent("config/defaults.json"), atomically: true, encoding: .utf8)
+        return repoRoot.resolvingSymlinksInPath()
+    }
+
+    func testSearchUpwardFindsDefaultsFromPlainSwiftPMBinaryLayout() throws {
+        let repoRoot = try makeRepoCheckout()
+        defer { try? FileManager.default.removeItem(at: repoRoot) }
+
+        let binaryPath = repoRoot.appendingPathComponent("swift/.build/release/diarize").path
+        let found = ConfigLoader.searchUpwardForRepoFile(from: binaryPath, filename: "config/defaults.json")
+        XCTAssertEqual(found?.path, repoRoot.appendingPathComponent("config/defaults.json").path)
+    }
+
+    func testSearchUpwardFindsDefaultsFromAssembledAppBundleLayout() throws {
+        let repoRoot = try makeRepoCheckout()
+        defer { try? FileManager.default.removeItem(at: repoRoot) }
+
+        let appExecutablePath = repoRoot
+            .appendingPathComponent("swift/.build/release/DiarizeApp.app/Contents/MacOS/DiarizeApp").path
+        let found = ConfigLoader.searchUpwardForRepoFile(from: appExecutablePath, filename: "config/defaults.json")
+        XCTAssertEqual(found?.path, repoRoot.appendingPathComponent("config/defaults.json").path)
+
+        let embeddedCLIPath = repoRoot
+            .appendingPathComponent("swift/.build/release/DiarizeApp.app/Contents/Resources/diarize").path
+        let foundFromResources = ConfigLoader.searchUpwardForRepoFile(
+            from: embeddedCLIPath, filename: "config/defaults.json")
+        XCTAssertEqual(foundFromResources?.path, repoRoot.appendingPathComponent("config/defaults.json").path)
+    }
+
+    func testSearchUpwardResolvesInstalledCLISymlink() throws {
+        let repoRoot = try makeRepoCheckout()
+        defer { try? FileManager.default.removeItem(at: repoRoot) }
+
+        let realCLIDir = repoRoot
+            .appendingPathComponent("swift/.build/release/DiarizeApp.app/Contents/Resources")
+        try FileManager.default.createDirectory(at: realCLIDir, withIntermediateDirectories: true)
+        let realCLIPath = realCLIDir.appendingPathComponent("diarize")
+        try "".write(to: realCLIPath, atomically: true, encoding: .utf8)
+
+        let symlinkDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("bin_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: symlinkDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: symlinkDir) }
+        let symlinkPath = symlinkDir.appendingPathComponent("diarize")
+        try FileManager.default.createSymbolicLink(at: symlinkPath, withDestinationURL: realCLIPath)
+
+        let found = ConfigLoader.searchUpwardForRepoFile(from: symlinkPath.path, filename: "config/defaults.json")
+        XCTAssertEqual(found?.path, repoRoot.appendingPathComponent("config/defaults.json").path)
+    }
+
+    func testSearchUpwardReturnsNilWhenNoRepoFileFound() {
+        let found = ConfigLoader.searchUpwardForRepoFile(
+            from: "/tmp/nonexistent-diarize-checkout-xyz/swift/.build/release/diarize",
+            filename: "config/defaults.json")
+        XCTAssertNil(found)
+    }
 }

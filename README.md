@@ -33,10 +33,16 @@ Options match the Python CLI: `--claude-guess`, `--yes`, `--vault-output`, `--co
 
 **macOS app:**
 
-Open `swift/` in Xcode and run the `DiarizeApp` scheme, or build it from the command line:
+Open `swift/` in Xcode and run the `DiarizeApp` scheme. `swift build -c release
+--product DiarizeApp` only produces the raw `DiarizeApp` executable, not an
+openable `.app` bundle — SwiftPM never assembles one on its own. To get a real
+`DiarizeApp.app` (which also carries the CLI with it), build via the helper
+script instead:
 
 ```bash
-swift build -c release --product DiarizeApp
+cd swift
+./scripts/build-app.sh
+open .build/release/DiarizeApp.app
 ```
 
 Drag a WAV file onto the app window to start processing.

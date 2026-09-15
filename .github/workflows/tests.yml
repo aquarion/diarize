@@ -64,3 +64,5 @@ jobs:
       - run: brew install ffmpeg
       - run: swift build
       - run: swift test
+      - run: ./scripts/build-app.sh
+      - run: test -x .build/release/DiarizeApp.app/Contents/MacOS/DiarizeApp

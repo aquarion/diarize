@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 
 public struct AppConfig: Sendable {
     public enum Defaults {
@@ -77,15 +80,56 @@ public enum ConfigLoader {
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent(filename)
         if FileManager.default.fileExists(atPath: cwd.path) { return cwd }
-        // Binary-relative: handles swift/.build/release/diarize in development
-        if let arg = CommandLine.arguments.first {
-            let candidate = URL(fileURLWithPath: arg).standardizedFileURL
-                .deletingLastPathComponent()  // release
-                .deletingLastPathComponent()  // .build
-                .deletingLastPathComponent()  // swift
-                .deletingLastPathComponent()  // repo root
-                .appendingPathComponent(filename)
-            if FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+        guard let executablePath = currentExecutablePath() else { return nil }
+        return searchUpwardForRepoFile(from: executablePath, filename: filename)
+    }
+
+    /// The path of the actual running executable, as opposed to
+    /// `CommandLine.arguments.first` (argv[0]). When `diarize` is invoked
+    /// via `PATH` (e.g. after "Install 'diarize' Command in Terminal"),
+    /// argv[0] is commonly just the bare command name the user typed
+    /// ("diarize"), not a path - resolving that starts a search from the
+    /// current directory instead of the installed bundle. `_NSGetExecutablePath`
+    /// returns the real path the OS loaded, which `searchUpwardForRepoFile`
+    /// can then walk up from.
+    private static func currentExecutablePath() -> String? {
+        #if canImport(Darwin)
+        var size: UInt32 = 0
+        _NSGetExecutablePath(nil, &size)
+        var buffer = [Int8](repeating: 0, count: Int(size))
+        guard _NSGetExecutablePath(&buffer, &size) == 0 else { return nil }
+        return String(cString: buffer)
+        #else
+        return CommandLine.arguments.first
+        #endif
+    }
+
+    /// Walks up from `executablePath` looking for `filename`, handling both
+    /// the plain SwiftPM binary layout (`swift/.build/release/diarize`) and
+    /// the assembled `.app` bundle layout
+    /// (`swift/.build/release/DiarizeApp.app/Contents/{MacOS,Resources}/...`),
+    /// which nest the executable at different depths - a fixed number of
+    /// `deletingLastPathComponent()` calls can't handle both at once, so this
+    /// searches upward instead, bounded well past either case.
+    ///
+    /// `resolvingSymlinksInPath()` matters here: the "Install 'diarize'
+    /// Command in Terminal" feature symlinks the bundled CLI to
+    /// `/usr/local/bin/diarize`, and without resolving that symlink first,
+    /// this walk would start under `/usr/local/bin` instead of the real
+    /// bundle path inside the checkout.
+    ///
+    /// Not private, so tests can exercise both layouts directly without
+    /// depending on `CommandLine.arguments`.
+    static func searchUpwardForRepoFile(
+        from executablePath: String, filename: String, fileManager: FileManager = .default
+    ) -> URL? {
+        var dir = URL(fileURLWithPath: executablePath).resolvingSymlinksInPath().deletingLastPathComponent()
+        for _ in 0..<8 {
+            let candidate = dir.appendingPathComponent(filename)
+            if fileManager.fileExists(atPath: candidate.path) { return candidate }
+            let parent = dir.deletingLastPathComponent()
+            if parent.path == dir.path { break }
+            dir = parent
         }
         return nil
     }
