@@ -1,4 +1,5 @@
 import io
+import json
 import subprocess
 import threading
 import time
@@ -44,16 +45,37 @@ def test_transcribe_no_backend(tmp_path, monkeypatch):
 def test_transcribe_starts_job(tmp_path):
     audio = tmp_path / "audio.wav"
     audio.touch()
-    mock_proc = _make_proc(b"    local       : /tmp/t.md\n", b"", 0)
+
+    # Block the collectors: a completed job is evicted from server.jobs by
+    # its background finalizer once persisted, which - for an instantly
+    # completing mock proc - can otherwise race ahead of this assertion.
+    unblock = threading.Event()
+
+    class _BlockingStdout:
+        def __iter__(self):
+            unblock.wait()
+            return iter([])
+
+        def close(self):
+            pass
+
+    mock_proc = MagicMock()
+    mock_proc.stdout = _BlockingStdout()
+    mock_proc.stderr = io.BytesIO(b"")
+    mock_proc.returncode = None
+    mock_proc.poll.return_value = None
 
     with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
         "subprocess.Popen", return_value=mock_proc
     ):
         result = server.transcribe(str(audio), 2)
 
-    assert "job_id" in result
-    assert result["backend"] == "swift"
-    assert result["job_id"] in server.jobs
+    try:
+        assert "job_id" in result
+        assert result["backend"] == "swift"
+        assert result["job_id"] in server.jobs
+    finally:
+        unblock.set()
 
 
 def test_transcribe_spawns_backend_in_own_process_group(tmp_path):
@@ -650,7 +672,24 @@ def _wait_for_terminal_record(job_id: str, timeout: float = 2.0) -> dict | None:
 def test_transcribe_persists_started_record(tmp_path):
     audio = tmp_path / "audio.wav"
     audio.touch()
-    mock_proc = _make_proc(b"    local       : /tmp/t.md\n", b"", 0)
+
+    # Block the collectors so the background finalizer can't race ahead and
+    # flip this to a terminal status before the assertions below run.
+    unblock = threading.Event()
+
+    class _BlockingStdout:
+        def __iter__(self):
+            unblock.wait()
+            return iter([])
+
+        def close(self):
+            pass
+
+    mock_proc = MagicMock()
+    mock_proc.stdout = _BlockingStdout()
+    mock_proc.stderr = io.BytesIO(b"")
+    mock_proc.returncode = None
+    mock_proc.poll.return_value = None
     mock_proc.pid = 4242
 
     with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
@@ -658,14 +697,17 @@ def test_transcribe_persists_started_record(tmp_path):
     ):
         result = server.transcribe(str(audio), 3)
 
-    record = server._load_registry()[result["job_id"]]
-    assert record["backend"] == "swift"
-    assert record["input_path"] == str(audio)
-    assert record["num_speakers"] == 3
-    assert record["pid"] == 4242
-    assert record["status"] == "running"
-    assert record["output_path"] is None
-    assert record["started_at"] is not None
+    try:
+        record = server._load_registry()[result["job_id"]]
+        assert record["backend"] == "swift"
+        assert record["input_path"] == str(audio)
+        assert record["num_speakers"] == 3
+        assert record["pid"] == 4242
+        assert record["status"] == "running"
+        assert record["output_path"] is None
+        assert record["started_at"] is not None
+    finally:
+        unblock.set()
 
 
 def test_finalizer_persists_done_status(tmp_path):
@@ -855,6 +897,131 @@ def test_load_registry_returns_empty_on_corrupt_file():
     server.JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
     server.JOBS_FILE.write_text("not json{{{")
     assert server._load_registry() == {}
+
+
+def test_load_registry_returns_empty_on_non_dict_json():
+    # Valid JSON that isn't the expected {job_id: record} shape must not
+    # crash _reconcile_registry_on_startup (which calls .values() on this
+    # at import time) - that would take the whole server down.
+    server.JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    server.JOBS_FILE.write_text("[]")
+    assert server._load_registry() == {}
+    server.JOBS_FILE.write_text("null")
+    assert server._load_registry() == {}
+
+
+def test_load_registry_drops_non_dict_records():
+    server.JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    server.JOBS_FILE.write_text(
+        json.dumps({"good": {"job_id": "good", "status": "done"}, "bad": "not a record"})
+    )
+    assert server._load_registry() == {"good": {"job_id": "good", "status": "done"}}
+
+
+def test_update_job_record_prunes(monkeypatch):
+    # Pruning previously only happened in _record_job_started, so the
+    # registry could stay over MAX_PERSISTED_JOBS indefinitely once no new
+    # job started a fresh prune pass.
+    monkeypatch.setattr(server, "MAX_PERSISTED_JOBS", 1)
+    server._record_job_started(
+        "old-id", backend="swift", input_path="/tmp/a.wav", num_speakers=1, pid=1
+    )
+    server._update_job_record("old-id", status="done", output_path="/tmp/a.md", error=None)
+    server._record_job_started(
+        "new-id", backend="swift", input_path="/tmp/b.wav", num_speakers=1, pid=2
+    )
+
+    server._update_job_record("new-id", status="done", output_path="/tmp/b.md", error=None)
+
+    assert set(server._load_registry()) == {"new-id"}
+
+
+def test_update_job_record_returns_false_when_no_record_exists():
+    assert (
+        server._update_job_record(
+            "never-started-id", status="done", output_path="/tmp/x.md", error=None
+        )
+        is False
+    )
+
+
+def test_list_jobs_clamps_negative_limit():
+    server._record_job_started(
+        "some-id", backend="swift", input_path="/tmp/a.wav", num_speakers=1, pid=1
+    )
+    assert server.list_jobs(limit=-5) == {"jobs": []}
+
+
+def test_list_jobs_survives_concurrent_transcribe(tmp_path):
+    # transcribe() inserts into `jobs` from list_jobs's perspective "mid
+    # iteration" if it runs on another thread at the wrong moment; iterating
+    # a live, unsynchronized dict under that race can raise "dictionary
+    # changed size during iteration".
+    #
+    # unittest.mock.patch is not itself thread-safe against concurrent
+    # enter/exit on the same target, so it's applied once here from the
+    # main thread around the whole concurrent section rather than inside
+    # each worker thread.
+    unblock = threading.Event()
+
+    class _BlockingStdout:
+        def __iter__(self):
+            unblock.wait()
+            return iter([])
+
+        def close(self):
+            pass
+
+    def _make_blocking_proc(*_args, **_kwargs):
+        proc = MagicMock()
+        proc.stdout = _BlockingStdout()
+        proc.stderr = io.BytesIO(b"")
+        proc.returncode = None
+        proc.poll.return_value = None
+        return proc
+
+    def _start_job(n: int):
+        audio = tmp_path / f"audio-{n}.wav"
+        audio.touch()
+        server.transcribe(str(audio), 2)
+
+    threads = [threading.Thread(target=_start_job, args=(n,)) for n in range(20)]
+    try:
+        with patch(
+            "server.select_backend", return_value=("swift", ["/bin/echo"])
+        ), patch("subprocess.Popen", side_effect=_make_blocking_proc):
+            for t in threads:
+                t.start()
+            for _ in range(50):
+                server.list_jobs()
+            unblock.set()
+            for t in threads:
+                t.join(timeout=2.0)
+    finally:
+        unblock.set()
+
+
+def test_list_jobs_sets_finished_at_for_completed_live_job_not_yet_finalized(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(server, "_update_job_record", lambda *a, **k: False)
+
+    transcript = tmp_path / "t.md"
+    proc = _make_proc(f"    local       : {transcript}\n".encode(), b"", 0)
+    server._record_job_started(
+        "finished-at-id",
+        backend="swift",
+        input_path="/tmp/a.wav",
+        num_speakers=2,
+        pid=proc.pid,
+    )
+    job = server.Job(proc=proc, backend="swift", job_id="finished-at-id")
+    server.jobs["finished-at-id"] = job
+    _wait(job)
+
+    result = server.list_jobs()
+    by_id = {entry["job_id"]: entry for entry in result["jobs"]}
+    assert by_id["finished-at-id"]["finished_at"] is not None
 
 
 def test_prune_registry_drops_oldest_completed_first(monkeypatch):

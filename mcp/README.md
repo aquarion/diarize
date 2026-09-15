@@ -81,8 +81,9 @@ Returns one of:
   restarted while this job was running, so its actual outcome is unknown;
   check the configured output location, or re-run
 - `{"status": "unknown", "error": "no such job_id"}` — this `job_id` was
-  never seen. Distinct from `"failed"`: there's nothing to act on, and no
-  compute to avoid retrying.
+  never seen, *or* it's old enough to have been pruned from the registry
+  (capped at the 200 most recent completed jobs). Distinct from `"failed"`:
+  there's nothing to act on, and no compute to avoid retrying.
 
 ### `list_jobs(limit=20)`
 

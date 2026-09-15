@@ -67,9 +67,16 @@ def _now_iso() -> str:
 
 def _load_registry() -> dict[str, dict]:
     try:
-        return json.loads(JOBS_FILE.read_text())
+        data = json.loads(JOBS_FILE.read_text())
     except (OSError, ValueError):
         return {}
+    # Defend against a corrupted/hand-edited file: valid JSON that isn't the
+    # shape we expect (e.g. "[]", "null", or a record that isn't an object)
+    # must not crash callers like _reconcile_registry_on_startup, which runs
+    # at import time - that would take the whole server down.
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, dict)}
 
 
 def _write_registry(registry: dict[str, dict]) -> None:
@@ -126,17 +133,23 @@ def _record_job_started(
 
 def _update_job_record(
     job_id: str, *, status: str, output_path: str | None, error: str | None
-) -> None:
+) -> bool:
+    """Returns True if a record for job_id existed and was updated - i.e.
+    it's now safe to rely on the registry alone for this job, since a
+    caller (Job._finalize_and_persist) uses this to decide whether it can
+    drop its own in-memory handle."""
     with _registry_lock:
         registry = _load_registry()
         record = registry.get(job_id)
         if record is None:
-            return  # e.g. registry file was lost/wiped after the job started
+            return False  # e.g. registry file was lost/wiped after the job started
         record["status"] = status
         record["output_path"] = output_path
         record["error"] = error
         record["finished_at"] = _now_iso()
+        _prune_registry(registry)
         _write_registry(registry)
+        return True
 
 
 def _reconcile_registry_on_startup() -> None:
@@ -260,17 +273,28 @@ class Job:
         # registry stuck at "running" instead of picking up the "failed"
         # outcome stalled() detection makes available via collector_error.
         while not self.is_complete() and not self.stalled():
-            # Wakes immediately once the collectors actually finish (the
-            # common case); the timeout only matters for the rare stalled
-            # case, bounding how quickly that gets detected and persisted.
-            self._stdout_done.wait(timeout=0.5)
+            # Wait on whichever collector hasn't finished yet - waiting on
+            # an already-set Event returns immediately, so always waiting on
+            # _stdout_done specifically would busy-spin for however long
+            # stderr outlives stdout.
+            pending = self._stderr_done if self._stdout_done.is_set() else self._stdout_done
+            pending.wait(timeout=0.5)
         outcome = _resolve_job_outcome(self)
-        _update_job_record(
+        persisted = _update_job_record(
             self.job_id,
             status=outcome["status"],
             output_path=outcome.get("output_path"),
             error=outcome.get("error"),
         )
+        # Everything needed to answer a later get_transcript/list_jobs call
+        # for this job now lives in the (tiny) persisted record - drop the
+        # live handle so a long-running server doesn't retain every job's
+        # full stdout/stderr in memory forever. Only once we know the
+        # registry actually has it, though - a Job with no registry entry
+        # (e.g. one built directly rather than via transcribe()) would
+        # otherwise become unreachable by any get_transcript call.
+        if persisted:
+            jobs.pop(self.job_id, None)
 
     def _record_collector_error(self, message: str) -> None:
         with self._error_lock:
@@ -554,7 +578,8 @@ def get_transcript(job_id: str) -> dict:
       {"status": "interrupted", "error": "<message>"} if the MCP server
       restarted while this job was running - its actual outcome is unknown.
       {"status": "unknown", "error": "no such job_id"} if this job_id was
-      never seen (distinct from "failed": nothing to act on, no compute to
+      never seen, or is old enough to have been pruned from the registry
+      (distinct from "failed": nothing to act on, no compute to
       retry-avoid).
     """
     job = jobs.get(job_id)
@@ -619,7 +644,10 @@ def list_jobs(limit: int = 20) -> dict:
     reports fine-grained progress, "fraction"/"stage" - see get_transcript.
     """
     registry = _load_registry()
-    for job_id, job in jobs.items():
+    # Snapshot via list(): transcribe() can insert into `jobs` from another
+    # thread mid-request, and iterating the live dict directly can raise
+    # "dictionary changed size during iteration".
+    for job_id, job in list(jobs.items()):
         record = dict(
             registry.get(
                 job_id,
@@ -653,11 +681,12 @@ def list_jobs(limit: int = 20) -> dict:
             record["status"] = outcome["status"]
             record["output_path"] = outcome.get("output_path", record.get("output_path"))
             record["error"] = outcome.get("error", record.get("error"))
+            record["finished_at"] = record.get("finished_at") or _now_iso()
         registry[job_id] = record
     entries = sorted(
         registry.values(), key=lambda r: r.get("started_at") or "", reverse=True
     )
-    return {"jobs": entries[:limit]}
+    return {"jobs": entries[: max(limit, 0)]}
 
 
 @mcp.tool()
