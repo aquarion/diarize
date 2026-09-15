@@ -296,6 +296,66 @@ def test_get_transcript_running_with_message():
     unblock.set()
 
 
+def test_get_transcript_running_with_fraction():
+    unblock = threading.Event()
+    lines_seen = threading.Event()
+
+    class _BlockingStdout:
+        def __iter__(self):
+            yield b"==> Transcribing audio...\n"
+            yield b"progress:0.4200:transcribing\n"
+            lines_seen.set()
+            unblock.wait()
+
+        def close(self):
+            pass
+
+    proc = MagicMock()
+    proc.stdout = _BlockingStdout()
+    proc.stderr = io.BytesIO(b"")
+    proc.returncode = 0
+    proc.poll.return_value = None
+
+    job = server.Job(proc=proc, backend="swift")
+    server.jobs["running-fraction-id"] = job
+
+    lines_seen.wait(timeout=2.0)
+    result = server.get_transcript("running-fraction-id")
+    assert result["status"] == "running"
+    assert result["fraction"] == 0.42
+    assert result["stage"] == "transcribing"
+    unblock.set()
+
+
+def test_get_transcript_running_ignores_malformed_progress_line():
+    unblock = threading.Event()
+    lines_seen = threading.Event()
+
+    class _BlockingStdout:
+        def __iter__(self):
+            yield b"progress:not-a-number:transcribing\n"
+            lines_seen.set()
+            unblock.wait()
+
+        def close(self):
+            pass
+
+    proc = MagicMock()
+    proc.stdout = _BlockingStdout()
+    proc.stderr = io.BytesIO(b"")
+    proc.returncode = 0
+    proc.poll.return_value = None
+
+    job = server.Job(proc=proc, backend="swift")
+    server.jobs["running-bad-fraction-id"] = job
+
+    lines_seen.wait(timeout=2.0)
+    result = server.get_transcript("running-bad-fraction-id")
+    assert result["status"] == "running"
+    assert "fraction" not in result
+    unblock.set()
+
+
 def test_get_transcript_done(tmp_path):
     transcript = tmp_path / "transcript.md"
     transcript.write_text("# Meeting\n\nAlice: Hello.\nBob: Hi.")

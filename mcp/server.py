@@ -111,6 +111,8 @@ class Job:
     stdout: str = field(default="", init=False)
     stderr: str = field(default="", init=False)
     last_message: str = field(default="", init=False)
+    last_fraction: float | None = field(default=None, init=False)
+    last_stage: str | None = field(default=None, init=False)
     collector_error: str = field(default="", init=False)
     _stdout_done: threading.Event = field(default_factory=threading.Event, init=False)
     _stderr_done: threading.Event = field(default_factory=threading.Event, init=False)
@@ -172,6 +174,18 @@ class Job:
                 stripped = line.strip()
                 if stripped.startswith("==>"):
                     self.last_message = stripped[3:].strip()
+                elif stripped.startswith("progress:"):
+                    # "progress:<fraction 0-1>:<stage>", emitted by both backends
+                    # during the (long) transcription stage. Malformed lines are
+                    # ignored rather than failing the job.
+                    parts = stripped.split(":", 2)
+                    if len(parts) == 3:
+                        try:
+                            self.last_fraction = float(parts[1])
+                        except ValueError:
+                            pass
+                        else:
+                            self.last_stage = parts[2]
             self.proc.stdout.close()
             self.proc.wait()
         except Exception as e:
@@ -324,7 +338,10 @@ def get_transcript(job_id: str) -> dict:
     """Poll a transcription job.
 
     Returns:
-      {"status": "running"} while the job is in progress.
+      {"status": "running"} while the job is in progress. May also include
+      "message" (last human-readable stage description) and, once the
+      transcription stage reports fine-grained progress, "fraction" (0-1)
+      and "stage".
       {"status": "done", "transcript": "<markdown>", "output_path": "<path>"}
       on success.
       {"status": "failed", "error": "<message>"} on failure or unknown job_id.
@@ -336,6 +353,9 @@ def get_transcript(job_id: str) -> dict:
         result: dict = {"status": "running"}
         if job.last_message:
             result["message"] = job.last_message
+        if job.last_fraction is not None:
+            result["fraction"] = job.last_fraction
+            result["stage"] = job.last_stage
         return result
     if job.collector_error:
         logger.error("job %s failed: %s", job_id, job.collector_error)

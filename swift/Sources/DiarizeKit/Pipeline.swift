@@ -44,7 +44,9 @@ public struct Pipeline {
             segments = try JSONDecoder().decode([Segment].self, from: Data(contentsOf: txCheckpoint))
         } else {
             progress.yield(.init(stage: .transcribing, fraction: 0.0, message: "Transcribing audio..."))
-            let raw = try await transcriber.transcribe(audioURL: sourceURL)
+            let raw = try await transcriber.transcribe(audioURL: sourceURL, onProgress: { fraction in
+                progress.yield(.init(stage: .transcribing, fraction: fraction, message: "Transcribing audio..."))
+            })
             try JSONEncoder().encode(raw).write(to: txCheckpoint)
             segments = raw
             progress.yield(.init(stage: .transcribing, fraction: 1.0, message: "Transcription complete"))

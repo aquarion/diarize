@@ -76,7 +76,16 @@ public enum DiarizeError: Error, LocalizedError {
 }
 
 public protocol TranscriberProtocol: Sendable {
-    func transcribe(audioURL: URL) async throws -> [Segment]
+    /// - Parameter onProgress: Called with a fraction (0...1) as transcription advances.
+    ///   May be invoked from any thread. Optional so callers that don't need progress
+    ///   can pass `nil`.
+    func transcribe(audioURL: URL, onProgress: (@Sendable (Double) -> Void)?) async throws -> [Segment]
+}
+
+extension TranscriberProtocol {
+    public func transcribe(audioURL: URL) async throws -> [Segment] {
+        try await transcribe(audioURL: audioURL, onProgress: nil)
+    }
 }
 
 public protocol DiarizerProtocol: Sendable {
