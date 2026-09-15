@@ -1,6 +1,6 @@
 # Diarize MCP Server
 
-MCP server that exposes `transcribe`, `get_transcript`, `get_config`, and `set_config` tools to Claude Desktop.
+MCP server that exposes `transcribe`, `get_transcript`, `list_jobs`, `get_config`, and `set_config` tools to Claude Desktop.
 
 ## Setup
 
@@ -66,7 +66,10 @@ Returns `{"job_id": "<uuid>", "backend": "swift"|"python"}` or `{"error": "..."}
 
 ### `get_transcript(job_id)`
 
-Polls the job started by `transcribe`.
+Polls the job started by `transcribe`. Job state is persisted to a small
+on-disk registry (`jobs.json` next to the log file) as soon as it's known, so
+a job started before an MCP server restart is still recognized afterward -
+`job_id` isn't forgotten just because the process that started it is gone.
 
 Returns one of:
 - `{"status": "running"}` — still processing. May also include `"message"`
@@ -74,6 +77,23 @@ Returns one of:
   reports fine-grained progress, `"fraction"` (0-1) and `"stage"`.
 - `{"status": "done", "transcript": "<markdown>", "output_path": "<path>"}` — finished
 - `{"status": "failed", "error": "<message>"}` — something went wrong
+- `{"status": "interrupted", "error": "<message>"}` — the MCP server
+  restarted while this job was running, so its actual outcome is unknown;
+  check the configured output location, or re-run
+- `{"status": "unknown", "error": "no such job_id"}` — this `job_id` was
+  never seen. Distinct from `"failed"`: there's nothing to act on, and no
+  compute to avoid retrying.
+
+### `list_jobs(limit=20)`
+
+Lists recent transcription jobs, most recently started first - including ones
+from before a server restart, which `get_transcript` alone can't surface
+without already knowing their `job_id`.
+
+Returns `{"jobs": [{"job_id", "backend", "input_path", "num_speakers",
+"status", "output_path", "error", "started_at", "finished_at"}, ...]}`. A job
+still running also carries `"message"` and, once available, `"fraction"` /
+`"stage"` - the same fields `get_transcript` reports for it.
 
 ### `get_config(key)`
 

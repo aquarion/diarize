@@ -13,6 +13,8 @@ def _make_proc(stdout: bytes, stderr: bytes, returncode: int) -> MagicMock:
     proc.stderr = io.BytesIO(stderr)
     proc.returncode = returncode
     proc.wait.return_value = returncode
+    proc.pid = 4242  # a concrete int - the job registry must be able to
+    # json-serialize it, unlike a MagicMock's auto-generated attribute
     return proc
 
 
@@ -237,7 +239,7 @@ def test_transcribe_no_caffeinate_when_unavailable(tmp_path):
 
 def test_get_transcript_unknown_job():
     result = server.get_transcript("no-such-id")
-    assert result == {"status": "failed", "error": "unknown job_id"}
+    assert result == {"status": "unknown", "error": "no such job_id"}
 
 
 def test_get_transcript_running():
@@ -627,6 +629,330 @@ def test_get_transcript_both_collectors_raise_simultaneously():
     assert result["status"] == "failed"
     assert "stdout broke" in result["error"]
     assert "stderr broke" in result["error"]
+
+
+# --- Persistent job registry ---
+
+
+def _wait_for_terminal_record(job_id: str, timeout: float = 2.0) -> dict | None:
+    """Poll the on-disk registry until job_id reaches a non-"running" status
+    (i.e. the background finalizer thread has persisted it), or timeout."""
+    deadline = time.monotonic() + timeout
+    record = None
+    while time.monotonic() < deadline:
+        record = server._load_registry().get(job_id)
+        if record is not None and record["status"] != "running":
+            return record
+        time.sleep(0.02)
+    return record
+
+
+def test_transcribe_persists_started_record(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    mock_proc = _make_proc(b"    local       : /tmp/t.md\n", b"", 0)
+    mock_proc.pid = 4242
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ):
+        result = server.transcribe(str(audio), 3)
+
+    record = server._load_registry()[result["job_id"]]
+    assert record["backend"] == "swift"
+    assert record["input_path"] == str(audio)
+    assert record["num_speakers"] == 3
+    assert record["pid"] == 4242
+    assert record["status"] == "running"
+    assert record["output_path"] is None
+    assert record["started_at"] is not None
+
+
+def test_finalizer_persists_done_status(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    transcript = tmp_path / "t.md"
+    mock_proc = _make_proc(f"    local       : {transcript}\n".encode(), b"", 0)
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ):
+        result = server.transcribe(str(audio), 2)
+
+    record = _wait_for_terminal_record(result["job_id"])
+    assert record["status"] == "done"
+    assert record["output_path"] == str(transcript)
+    assert record["error"] is None
+    assert record["finished_at"] is not None
+
+
+def test_finalizer_persists_failed_status(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    mock_proc = _make_proc(b"", b"boom\n", 1)
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ):
+        result = server.transcribe(str(audio), 2)
+
+    record = _wait_for_terminal_record(result["job_id"])
+    assert record["status"] == "failed"
+    assert "boom" in record["error"]
+    assert record["output_path"] is None
+
+
+def test_finalizer_persists_failed_status_for_stalled_job(monkeypatch):
+    # A stalled job (process exited, collectors never finish) never sets
+    # the done Events the finalizer originally just blocked on - it must
+    # instead notice via the same is_complete()/stalled() check
+    # get_transcript's polling uses, or the registry entry would be stuck
+    # at "running" forever (short of a server restart).
+    monkeypatch.setattr(server, "COLLECTOR_STALL_TIMEOUT", 0.05)
+
+    never_release = threading.Event()
+
+    class _NeverEndingReader:
+        def __iter__(self):
+            never_release.wait()
+            return iter([])
+
+        def read(self):
+            never_release.wait()
+            return b""
+
+        def close(self):
+            pass
+
+    proc = MagicMock()
+    proc.stdout = _NeverEndingReader()
+    proc.stderr = _NeverEndingReader()
+    proc.returncode = 1
+    proc.poll.return_value = 1
+    proc.pid = 4242
+
+    server._record_job_started(
+        "stalled-finalize-id",
+        backend="swift",
+        input_path="/tmp/a.wav",
+        num_speakers=2,
+        pid=4242,
+    )
+    job = server.Job(proc=proc, backend="swift", job_id="stalled-finalize-id")
+    server.jobs["stalled-finalize-id"] = job
+
+    try:
+        record = _wait_for_terminal_record("stalled-finalize-id", timeout=3.0)
+        assert record is not None
+        assert record["status"] == "failed"
+        assert "internal bug" in record["error"]
+    finally:
+        never_release.set()
+
+
+def test_get_transcript_reads_done_job_from_registry_when_not_live(tmp_path):
+    transcript = tmp_path / "transcript.md"
+    transcript.write_text("# Meeting\n\nAlice: Hello.")
+    server._record_job_started(
+        "past-done-id", backend="swift", input_path="/tmp/a.wav", num_speakers=2, pid=1
+    )
+    server._update_job_record(
+        "past-done-id", status="done", output_path=str(transcript), error=None
+    )
+
+    result = server.get_transcript("past-done-id")
+    assert result["status"] == "done"
+    assert "Alice" in result["transcript"]
+    assert result["output_path"] == str(transcript)
+
+
+def test_get_transcript_reads_done_job_missing_file_from_registry(tmp_path):
+    server._record_job_started(
+        "past-missing-id", backend="swift", input_path="/tmp/a.wav", num_speakers=2, pid=1
+    )
+    server._update_job_record(
+        "past-missing-id",
+        status="done",
+        output_path=str(tmp_path / "gone.md"),
+        error=None,
+    )
+
+    result = server.get_transcript("past-missing-id")
+    assert result["status"] == "failed"
+
+
+def test_get_transcript_reads_failed_job_from_registry_when_not_live():
+    server._record_job_started(
+        "past-failed-id", backend="swift", input_path="/tmp/a.wav", num_speakers=2, pid=1
+    )
+    server._update_job_record(
+        "past-failed-id", status="failed", output_path=None, error="exit code 1"
+    )
+
+    result = server.get_transcript("past-failed-id")
+    assert result == {"status": "failed", "error": "exit code 1"}
+
+
+def test_get_transcript_reads_interrupted_job_from_registry():
+    server._record_job_started(
+        "past-interrupted-id",
+        backend="swift",
+        input_path="/tmp/a.wav",
+        num_speakers=2,
+        pid=1,
+    )
+    server._update_job_record(
+        "past-interrupted-id",
+        status="interrupted",
+        output_path=None,
+        error="server restarted",
+    )
+
+    result = server.get_transcript("past-interrupted-id")
+    assert result == {"status": "interrupted", "error": "server restarted"}
+
+
+def test_get_transcript_registry_running_but_not_live_reports_interrupted():
+    # Fail-safe: reconciliation should always convert "running" to
+    # "interrupted" on startup, but get_transcript must not claim a job with
+    # no live handle is still "running" even if that somehow didn't happen.
+    server._record_job_started(
+        "stale-running-id", backend="swift", input_path="/tmp/a.wav", num_speakers=2, pid=1
+    )
+
+    result = server.get_transcript("stale-running-id")
+    assert result["status"] == "interrupted"
+
+
+def test_reconcile_registry_on_startup_marks_running_as_interrupted():
+    server._record_job_started(
+        "reconcile-id", backend="swift", input_path="/tmp/a.wav", num_speakers=2, pid=1
+    )
+
+    server._reconcile_registry_on_startup()
+
+    record = server._load_registry()["reconcile-id"]
+    assert record["status"] == "interrupted"
+    assert "restarted" in record["error"]
+    assert record["finished_at"] is not None
+
+
+def test_reconcile_registry_on_startup_leaves_terminal_statuses_alone():
+    server._record_job_started(
+        "already-done-id", backend="swift", input_path="/tmp/a.wav", num_speakers=2, pid=1
+    )
+    server._update_job_record(
+        "already-done-id", status="done", output_path="/tmp/out.md", error=None
+    )
+
+    server._reconcile_registry_on_startup()
+
+    record = server._load_registry()["already-done-id"]
+    assert record["status"] == "done"
+
+
+def test_load_registry_returns_empty_on_corrupt_file():
+    server.JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    server.JOBS_FILE.write_text("not json{{{")
+    assert server._load_registry() == {}
+
+
+def test_prune_registry_drops_oldest_completed_first(monkeypatch):
+    monkeypatch.setattr(server, "MAX_PERSISTED_JOBS", 2)
+    registry = {
+        "old": {"job_id": "old", "status": "done", "started_at": "2020-01-01T00:00:00"},
+        "mid": {"job_id": "mid", "status": "failed", "started_at": "2020-06-01T00:00:00"},
+        "new": {"job_id": "new", "status": "done", "started_at": "2021-01-01T00:00:00"},
+        "still-running": {
+            "job_id": "still-running",
+            "status": "running",
+            "started_at": "2019-01-01T00:00:00",
+        },
+    }
+    server._prune_registry(registry)
+    # overflow = 4 - 2 = 2: drops the 2 oldest *completed* entries ("old",
+    # then "mid"), never the still-running one regardless of its age.
+    assert set(registry) == {"new", "still-running"}
+
+
+def test_list_jobs_merges_registry_and_live_state(tmp_path):
+    server._record_job_started(
+        "old-done-id", backend="python", input_path="/tmp/old.wav", num_speakers=1, pid=1
+    )
+    server._update_job_record(
+        "old-done-id", status="done", output_path="/tmp/old.md", error=None
+    )
+
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+
+    unblock = threading.Event()
+
+    class _BlockingStdout:
+        def __iter__(self):
+            yield b"==> Transcribing audio...\n"
+            unblock.wait()
+
+        def close(self):
+            pass
+
+    live_proc = MagicMock()
+    live_proc.stdout = _BlockingStdout()
+    live_proc.stderr = io.BytesIO(b"")
+    live_proc.returncode = None
+    live_proc.poll.return_value = None
+    live_proc.pid = 9999
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=live_proc
+    ):
+        started = server.transcribe(str(audio), 2)
+
+    try:
+        result = server.list_jobs()
+        by_id = {entry["job_id"]: entry for entry in result["jobs"]}
+        assert by_id["old-done-id"]["status"] == "done"
+        assert by_id["old-done-id"]["output_path"] == "/tmp/old.md"
+        assert by_id[started["job_id"]]["status"] == "running"
+    finally:
+        unblock.set()
+
+
+def test_list_jobs_recomputes_outcome_for_completed_job_not_yet_finalized(
+    tmp_path, monkeypatch
+):
+    # Simulate the background finalizer thread not having written yet, to
+    # exercise the case where the on-disk registry still says "running" for
+    # an already-completed live job - list_jobs must recompute the real
+    # outcome rather than trust that stale snapshot.
+    monkeypatch.setattr(server, "_update_job_record", lambda *a, **k: None)
+
+    transcript = tmp_path / "t.md"
+    proc = _make_proc(f"    local       : {transcript}\n".encode(), b"", 0)
+    server._record_job_started(
+        "fresh-done-id",
+        backend="swift",
+        input_path="/tmp/a.wav",
+        num_speakers=2,
+        pid=proc.pid,
+    )
+    job = server.Job(proc=proc, backend="swift", job_id="fresh-done-id")
+    server.jobs["fresh-done-id"] = job
+    _wait(job)
+
+    result = server.list_jobs()
+    by_id = {entry["job_id"]: entry for entry in result["jobs"]}
+    assert by_id["fresh-done-id"]["status"] == "done"
+    assert by_id["fresh-done-id"]["output_path"] == str(transcript)
+
+
+def test_list_jobs_respects_limit():
+    for i in range(5):
+        server._record_job_started(
+            f"job-{i}", backend="swift", input_path="/tmp/a.wav", num_speakers=1, pid=1
+        )
+    result = server.list_jobs(limit=2)
+    assert len(result["jobs"]) == 2
 
 
 def test_get_config_success():

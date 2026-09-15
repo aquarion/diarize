@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import logging.handlers
 import os
@@ -12,6 +13,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -41,6 +43,126 @@ if not logger.handlers:
         # discarding log records if the log directory isn't writable.
         _handler = logging.NullHandler()
     logger.addHandler(_handler)
+
+
+# --- Persistent job registry ---
+#
+# `jobs` (above) is in-memory only and forgotten on restart, which used to
+# make a still-running (or just-finished) job indistinguishable from one
+# that never existed. This registry persists the essentials - enough to
+# tell a caller "yes, that job existed, here's what happened to it" even
+# after the process that ran it is gone.
+
+JOBS_FILE = LOG_DIR / "jobs.json"
+_registry_lock = threading.Lock()
+
+# Keep the on-disk registry bounded so it can't grow forever over a long
+# server lifetime.
+MAX_PERSISTED_JOBS = 200
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _load_registry() -> dict[str, dict]:
+    try:
+        return json.loads(JOBS_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_registry(registry: dict[str, dict]) -> None:
+    """Atomically replace the registry file so a crash mid-write can't leave
+    it corrupted. Persistence is best-effort: a failure here is logged, not
+    raised - it must never take down a job or the server."""
+    try:
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = JOBS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(registry, indent=2))
+        os.replace(tmp, JOBS_FILE)
+    except (OSError, TypeError) as e:
+        # TypeError: a value in the registry wasn't JSON-serializable - a
+        # bug elsewhere, but persistence failing must never take a job or
+        # the server down over it.
+        logger.warning("failed to persist job registry: %s", e)
+
+
+def _prune_registry(registry: dict[str, dict]) -> None:
+    """Drop the oldest *completed* entries beyond MAX_PERSISTED_JOBS. Never
+    drops a "running" entry - losing track of an in-flight job is exactly
+    the bug this registry exists to fix."""
+    overflow = len(registry) - MAX_PERSISTED_JOBS
+    if overflow <= 0:
+        return
+    completed = sorted(
+        (r for r in registry.values() if r["status"] != "running"),
+        key=lambda r: r["started_at"],
+    )
+    for record in completed[:overflow]:
+        del registry[record["job_id"]]
+
+
+def _record_job_started(
+    job_id: str, *, backend: str, input_path: str, num_speakers: int, pid: int
+) -> None:
+    with _registry_lock:
+        registry = _load_registry()
+        registry[job_id] = {
+            "job_id": job_id,
+            "backend": backend,
+            "input_path": input_path,
+            "num_speakers": num_speakers,
+            "pid": pid,
+            "status": "running",
+            "output_path": None,
+            "error": None,
+            "started_at": _now_iso(),
+            "finished_at": None,
+        }
+        _prune_registry(registry)
+        _write_registry(registry)
+
+
+def _update_job_record(
+    job_id: str, *, status: str, output_path: str | None, error: str | None
+) -> None:
+    with _registry_lock:
+        registry = _load_registry()
+        record = registry.get(job_id)
+        if record is None:
+            return  # e.g. registry file was lost/wiped after the job started
+        record["status"] = status
+        record["output_path"] = output_path
+        record["error"] = error
+        record["finished_at"] = _now_iso()
+        _write_registry(registry)
+
+
+def _reconcile_registry_on_startup() -> None:
+    """A job recorded as "running" from a previous server process cannot
+    actually still be tracked as running - that process's handle to the
+    subprocess (and its stdout/stderr pipes) is gone. Mark these
+    "interrupted" rather than leaving them to look perpetually in-progress,
+    so a caller knows to check for output on disk or just re-run."""
+    with _registry_lock:
+        registry = _load_registry()
+        changed = False
+        for record in registry.values():
+            if record["status"] == "running":
+                record["status"] = "interrupted"
+                record["error"] = (
+                    "the MCP server restarted while this job was running; "
+                    "its actual outcome is unknown - check the configured "
+                    "output location, or re-run the transcription"
+                )
+                record["finished_at"] = _now_iso()
+                changed = True
+        if changed:
+            _write_registry(registry)
+
+
+_reconcile_registry_on_startup()
 
 
 class BackendUnavailableError(Exception):
@@ -123,6 +245,32 @@ class Job:
     def __post_init__(self) -> None:
         threading.Thread(target=self._collect_stdout, daemon=True).start()
         threading.Thread(target=self._collect_stderr, daemon=True).start()
+        # Persists this job's outcome to the on-disk registry as soon as it's
+        # known, independent of whether any client ever calls get_transcript
+        # again to observe it - otherwise a client that stops polling right
+        # after a job finishes would leave it stuck at "running" in the
+        # registry until the next restart marks it "interrupted".
+        threading.Thread(target=self._finalize_and_persist, daemon=True).start()
+
+    def _finalize_and_persist(self) -> None:
+        # Mirrors get_transcript's own is_complete()/stalled() check rather
+        # than just waiting on the done Events: a stalled job (collectors
+        # stuck, process already exited) never sets those Events, and
+        # without this loop this thread would block forever, leaving the
+        # registry stuck at "running" instead of picking up the "failed"
+        # outcome stalled() detection makes available via collector_error.
+        while not self.is_complete() and not self.stalled():
+            # Wakes immediately once the collectors actually finish (the
+            # common case); the timeout only matters for the rare stalled
+            # case, bounding how quickly that gets detected and persisted.
+            self._stdout_done.wait(timeout=0.5)
+        outcome = _resolve_job_outcome(self)
+        _update_job_record(
+            self.job_id,
+            status=outcome["status"],
+            output_path=outcome.get("output_path"),
+            error=outcome.get("error"),
+        )
 
     def _record_collector_error(self, message: str) -> None:
         with self._error_lock:
@@ -334,6 +482,16 @@ def transcribe(file_path: str, num_speakers: int) -> dict:
                 e,
             )
     job_id = str(uuid.uuid4())
+    # Record before constructing Job: Job.__post_init__ spawns the finalizer
+    # thread immediately, which would find no record to update if the job
+    # somehow finished and that thread ran before this record existed.
+    _record_job_started(
+        job_id,
+        backend=backend_name,
+        input_path=str(p),
+        num_speakers=num_speakers,
+        pid=proc.pid,
+    )
     jobs[job_id] = Job(proc=proc, backend=backend_name, job_id=job_id)
     logger.info(
         "started job %s (backend=%s, pid=%s, file=%s, num_speakers=%s)",
@@ -346,30 +504,12 @@ def transcribe(file_path: str, num_speakers: int) -> dict:
     return {"job_id": job_id, "backend": backend_name}
 
 
-@mcp.tool()
-def get_transcript(job_id: str) -> dict:
-    """Poll a transcription job.
-
-    Returns:
-      {"status": "running"} while the job is in progress. May also include
-      "message" (last human-readable stage description) and, once the
-      transcription stage reports fine-grained progress, "fraction" (0-1)
-      and "stage".
-      {"status": "done", "transcript": "<markdown>", "output_path": "<path>"}
-      on success.
-      {"status": "failed", "error": "<message>"} on failure or unknown job_id.
-    """
-    job = jobs.get(job_id)
-    if job is None:
-        return {"status": "failed", "error": "unknown job_id"}
-    if not job.is_complete() and not job.stalled():
-        result: dict = {"status": "running"}
-        if job.last_message:
-            result["message"] = job.last_message
-        if job.last_fraction is not None:
-            result["fraction"] = job.last_fraction
-            result["stage"] = job.last_stage
-        return result
+def _resolve_job_outcome(job: Job) -> dict:
+    """Determine whether a complete job succeeded or failed, and its output
+    path if so. Shared between get_transcript's polling and the background
+    finalizer that persists the outcome to the on-disk registry as soon as
+    it's known, independent of whether anyone ever polls."""
+    job_id = job.job_id
     if job.collector_error:
         logger.error("job %s failed: %s", job_id, job.collector_error)
         return {
@@ -396,6 +536,47 @@ def get_transcript(job_id: str) -> dict:
             "job %s: could not find transcript path in stdout:\n%s", job_id, job.stdout
         )
         return {"status": "failed", "error": "could not find transcript path in output"}
+    return {"status": "done", "output_path": path}
+
+
+@mcp.tool()
+def get_transcript(job_id: str) -> dict:
+    """Poll a transcription job.
+
+    Returns:
+      {"status": "running"} while the job is in progress. May also include
+      "message" (last human-readable stage description) and, once the
+      transcription stage reports fine-grained progress, "fraction" (0-1)
+      and "stage".
+      {"status": "done", "transcript": "<markdown>", "output_path": "<path>"}
+      on success.
+      {"status": "failed", "error": "<message>"} on failure.
+      {"status": "interrupted", "error": "<message>"} if the MCP server
+      restarted while this job was running - its actual outcome is unknown.
+      {"status": "unknown", "error": "no such job_id"} if this job_id was
+      never seen (distinct from "failed": nothing to act on, no compute to
+      retry-avoid).
+    """
+    job = jobs.get(job_id)
+    if job is None:
+        return _get_transcript_from_registry(job_id)
+    if not job.is_complete() and not job.stalled():
+        result: dict = {"status": "running"}
+        if job.last_message:
+            result["message"] = job.last_message
+        if job.last_fraction is not None:
+            result["fraction"] = job.last_fraction
+            result["stage"] = job.last_stage
+        return result
+    outcome = _resolve_job_outcome(job)
+    if outcome["status"] != "done":
+        return outcome
+    return _read_transcript_result(outcome["output_path"], job_id)
+
+
+def _read_transcript_result(path: str, job_id: str) -> dict:
+    """Shared tail of a successful "done" resolution, whether the job was
+    resolved live or read back from the persisted registry."""
     try:
         transcript_text = Path(path).read_text()
     except Exception as e:
@@ -403,6 +584,80 @@ def get_transcript(job_id: str) -> dict:
         return {"status": "failed", "error": str(e)}
     logger.info("job %s done, output_path=%s", job_id, path)
     return {"status": "done", "transcript": transcript_text, "output_path": path}
+
+
+def _get_transcript_from_registry(job_id: str) -> dict:
+    """get_transcript's fallback for a job_id no longer (or never) tracked
+    live - e.g. because the server restarted since it was started. Consults
+    the persisted registry so a restart can't turn "this job existed" into
+    "unknown job_id"."""
+    record = _load_registry().get(job_id)
+    if record is None:
+        return {"status": "unknown", "error": "no such job_id"}
+    if record["status"] == "done":
+        return _read_transcript_result(record["output_path"], job_id)
+    if record["status"] == "running":
+        # Shouldn't normally happen - _reconcile_registry_on_startup converts
+        # these to "interrupted" before the server starts serving requests -
+        # but fail safe rather than claim a job with no live handle is running.
+        return {
+            "status": "interrupted",
+            "error": "job is no longer being tracked; check the configured "
+            "output location, or re-run the transcription",
+        }
+    return {"status": record["status"], "error": record.get("error") or "unknown error"}
+
+
+@mcp.tool()
+def list_jobs(limit: int = 20) -> dict:
+    """List recent transcription jobs, most recently started first - including
+    ones from before a server restart, which get_transcript alone can't see.
+
+    Returns {"jobs": [{"job_id", "backend", "input_path", "num_speakers",
+    "status", "output_path", "error", "started_at", "finished_at"}, ...]}.
+    A job still tracked live also carries "message" and, once transcription
+    reports fine-grained progress, "fraction"/"stage" - see get_transcript.
+    """
+    registry = _load_registry()
+    for job_id, job in jobs.items():
+        record = dict(
+            registry.get(
+                job_id,
+                {
+                    "job_id": job_id,
+                    "backend": job.backend,
+                    "input_path": None,
+                    "num_speakers": None,
+                    "pid": job.proc.pid,
+                    "status": "running",
+                    "output_path": None,
+                    "error": None,
+                    "started_at": None,
+                    "finished_at": None,
+                },
+            )
+        )
+        if not job.is_complete() and not job.stalled():
+            record["status"] = "running"
+            if job.last_message:
+                record["message"] = job.last_message
+            if job.last_fraction is not None:
+                record["fraction"] = job.last_fraction
+                record["stage"] = job.last_stage
+        else:
+            # The job finished, but the background finalizer thread that
+            # persists this to disk runs asynchronously - compute the
+            # outcome directly rather than risk showing a stale "running"
+            # snapshot from before it's had a chance to write.
+            outcome = _resolve_job_outcome(job)
+            record["status"] = outcome["status"]
+            record["output_path"] = outcome.get("output_path", record.get("output_path"))
+            record["error"] = outcome.get("error", record.get("error"))
+        registry[job_id] = record
+    entries = sorted(
+        registry.values(), key=lambda r: r.get("started_at") or "", reverse=True
+    )
+    return {"jobs": entries[:limit]}
 
 
 @mcp.tool()
