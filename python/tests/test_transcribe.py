@@ -348,6 +348,26 @@ def test_run_whisperx_subprocess_relays_stdout_and_parses_progress(capsys):
     assert "progress:1.0000:transcribing" in out
 
 
+def test_run_whisperx_subprocess_suppresses_backward_progress_from_alignment_pass(
+    capsys,
+):
+    # whisperx runs transcription then a separate alignment pass, and each
+    # prints its own independent 0-100% "Progress:" line - the alignment
+    # pass's lines here (restarting at 0%) must not be translated, since
+    # that would make the reported fraction jump backwards.
+    lines = [
+        "Progress: 100.00%...\n",
+        "Progress: 0.00%...\n",
+        "Progress: 50.00%...\n",
+        "Progress: 100.00%...\n",
+    ]
+    with patch("transcribe.subprocess.Popen", return_value=_fake_popen(lines)):
+        transcribe._run_whisperx_subprocess(["whisperx", "audio.wav"])
+    out = capsys.readouterr().out
+    progress_lines = [line for line in out.splitlines() if line.startswith("progress:")]
+    assert progress_lines == ["progress:1.0000:transcribing"]
+
+
 def test_run_whisperx_subprocess_raises_on_nonzero_exit():
     with patch(
         "transcribe.subprocess.Popen", return_value=_fake_popen([], returncode=1)

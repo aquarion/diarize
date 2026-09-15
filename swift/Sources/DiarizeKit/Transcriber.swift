@@ -16,15 +16,15 @@ public actor WhisperKitTranscriber: TranscriberProtocol {
         }
         // WhisperKit doesn't hand back a fraction in its per-token callback, but it
         // maintains its own Foundation `Progress` (updated once per ~30s decode window)
-        // that we can sample whenever the callback fires. Dedup identical reads so we
-        // don't flood the pipeline's progress stream with hundreds of repeats between
-        // window boundaries.
-        let taskProgress = wk.progress
+        // that we can sample whenever the callback fires. Read `wk.progress` fresh on
+        // each tick (rather than capturing it once up front) so this can't end up
+        // reading a stale Progress object if a caller ever reuses a WhisperKitTranscriber
+        // across more than one transcribe() call.
         let lastReported = LastReportedFraction()
         let results: [TranscriptionResult] = try await wk.transcribe(
             audioPath: audioURL.path,
             callback: { _ in
-                let fraction = taskProgress.fractionCompleted
+                let fraction = wk.progress.fractionCompleted
                 if lastReported.update(to: fraction) {
                     onProgress?(fraction)
                 }
@@ -44,7 +44,10 @@ public actor WhisperKitTranscriber: TranscriberProtocol {
 }
 
 /// WhisperKit invokes its transcription callback from `Task.detached`, so callbacks
-/// can race each other; this guards the last-seen fraction so we only forward changes.
+/// for different windows can run out of order. Only forwarding strictly increasing
+/// fractions both dedups repeats within a window and stops an out-of-order callback
+/// (e.g. one for an earlier window that got scheduled late) from reporting progress
+/// moving backwards.
 private final class LastReportedFraction: @unchecked Sendable {
     private let lock = NSLock()
     private var value: Double = -1
@@ -52,7 +55,7 @@ private final class LastReportedFraction: @unchecked Sendable {
     func update(to newValue: Double) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard newValue != value else { return false }
+        guard newValue > value else { return false }
         value = newValue
         return true
     }

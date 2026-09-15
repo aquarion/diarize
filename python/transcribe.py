@@ -178,12 +178,22 @@ def _run_whisperx_subprocess(cmd: list[str]) -> None:
         cmd, stdout=subprocess.PIPE, text=True, bufsize=1, errors="replace"
     )
     assert proc.stdout is not None
+    # whisperx (when run with --diarize, as we always do) runs transcription
+    # then a separate word-alignment pass, and each prints its own
+    # independent 0-100% "Progress:" lines rather than a single combined
+    # sweep - so translating both verbatim would make the reported fraction
+    # jump backwards once alignment starts. Only forwarding strictly
+    # increasing fractions keeps what we report monotonic: alignment then
+    # just reads as holding at "almost done" rather than restarting.
+    last_fraction = 0.0
     for line in proc.stdout:
         sys.stdout.write(line)
         match = _WHISPERX_PROGRESS_RE.match(line.strip())
         if match:
             fraction = min(1.0, float(match.group(1)) / 100.0)
-            print(f"progress:{fraction:.4f}:transcribing")
+            if fraction > last_fraction:
+                last_fraction = fraction
+                print(f"progress:{fraction:.4f}:transcribing")
     proc.stdout.close()
     returncode = proc.wait()
     if returncode != 0:
@@ -315,6 +325,12 @@ def run_mlx_whisper_pipeline(wav_path: Path, cfg: AppConfig, out_dir: Path) -> N
             raw = mlx_whisper.transcribe(
                 audio_array, path_or_hf_repo=cfg.mlx_model, verbose=True
             )
+        # If the last segment ends before the file's actual duration (common
+        # with trailing silence), the tee above never sees a timestamp that
+        # reaches 1.0 - report completion explicitly rather than leaving a
+        # caller reading a stale, less-than-100% fraction until the next
+        # "==>" line (which won't be printed until diarization starts).
+        print("progress:1.0000:transcribing")
 
         raw_segments = raw.get("segments", []) if isinstance(raw, dict) else []
         if not isinstance(raw_segments, list) or not raw_segments:
