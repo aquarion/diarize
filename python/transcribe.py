@@ -30,9 +30,13 @@ def _parse_clock(timestamp: str) -> float:
 
 
 class _ProgressTee:
-    """Forwards everything written to `target` unchanged, while also emitting
-    a "progress:<fraction>:<stage>" line (parsed by the MCP server) whenever a
-    whisper-style "[start --> end] text" segment line completes.
+    """Forwards everything written to `target`, translating each whisper-style
+    "[start --> end] text" verbose segment line into a "progress:<fraction>:
+    <stage>" line (parsed by the MCP server) instead of passing it through -
+    the segment text itself is redundant with the output files, and passing
+    thousands of them through would otherwise bloat the MCP server's
+    in-memory copy of this job's stdout for no benefit. Everything else
+    (diagnostics, warnings, ...) is forwarded unchanged.
 
     This lets us surface fine-grained transcription progress without a
     callback hook into the underlying transcription library, mirroring the
@@ -46,7 +50,6 @@ class _ProgressTee:
         self._buffer = ""
 
     def write(self, s: str) -> int:
-        self._target.write(s)
         self._buffer += s
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
@@ -54,9 +57,14 @@ class _ProgressTee:
             if match:
                 fraction = min(1.0, _parse_clock(match.group(1)) / self._total_duration)
                 self._target.write(f"progress:{fraction:.4f}:{self._stage}\n")
+            else:
+                self._target.write(line + "\n")
         return len(s)
 
     def flush(self) -> None:
+        if self._buffer:
+            self._target.write(self._buffer)
+            self._buffer = ""
         self._target.flush()
 
 
@@ -166,7 +174,9 @@ def _run_whisperx_subprocess(cmd: list[str]) -> None:
     own "Progress: NN.NN%..." lines (from --print_progress) into the
     "progress:<fraction>:<stage>" lines the MCP server parses - the same
     format the mlx-whisper and Swift/WhisperKit backends emit."""
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1)
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, text=True, bufsize=1, errors="replace"
+    )
     assert proc.stdout is not None
     for line in proc.stdout:
         sys.stdout.write(line)

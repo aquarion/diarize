@@ -174,6 +174,12 @@ class Job:
                 stripped = line.strip()
                 if stripped.startswith("==>"):
                     self.last_message = stripped[3:].strip()
+                    # Every "==>" line is a stage transition in both CLIs'
+                    # output convention, so any fraction/stage from the
+                    # previous stage no longer applies (e.g. don't keep
+                    # reporting 98% "transcribing" once diarization starts).
+                    self.last_fraction = None
+                    self.last_stage = None
                 elif stripped.startswith("progress:"):
                     # "progress:<fraction 0-1>:<stage>", emitted by both backends
                     # during the (long) transcription stage. Malformed lines are

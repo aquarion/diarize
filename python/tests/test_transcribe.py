@@ -151,8 +151,18 @@ def test_progress_tee_emits_progress_for_segment_lines(capsys):
     tee = transcribe._ProgressTee(target, total_duration=10.0, stage="transcribing")
     tee.write("[00:00.000 --> 00:05.000] hello\n")
     out = capsys.readouterr().out
-    assert "[00:00.000 --> 00:05.000] hello" in out
     assert "progress:0.5000:transcribing" in out
+
+
+def test_progress_tee_suppresses_raw_segment_text(capsys):
+    # The segment's own text is redundant with the output files already
+    # written to disk, and passing thousands of them through would bloat
+    # the MCP server's in-memory copy of the job's stdout for no benefit.
+    target = sys.stdout
+    tee = transcribe._ProgressTee(target, total_duration=10.0, stage="transcribing")
+    tee.write("[00:00.000 --> 00:05.000] hello\n")
+    out = capsys.readouterr().out
+    assert "hello" not in out
 
 
 def test_progress_tee_ignores_non_segment_lines(capsys):
@@ -179,6 +189,15 @@ def test_progress_tee_clamps_fraction_to_one(capsys):
     tee.write("[00:00.000 --> 00:20.000] overrun\n")
     out = capsys.readouterr().out
     assert "progress:1.0000:transcribing" in out
+
+
+def test_progress_tee_flush_emits_buffered_partial_line(capsys):
+    target = sys.stdout
+    tee = transcribe._ProgressTee(target, total_duration=10.0, stage="transcribing")
+    tee.write("no trailing newline yet")
+    assert capsys.readouterr().out == ""
+    tee.flush()
+    assert capsys.readouterr().out == "no trailing newline yet"
 
 
 def test_tee_progress_restores_stdout_on_success():
