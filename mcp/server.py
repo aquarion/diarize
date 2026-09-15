@@ -182,16 +182,23 @@ class Job:
                     self.last_stage = None
                 elif stripped.startswith("progress:"):
                     # "progress:<fraction 0-1>:<stage>", emitted by both backends
-                    # during the (long) transcription stage. Malformed lines are
-                    # ignored rather than failing the job.
+                    # during the (long) transcription stage. Malformed or
+                    # out-of-contract lines are ignored rather than failing
+                    # the job or handing a client nan/inf/out-of-range JSON.
                     parts = stripped.split(":", 2)
                     if len(parts) == 3:
                         try:
-                            self.last_fraction = float(parts[1])
+                            fraction = float(parts[1])
                         except ValueError:
                             pass
                         else:
-                            self.last_stage = parts[2]
+                            # Comparisons against float("nan") are always
+                            # False, so this range check also rejects nan
+                            # (and +/-inf) along with plain out-of-range
+                            # values - no separate isnan/isinf check needed.
+                            if 0.0 <= fraction <= 1.0:
+                                self.last_fraction = fraction
+                                self.last_stage = parts[2]
             self.proc.stdout.close()
             self.proc.wait()
         except Exception as e:
