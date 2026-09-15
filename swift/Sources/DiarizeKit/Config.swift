@@ -77,22 +77,36 @@ public enum ConfigLoader {
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent(filename)
         if FileManager.default.fileExists(atPath: cwd.path) { return cwd }
-        // Binary-relative: walk up from the executable looking for the repo
-        // checkout root. A fixed number of `deletingLastPathComponent()`
-        // calls can't handle both layouts at once - the plain SwiftPM binary
-        // (swift/.build/release/diarize) and the assembled app bundle
-        // (swift/.build/release/DiarizeApp.app/Contents/{MacOS,Resources}/...)
-        // sit at different depths - so search upward instead, bounded well
-        // past either case.
-        if let arg = CommandLine.arguments.first {
-            var dir = URL(fileURLWithPath: arg).standardizedFileURL.deletingLastPathComponent()
-            for _ in 0..<8 {
-                let candidate = dir.appendingPathComponent(filename)
-                if FileManager.default.fileExists(atPath: candidate.path) { return candidate }
-                let parent = dir.deletingLastPathComponent()
-                if parent.path == dir.path { break }
-                dir = parent
-            }
+        guard let arg = CommandLine.arguments.first else { return nil }
+        return searchUpwardForRepoFile(from: arg, filename: filename)
+    }
+
+    /// Walks up from `executablePath` looking for `filename`, handling both
+    /// the plain SwiftPM binary layout (`swift/.build/release/diarize`) and
+    /// the assembled `.app` bundle layout
+    /// (`swift/.build/release/DiarizeApp.app/Contents/{MacOS,Resources}/...`),
+    /// which nest the executable at different depths - a fixed number of
+    /// `deletingLastPathComponent()` calls can't handle both at once, so this
+    /// searches upward instead, bounded well past either case.
+    ///
+    /// `resolvingSymlinksInPath()` matters here: the "Install 'diarize'
+    /// Command in Terminal" feature symlinks the bundled CLI to
+    /// `/usr/local/bin/diarize`, and without resolving that symlink first,
+    /// this walk would start under `/usr/local/bin` instead of the real
+    /// bundle path inside the checkout.
+    ///
+    /// Not private, so tests can exercise both layouts directly without
+    /// depending on `CommandLine.arguments`.
+    static func searchUpwardForRepoFile(
+        from executablePath: String, filename: String, fileManager: FileManager = .default
+    ) -> URL? {
+        var dir = URL(fileURLWithPath: executablePath).resolvingSymlinksInPath().deletingLastPathComponent()
+        for _ in 0..<8 {
+            let candidate = dir.appendingPathComponent(filename)
+            if fileManager.fileExists(atPath: candidate.path) { return candidate }
+            let parent = dir.deletingLastPathComponent()
+            if parent.path == dir.path { break }
+            dir = parent
         }
         return nil
     }
