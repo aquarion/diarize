@@ -24,11 +24,11 @@ BUNDLE_VERSION="${DIARIZE_APP_VERSION:-1.0}"
 
 # CFBundleVersion/CFBundleShortVersionString both go straight into the
 # Info.plist XML below, and CFBundleVersion is specifically required by
-# Launch Services to be 1-3 period-separated non-negative integers - reject
-# anything else up front instead of writing a malformed or invalid plist
-# and exiting 0 anyway.
-if ! [[ "$BUNDLE_VERSION" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
-    echo "!! Invalid DIARIZE_APP_VERSION '$BUNDLE_VERSION': must be 1-3 period-separated non-negative integers (e.g. 1.0 or 1.2.3)" >&2
+# Launch Services to be 1-3 period-separated integers with a non-zero first
+# component - reject anything else up front instead of writing a malformed
+# or invalid plist and exiting 0 anyway.
+if ! [[ "$BUNDLE_VERSION" =~ ^[1-9][0-9]*(\.[0-9]+){0,2}$ ]]; then
+    echo "!! Invalid DIARIZE_APP_VERSION '$BUNDLE_VERSION': must be 1-3 period-separated integers with a non-zero first component (e.g. 1.0 or 1.2.3)" >&2
     exit 1
 fi
 
