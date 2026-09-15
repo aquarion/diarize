@@ -77,15 +77,22 @@ public enum ConfigLoader {
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent(filename)
         if FileManager.default.fileExists(atPath: cwd.path) { return cwd }
-        // Binary-relative: handles swift/.build/release/diarize in development
+        // Binary-relative: walk up from the executable looking for the repo
+        // checkout root. A fixed number of `deletingLastPathComponent()`
+        // calls can't handle both layouts at once - the plain SwiftPM binary
+        // (swift/.build/release/diarize) and the assembled app bundle
+        // (swift/.build/release/DiarizeApp.app/Contents/{MacOS,Resources}/...)
+        // sit at different depths - so search upward instead, bounded well
+        // past either case.
         if let arg = CommandLine.arguments.first {
-            let candidate = URL(fileURLWithPath: arg).standardizedFileURL
-                .deletingLastPathComponent()  // release
-                .deletingLastPathComponent()  // .build
-                .deletingLastPathComponent()  // swift
-                .deletingLastPathComponent()  // repo root
-                .appendingPathComponent(filename)
-            if FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+            var dir = URL(fileURLWithPath: arg).standardizedFileURL.deletingLastPathComponent()
+            for _ in 0..<8 {
+                let candidate = dir.appendingPathComponent(filename)
+                if FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+                let parent = dir.deletingLastPathComponent()
+                if parent.path == dir.path { break }
+                dir = parent
+            }
         }
         return nil
     }

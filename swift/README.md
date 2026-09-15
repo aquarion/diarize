@@ -23,12 +23,15 @@ cd swift
 swift build -c release
 ```
 
-This builds both the `diarize` CLI and the `DiarizeApp` bundle as separate
-products (a plain SwiftPM build does not embed one in the other).
+This builds both the `diarize` CLI and the `DiarizeApp` executable as
+separate products. Neither SwiftPM build system produces a macOS `.app`
+bundle on its own, so `DiarizeApp` on its own is just a raw executable, not
+something you can `open`.
 
-To get a single `DiarizeApp.app` that carries the CLI with it, build via the
-helper script instead, which copies `diarize` into the app bundle's
-`Contents/Resources/` after building both:
+To get a real `DiarizeApp.app` bundle that also carries the CLI with it,
+build via the helper script instead, which hand-assembles the bundle
+(`Info.plist`, `Contents/MacOS`, `Contents/Resources`) and embeds `diarize`
+into `Contents/Resources/`:
 
 ```bash
 ./scripts/build-app.sh
