@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 
 public struct AppConfig: Sendable {
     public enum Defaults {
@@ -72,13 +75,36 @@ public enum ConfigLoader {
             .appendingPathComponent("diarize/huggingface")
     }
 
-    private static func repoDefaultsURL() -> URL? {
+    /// Not private, so tests can exercise the real production lookup (driven
+    /// by the actual running executable's path) rather than only the
+    /// extracted `searchUpwardForRepoFile()` helper with synthetic paths.
+    static func repoDefaultsURL() -> URL? {
         let filename = "config/defaults.json"
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent(filename)
         if FileManager.default.fileExists(atPath: cwd.path) { return cwd }
-        guard let arg = CommandLine.arguments.first else { return nil }
-        return searchUpwardForRepoFile(from: arg, filename: filename)
+        guard let executablePath = currentExecutablePath() else { return nil }
+        return searchUpwardForRepoFile(from: executablePath, filename: filename)
+    }
+
+    /// The path of the actual running executable, as opposed to
+    /// `CommandLine.arguments.first` (argv[0]). When `diarize` is invoked
+    /// via `PATH` (e.g. after "Install 'diarize' Command in Terminal"),
+    /// argv[0] is commonly just the bare command name the user typed
+    /// ("diarize"), not a path - resolving that starts a search from the
+    /// current directory instead of the installed bundle. `_NSGetExecutablePath`
+    /// returns the real path the OS loaded, which `searchUpwardForRepoFile`
+    /// can then walk up from.
+    private static func currentExecutablePath() -> String? {
+        #if canImport(Darwin)
+        var size: UInt32 = 0
+        _NSGetExecutablePath(nil, &size)
+        var buffer = [Int8](repeating: 0, count: Int(size))
+        guard _NSGetExecutablePath(&buffer, &size) == 0 else { return nil }
+        return String(cString: buffer)
+        #else
+        return CommandLine.arguments.first
+        #endif
     }
 
     /// Walks up from `executablePath` looking for `filename`, handling both
