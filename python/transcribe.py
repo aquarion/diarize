@@ -4,12 +4,80 @@ from __future__ import annotations
 import importlib
 import json
 import platform
+import re
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
 from config import AppConfig, FatalPipelineError
+
+# Matches a whisper-style verbose segment line: "[00:12.340 --> 00:15.670] text"
+# (hours are included only for recordings over an hour: "01:02:03.456 --> ...").
+_SEGMENT_TIMESTAMP_RE = re.compile(r"^\[[\d:.]+\s*-->\s*([\d:.]+)\]")
+
+
+def _parse_clock(timestamp: str) -> float:
+    """Parse a "MM:SS.mmm" or "HH:MM:SS.mmm" clock timestamp into seconds."""
+    parts = timestamp.split(":")
+    seconds = float(parts[-1])
+    if len(parts) >= 2:
+        seconds += int(parts[-2]) * 60
+    if len(parts) == 3:
+        seconds += int(parts[-3]) * 3600
+    return seconds
+
+
+class _ProgressTee:
+    """Forwards everything written to `target`, translating each whisper-style
+    "[start --> end] text" verbose segment line into a "progress:<fraction>:
+    <stage>" line (parsed by the MCP server) instead of passing it through -
+    the segment text itself is redundant with the output files, and passing
+    thousands of them through would otherwise bloat the MCP server's
+    in-memory copy of this job's stdout for no benefit. Everything else
+    (diagnostics, warnings, ...) is forwarded unchanged.
+
+    This lets us surface fine-grained transcription progress without a
+    callback hook into the underlying transcription library, mirroring the
+    granularity WhisperKit's progress callback gives the Swift backend.
+    """
+
+    def __init__(self, target: Any, total_duration: float, stage: str) -> None:
+        self._target = target
+        self._total_duration = max(total_duration, 1e-6)
+        self._stage = stage
+        self._buffer = ""
+
+    def write(self, s: str) -> int:
+        self._buffer += s
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            match = _SEGMENT_TIMESTAMP_RE.match(line)
+            if match:
+                fraction = min(1.0, _parse_clock(match.group(1)) / self._total_duration)
+                self._target.write(f"progress:{fraction:.4f}:{self._stage}\n")
+            else:
+                self._target.write(line + "\n")
+        return len(s)
+
+    def flush(self) -> None:
+        if self._buffer:
+            self._target.write(self._buffer)
+            self._buffer = ""
+        self._target.flush()
+
+
+@contextmanager
+def _tee_progress(stage: str, total_duration: float):
+    """Temporarily replaces sys.stdout with a `_ProgressTee` for the duration
+    of the `with` block."""
+    old_stdout = sys.stdout
+    sys.stdout = _ProgressTee(old_stdout, total_duration, stage)
+    try:
+        yield
+    finally:
+        sys.stdout = old_stdout
 
 
 def has_cuda_available() -> bool:
@@ -97,6 +165,41 @@ def _build_whisperx_cmd(
     return cmd
 
 
+# whisperx's own --print_progress output looks like "Progress: 42.00%..."
+_WHISPERX_PROGRESS_RE = re.compile(r"^Progress:\s*([\d.]+)%")
+
+
+def _run_whisperx_subprocess(cmd: list[str]) -> None:
+    """Runs a whisperx command, relaying its stdout live while translating its
+    own "Progress: NN.NN%..." lines (from --print_progress) into the
+    "progress:<fraction>:<stage>" lines the MCP server parses - the same
+    format the mlx-whisper and Swift/WhisperKit backends emit."""
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, text=True, bufsize=1, errors="replace"
+    )
+    assert proc.stdout is not None
+    # whisperx (when run with --diarize, as we always do) runs transcription
+    # then a separate word-alignment pass, and each prints its own
+    # independent 0-100% "Progress:" lines rather than a single combined
+    # sweep - so translating both verbatim would make the reported fraction
+    # jump backwards once alignment starts. Only forwarding strictly
+    # increasing fractions keeps what we report monotonic: alignment then
+    # just reads as holding at "almost done" rather than restarting.
+    last_fraction = 0.0
+    for line in proc.stdout:
+        sys.stdout.write(line)
+        match = _WHISPERX_PROGRESS_RE.match(line.strip())
+        if match:
+            fraction = min(1.0, float(match.group(1)) / 100.0)
+            if fraction > last_fraction:
+                last_fraction = fraction
+                print(f"progress:{fraction:.4f}:transcribing")
+    proc.stdout.close()
+    returncode = proc.wait()
+    if returncode != 0:
+        raise subprocess.CalledProcessError(returncode, cmd)
+
+
 def run_whisperx(wav_path: Path, cfg: AppConfig, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -107,7 +210,7 @@ def run_whisperx(wav_path: Path, cfg: AppConfig, out_dir: Path) -> None:
     print(f"    runtime: device={device or 'cpu'} compute_type={compute_type}")
     print("    command:", " ".join(cmd))
     try:
-        subprocess.run(cmd, check=True)
+        _run_whisperx_subprocess(cmd)
     except subprocess.CalledProcessError:
         if device == "cuda":
             print("!! CUDA WhisperX run failed; retrying on CPU.")
@@ -119,7 +222,7 @@ def run_whisperx(wav_path: Path, cfg: AppConfig, out_dir: Path) -> None:
                 None,
             )
             print("    fallback command:", " ".join(fallback_cmd))
-            subprocess.run(fallback_cmd, check=True)
+            _run_whisperx_subprocess(fallback_cmd)
             return
         raise
 
@@ -211,9 +314,23 @@ def run_mlx_whisper_pipeline(wav_path: Path, cfg: AppConfig, out_dir: Path) -> N
     else:
         print("==> Running mlx-whisper (Apple Silicon)")
         print(f"    model: {cfg.mlx_model}")
-        raw = mlx_whisper.transcribe(
-            str(wav_path), path_or_hf_repo=cfg.mlx_model, verbose=False
-        )
+        from mlx_whisper.audio import SAMPLE_RATE, load_audio
+
+        # Load audio ourselves (rather than handing transcribe() the path) so we
+        # know its duration up front, letting us translate whisper's per-segment
+        # verbose timestamps into a 0-1 progress fraction as they're printed.
+        audio_array = load_audio(str(wav_path))
+        duration = len(audio_array) / SAMPLE_RATE
+        with _tee_progress(stage="transcribing", total_duration=duration):
+            raw = mlx_whisper.transcribe(
+                audio_array, path_or_hf_repo=cfg.mlx_model, verbose=True
+            )
+        # If the last segment ends before the file's actual duration (common
+        # with trailing silence), the tee above never sees a timestamp that
+        # reaches 1.0 - report completion explicitly rather than leaving a
+        # caller reading a stale, less-than-100% fraction until the next
+        # "==>" line (which won't be printed until diarization starts).
+        print("progress:1.0000:transcribing")
 
         raw_segments = raw.get("segments", []) if isinstance(raw, dict) else []
         if not isinstance(raw_segments, list) or not raw_segments:

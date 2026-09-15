@@ -70,7 +70,19 @@ struct Transcribe: AsyncParsableCommand {
             config: cfg, progress: continuation
         )
         for await p in progressStream {
-            print("==> \(p.message)")
+            // Fine-grained in-stage ticks (e.g. mid-transcription) are printed as
+            // machine-parseable "progress:<fraction>:<stage>" lines rather than
+            // repeating the same "==>" message hundreds of times; the MCP server
+            // parses these to report live progress to callers.
+            if p.fraction > 0.0 && p.fraction < 1.0 {
+                // Force a POSIX locale: String(format:) otherwise uses the
+                // process locale, which on a comma-decimal system would emit
+                // "0,4200" and break the MCP server's parser.
+                let fractionStr = String(format: "%.4f", locale: Locale(identifier: "en_US_POSIX"), p.fraction)
+                print("progress:\(fractionStr):\(p.stage)")
+            } else {
+                print("==> \(p.message)")
+            }
         }
         let pipelineResult = try await result
 

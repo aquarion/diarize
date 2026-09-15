@@ -77,6 +77,29 @@ public enum DiarizeError: Error, LocalizedError {
 
 public protocol TranscriberProtocol: Sendable {
     func transcribe(audioURL: URL) async throws -> [Segment]
+
+    /// - Parameter onProgress: Called with a fraction (0...1) as transcription advances.
+    ///   May be invoked from any thread. Optional so callers that don't need progress
+    ///   can pass `nil`.
+    func transcribe(audioURL: URL, onProgress: (@Sendable (Double) -> Void)?) async throws -> [Segment]
+}
+
+extension TranscriberProtocol {
+    // Each requirement defaults to forwarding into the other, so a conformer
+    // only needs to implement whichever one it actually supports: a plain
+    // conformer implements just `transcribe(audioURL:)`, while one that
+    // reports progress (like WhisperKitTranscriber) implements the two-arg
+    // version directly instead of relying on this default. A conformer
+    // implementing neither would recurse forever - not something either
+    // default can catch at compile time - so every real conformer must
+    // implement at least one.
+    public func transcribe(audioURL: URL) async throws -> [Segment] {
+        try await transcribe(audioURL: audioURL, onProgress: nil)
+    }
+
+    public func transcribe(audioURL: URL, onProgress: (@Sendable (Double) -> Void)?) async throws -> [Segment] {
+        try await transcribe(audioURL: audioURL)
+    }
 }
 
 public protocol DiarizerProtocol: Sendable {

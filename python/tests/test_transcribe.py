@@ -125,6 +125,96 @@ def test_fmt_vtt_ts_negative_clamped_to_zero():
     assert transcribe._fmt_vtt_ts(-5) == "00:00:00.000"
 
 
+# --- _parse_clock ---
+
+
+def test_parse_clock_mm_ss():
+    assert transcribe._parse_clock("01:02.500") == pytest.approx(62.5)
+
+
+def test_parse_clock_hh_mm_ss():
+    assert transcribe._parse_clock("01:02:03.500") == pytest.approx(3723.5)
+
+
+# --- _ProgressTee / _tee_progress ---
+
+
+def test_progress_tee_relays_all_output(capsys):
+    target = sys.stdout
+    tee = transcribe._ProgressTee(target, total_duration=10.0, stage="transcribing")
+    tee.write("hello\n")
+    assert capsys.readouterr().out == "hello\n"
+
+
+def test_progress_tee_emits_progress_for_segment_lines(capsys):
+    target = sys.stdout
+    tee = transcribe._ProgressTee(target, total_duration=10.0, stage="transcribing")
+    tee.write("[00:00.000 --> 00:05.000] hello\n")
+    out = capsys.readouterr().out
+    assert "progress:0.5000:transcribing" in out
+
+
+def test_progress_tee_suppresses_raw_segment_text(capsys):
+    # The segment's own text is redundant with the output files already
+    # written to disk, and passing thousands of them through would bloat
+    # the MCP server's in-memory copy of the job's stdout for no benefit.
+    target = sys.stdout
+    tee = transcribe._ProgressTee(target, total_duration=10.0, stage="transcribing")
+    tee.write("[00:00.000 --> 00:05.000] hello\n")
+    out = capsys.readouterr().out
+    assert "hello" not in out
+
+
+def test_progress_tee_ignores_non_segment_lines(capsys):
+    target = sys.stdout
+    tee = transcribe._ProgressTee(target, total_duration=10.0, stage="transcribing")
+    tee.write("Detected language: en\n")
+    out = capsys.readouterr().out
+    assert out == "Detected language: en\n"
+    assert "progress:" not in out
+
+
+def test_progress_tee_handles_writes_split_across_lines(capsys):
+    target = sys.stdout
+    tee = transcribe._ProgressTee(target, total_duration=10.0, stage="transcribing")
+    tee.write("[00:00.000 --> ")
+    tee.write("00:05.000] hello\n")
+    out = capsys.readouterr().out
+    assert "progress:0.5000:transcribing" in out
+
+
+def test_progress_tee_clamps_fraction_to_one(capsys):
+    target = sys.stdout
+    tee = transcribe._ProgressTee(target, total_duration=10.0, stage="transcribing")
+    tee.write("[00:00.000 --> 00:20.000] overrun\n")
+    out = capsys.readouterr().out
+    assert "progress:1.0000:transcribing" in out
+
+
+def test_progress_tee_flush_emits_buffered_partial_line(capsys):
+    target = sys.stdout
+    tee = transcribe._ProgressTee(target, total_duration=10.0, stage="transcribing")
+    tee.write("no trailing newline yet")
+    assert capsys.readouterr().out == ""
+    tee.flush()
+    assert capsys.readouterr().out == "no trailing newline yet"
+
+
+def test_tee_progress_restores_stdout_on_success():
+    original = sys.stdout
+    with transcribe._tee_progress(stage="transcribing", total_duration=1.0):
+        assert sys.stdout is not original
+    assert sys.stdout is original
+
+
+def test_tee_progress_restores_stdout_on_exception():
+    original = sys.stdout
+    with pytest.raises(RuntimeError):
+        with transcribe._tee_progress(stage="transcribing", total_duration=1.0):
+            raise RuntimeError("boom")
+    assert sys.stdout is original
+
+
 # --- has_cuda_available ---
 
 
@@ -194,8 +284,7 @@ def test_run_whisperx_success_no_retry(tmp_path, monkeypatch):
     monkeypatch.setattr(
         transcribe, "resolve_whisperx_runtime", lambda cfg: (None, "int8")
     )
-    with patch("transcribe.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0)
+    with patch("transcribe._run_whisperx_subprocess") as mock_run:
         transcribe.run_whisperx(tmp_path / "audio.wav", _cfg(), tmp_path / "out")
     assert mock_run.call_count == 1
 
@@ -205,8 +294,8 @@ def test_run_whisperx_retries_on_cpu_after_cuda_failure(tmp_path, monkeypatch):
         transcribe, "resolve_whisperx_runtime", lambda cfg: ("cuda", "float16")
     )
     fail = subprocess.CalledProcessError(returncode=1, cmd="whisperx")
-    with patch("transcribe.subprocess.run") as mock_run:
-        mock_run.side_effect = [fail, MagicMock(returncode=0)]
+    with patch("transcribe._run_whisperx_subprocess") as mock_run:
+        mock_run.side_effect = [fail, None]
         transcribe.run_whisperx(tmp_path / "audio.wav", _cfg(), tmp_path / "out")
     assert mock_run.call_count == 2
     # second call should be the CPU fallback: no --device flag
@@ -219,7 +308,7 @@ def test_run_whisperx_non_cuda_failure_propagates(tmp_path, monkeypatch):
         transcribe, "resolve_whisperx_runtime", lambda cfg: (None, "int8")
     )
     fail = subprocess.CalledProcessError(returncode=1, cmd="whisperx")
-    with patch("transcribe.subprocess.run", side_effect=fail):
+    with patch("transcribe._run_whisperx_subprocess", side_effect=fail):
         with pytest.raises(subprocess.CalledProcessError):
             transcribe.run_whisperx(tmp_path / "audio.wav", _cfg(), tmp_path / "out")
 
@@ -229,9 +318,62 @@ def test_run_whisperx_creates_out_dir(tmp_path, monkeypatch):
         transcribe, "resolve_whisperx_runtime", lambda cfg: (None, "int8")
     )
     out_dir = tmp_path / "nested" / "out"
-    with patch("transcribe.subprocess.run", return_value=MagicMock(returncode=0)):
+    with patch("transcribe._run_whisperx_subprocess"):
         transcribe.run_whisperx(tmp_path / "audio.wav", _cfg(), out_dir)
     assert out_dir.exists()
+
+
+# --- _run_whisperx_subprocess ---
+
+
+def _fake_popen(lines, returncode=0):
+    proc = MagicMock()
+    proc.stdout = MagicMock()
+    proc.stdout.__iter__.return_value = iter(lines)
+    proc.wait.return_value = returncode
+    return proc
+
+
+def test_run_whisperx_subprocess_relays_stdout_and_parses_progress(capsys):
+    lines = [
+        "some setup line\n",
+        "Progress: 42.00%...\n",
+        "Progress: 100.00%...\n",
+    ]
+    with patch("transcribe.subprocess.Popen", return_value=_fake_popen(lines)):
+        transcribe._run_whisperx_subprocess(["whisperx", "audio.wav"])
+    out = capsys.readouterr().out
+    assert "some setup line" in out
+    assert "progress:0.4200:transcribing" in out
+    assert "progress:1.0000:transcribing" in out
+
+
+def test_run_whisperx_subprocess_suppresses_backward_progress_from_alignment_pass(
+    capsys,
+):
+    # whisperx runs transcription then a separate alignment pass, and each
+    # prints its own independent 0-100% "Progress:" line - the alignment
+    # pass's lines here (restarting at 0%) must not be translated, since
+    # that would make the reported fraction jump backwards.
+    lines = [
+        "Progress: 100.00%...\n",
+        "Progress: 0.00%...\n",
+        "Progress: 50.00%...\n",
+        "Progress: 100.00%...\n",
+    ]
+    with patch("transcribe.subprocess.Popen", return_value=_fake_popen(lines)):
+        transcribe._run_whisperx_subprocess(["whisperx", "audio.wav"])
+    out = capsys.readouterr().out
+    progress_lines = [line for line in out.splitlines() if line.startswith("progress:")]
+    assert progress_lines == ["progress:1.0000:transcribing"]
+
+
+def test_run_whisperx_subprocess_raises_on_nonzero_exit():
+    with patch(
+        "transcribe.subprocess.Popen", return_value=_fake_popen([], returncode=1)
+    ):
+        with pytest.raises(subprocess.CalledProcessError):
+            transcribe._run_whisperx_subprocess(["whisperx", "audio.wav"])
 
 
 # --- is_apple_silicon ---

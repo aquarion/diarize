@@ -69,7 +69,9 @@ Returns `{"job_id": "<uuid>", "backend": "swift"|"python"}` or `{"error": "..."}
 Polls the job started by `transcribe`.
 
 Returns one of:
-- `{"status": "running"}` — still processing
+- `{"status": "running"}` — still processing. May also include `"message"`
+  (last human-readable stage description) and, once the transcription stage
+  reports fine-grained progress, `"fraction"` (0-1) and `"stage"`.
 - `{"status": "done", "transcript": "<markdown>", "output_path": "<path>"}` — finished
 - `{"status": "failed", "error": "<message>"}` — something went wrong
 

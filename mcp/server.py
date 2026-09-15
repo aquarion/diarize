@@ -111,6 +111,8 @@ class Job:
     stdout: str = field(default="", init=False)
     stderr: str = field(default="", init=False)
     last_message: str = field(default="", init=False)
+    last_fraction: float | None = field(default=None, init=False)
+    last_stage: str | None = field(default=None, init=False)
     collector_error: str = field(default="", init=False)
     _stdout_done: threading.Event = field(default_factory=threading.Event, init=False)
     _stderr_done: threading.Event = field(default_factory=threading.Event, init=False)
@@ -172,6 +174,31 @@ class Job:
                 stripped = line.strip()
                 if stripped.startswith("==>"):
                     self.last_message = stripped[3:].strip()
+                    # Every "==>" line is a stage transition in both CLIs'
+                    # output convention, so any fraction/stage from the
+                    # previous stage no longer applies (e.g. don't keep
+                    # reporting 98% "transcribing" once diarization starts).
+                    self.last_fraction = None
+                    self.last_stage = None
+                elif stripped.startswith("progress:"):
+                    # "progress:<fraction 0-1>:<stage>", emitted by both backends
+                    # during the (long) transcription stage. Malformed or
+                    # out-of-contract lines are ignored rather than failing
+                    # the job or handing a client nan/inf/out-of-range JSON.
+                    parts = stripped.split(":", 2)
+                    if len(parts) == 3:
+                        try:
+                            fraction = float(parts[1])
+                        except ValueError:
+                            pass
+                        else:
+                            # Comparisons against float("nan") are always
+                            # False, so this range check also rejects nan
+                            # (and +/-inf) along with plain out-of-range
+                            # values - no separate isnan/isinf check needed.
+                            if 0.0 <= fraction <= 1.0:
+                                self.last_fraction = fraction
+                                self.last_stage = parts[2]
             self.proc.stdout.close()
             self.proc.wait()
         except Exception as e:
@@ -324,7 +351,10 @@ def get_transcript(job_id: str) -> dict:
     """Poll a transcription job.
 
     Returns:
-      {"status": "running"} while the job is in progress.
+      {"status": "running"} while the job is in progress. May also include
+      "message" (last human-readable stage description) and, once the
+      transcription stage reports fine-grained progress, "fraction" (0-1)
+      and "stage".
       {"status": "done", "transcript": "<markdown>", "output_path": "<path>"}
       on success.
       {"status": "failed", "error": "<message>"} on failure or unknown job_id.
@@ -336,6 +366,9 @@ def get_transcript(job_id: str) -> dict:
         result: dict = {"status": "running"}
         if job.last_message:
             result["message"] = job.last_message
+        if job.last_fraction is not None:
+            result["fraction"] = job.last_fraction
+            result["stage"] = job.last_stage
         return result
     if job.collector_error:
         logger.error("job %s failed: %s", job_id, job.collector_error)

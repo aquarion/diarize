@@ -296,6 +296,135 @@ def test_get_transcript_running_with_message():
     unblock.set()
 
 
+def test_get_transcript_running_with_fraction():
+    unblock = threading.Event()
+    lines_seen = threading.Event()
+
+    class _BlockingStdout:
+        def __iter__(self):
+            yield b"==> Transcribing audio...\n"
+            yield b"progress:0.4200:transcribing\n"
+            lines_seen.set()
+            unblock.wait()
+
+        def close(self):
+            pass
+
+    proc = MagicMock()
+    proc.stdout = _BlockingStdout()
+    proc.stderr = io.BytesIO(b"")
+    proc.returncode = 0
+    proc.poll.return_value = None
+
+    job = server.Job(proc=proc, backend="swift")
+    server.jobs["running-fraction-id"] = job
+
+    lines_seen.wait(timeout=2.0)
+    result = server.get_transcript("running-fraction-id")
+    assert result["status"] == "running"
+    assert result["fraction"] == 0.42
+    assert result["stage"] == "transcribing"
+    unblock.set()
+
+
+def test_get_transcript_running_ignores_malformed_progress_line():
+    unblock = threading.Event()
+    lines_seen = threading.Event()
+
+    class _BlockingStdout:
+        def __iter__(self):
+            yield b"progress:not-a-number:transcribing\n"
+            lines_seen.set()
+            unblock.wait()
+
+        def close(self):
+            pass
+
+    proc = MagicMock()
+    proc.stdout = _BlockingStdout()
+    proc.stderr = io.BytesIO(b"")
+    proc.returncode = 0
+    proc.poll.return_value = None
+
+    job = server.Job(proc=proc, backend="swift")
+    server.jobs["running-bad-fraction-id"] = job
+
+    lines_seen.wait(timeout=2.0)
+    result = server.get_transcript("running-bad-fraction-id")
+    assert result["status"] == "running"
+    assert "fraction" not in result
+    unblock.set()
+
+
+def test_get_transcript_running_ignores_out_of_range_progress_lines():
+    # nan/inf/out-of-range values would otherwise be stored verbatim and
+    # (for nan/inf) produce invalid JSON for a client polling get_transcript.
+    unblock = threading.Event()
+    lines_seen = threading.Event()
+
+    class _BlockingStdout:
+        def __iter__(self):
+            yield b"progress:2.0000:transcribing\n"
+            yield b"progress:nan:transcribing\n"
+            yield b"progress:inf:transcribing\n"
+            yield b"progress:-1.0000:transcribing\n"
+            lines_seen.set()
+            unblock.wait()
+
+        def close(self):
+            pass
+
+    proc = MagicMock()
+    proc.stdout = _BlockingStdout()
+    proc.stderr = io.BytesIO(b"")
+    proc.returncode = 0
+    proc.poll.return_value = None
+
+    job = server.Job(proc=proc, backend="swift")
+    server.jobs["running-out-of-range-fraction-id"] = job
+
+    lines_seen.wait(timeout=2.0)
+    result = server.get_transcript("running-out-of-range-fraction-id")
+    assert result["status"] == "running"
+    assert "fraction" not in result
+    unblock.set()
+
+
+def test_get_transcript_running_fraction_cleared_on_next_stage():
+    # A stale transcription-stage fraction shouldn't leak into a later
+    # stage (e.g. diarization) that never reports its own progress lines.
+    unblock = threading.Event()
+    lines_seen = threading.Event()
+
+    class _BlockingStdout:
+        def __iter__(self):
+            yield b"==> Transcribing audio...\n"
+            yield b"progress:0.9800:transcribing\n"
+            yield b"==> Running pyannote diarization\n"
+            lines_seen.set()
+            unblock.wait()
+
+        def close(self):
+            pass
+
+    proc = MagicMock()
+    proc.stdout = _BlockingStdout()
+    proc.stderr = io.BytesIO(b"")
+    proc.returncode = 0
+    proc.poll.return_value = None
+
+    job = server.Job(proc=proc, backend="swift")
+    server.jobs["running-stage-transition-id"] = job
+
+    lines_seen.wait(timeout=2.0)
+    result = server.get_transcript("running-stage-transition-id")
+    assert result["status"] == "running"
+    assert result["message"] == "Running pyannote diarization"
+    assert "fraction" not in result
+    assert "stage" not in result
+    unblock.set()
+
+
 def test_get_transcript_done(tmp_path):
     transcript = tmp_path / "transcript.md"
     transcript.write_text("# Meeting\n\nAlice: Hello.\nBob: Hi.")
