@@ -372,6 +372,12 @@ class Job:
     # key that transcribe() then re-adds afterward - see _finalize_and_persist.
     _lifecycle_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _eviction_pending: bool = field(default=False, init=False)
+    # Set once a call to _persist_terminal_outcome has actually written this
+    # job's outcome to disk - guards against a later, stale call (e.g. from
+    # list_jobs, racing this job's own finalizer) re-persisting and
+    # resurrecting a record that's since been pruned. See
+    # _persist_terminal_outcome.
+    _outcome_persisted: bool = field(default=False, init=False)
     # Set once _finalize_and_persist has made its last attempt (successful
     # or not) - not used by production code (which never needs to wait for
     # its own background thread), only by tests that need to know a
@@ -743,6 +749,24 @@ def _persist_terminal_outcome(job: Job, outcome: dict) -> bool:
     # window can't remove this job's just-written record before this
     # function gets to act on the promise that record's existence made -
     # see _pending_eviction and _prune_registry.
+    with job._lifecycle_lock:
+        # A prior call for this exact job (almost always its own finalizer
+        # thread, but get_transcript/list_jobs can reach here too - see
+        # this function's docstring) may have already durably persisted
+        # this outcome. E.g. list_jobs takes a snapshot, then before its
+        # loop reaches this job, the job finishes, gets fully persisted and
+        # evicted by its own finalizer, and its now-completed record gets
+        # pruned by some unrelated job's finalizer (it's simply the oldest
+        # completed one once no longer "running"). Were we to proceed here,
+        # _update_job_record's fallback_start would reconstruct a fresh
+        # record for a job the 200-entry cap already forgot on purpose.
+        # _outcome_persisted (set only after a previous call's write
+        # actually succeeded) is the signal for that - unlike checking
+        # `jobs.get(job.job_id) is not job`, it can't be confused with the
+        # legitimate case below where this is the *first* call and the job
+        # simply hasn't been inserted into `jobs` yet.
+        if job._outcome_persisted:
+            return True
     with _registry_lock:
         _pending_eviction.add(job.job_id)
     try:
@@ -764,6 +788,7 @@ def _persist_terminal_outcome(job: Job, outcome: dict) -> bool:
         if not persisted:
             return False
         with job._lifecycle_lock:
+            job._outcome_persisted = True
             # For a job that completes near-instantly, this can run before
             # transcribe() has inserted `job` into `jobs` at all - popping
             # now would be a silent no-op, and the later insertion would

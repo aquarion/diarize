@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 
 os.environ.setdefault("DIARIZE_LOG_DIR", tempfile.mkdtemp(prefix="diarize-test-logs-"))
 
@@ -21,6 +22,26 @@ import server  # noqa: E402
 server._PERSIST_RETRY_ATTEMPTS = 2
 server._PERSIST_RETRY_DELAY = 0.01
 
+# Tracks every Job ever constructed during the test session, regardless of
+# whether it ends up in server.jobs (a test may hold one only as a local
+# variable, or it may already have evicted itself by the time a fixture
+# looks). Job.__post_init__ starts its finalizer thread immediately, so this
+# is the only reliable way to wait for *every* such thread to finish before
+# tearing down - waiting on server.jobs.values() alone would miss a job that
+# was never inserted, or one that already evicted itself.
+_all_jobs: list[server.Job] = []
+_all_jobs_lock = threading.Lock()
+_orig_post_init = server.Job.__post_init__
+
+
+def _tracking_post_init(self: server.Job) -> None:
+    with _all_jobs_lock:
+        _all_jobs.append(self)
+    _orig_post_init(self)
+
+
+server.Job.__post_init__ = _tracking_post_init
+
 
 @pytest.fixture(autouse=True)
 def clear_jobs():
@@ -33,6 +54,14 @@ def clear_jobs():
     with server._registry_lock:
         server.JOBS_FILE.unlink(missing_ok=True)
     yield
+    # Wait for every finalizer thread this test's Jobs started before
+    # unlinking below - otherwise one still mid-retry can wake up after the
+    # unlink, land a write on the *next* test's jobs.json, and leak a stray
+    # record into it (see _all_jobs above).
+    with _all_jobs_lock:
+        pending, _all_jobs[:] = list(_all_jobs), []
+    for job in pending:
+        job._finalizer_done.wait(timeout=2.0)
     server.jobs.clear()
     server._pending_eviction.clear()
     with server._registry_lock:

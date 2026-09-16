@@ -1319,6 +1319,43 @@ def test_persist_terminal_outcome_flags_eviction_pending_when_not_yet_inserted()
     assert "not-inserted-id" not in server.jobs
 
 
+def test_persist_terminal_outcome_does_not_resurrect_pruned_record():
+    # list_jobs snapshots `jobs` and processes it outside _registry_lock, so
+    # by the time its loop reaches a given job, that job's own finalizer may
+    # have already persisted its outcome, evicted it, and - if it was the
+    # oldest completed record once no longer "running" - had it pruned by
+    # some unrelated job's finalizer. A second, stale call for that same Job
+    # object must not use fallback_start to reconstruct a record the cap
+    # already forgot on purpose.
+    proc = MagicMock()
+    proc.pid = 4242
+    with patch.object(server.Job, "__post_init__", lambda self: None):
+        job = server.Job(proc=proc, backend="swift", job_id="pruned-id")
+    server.jobs["pruned-id"] = job
+
+    server._record_job_started(
+        "pruned-id", backend="swift", input_path="/tmp/a.wav", num_speakers=1, pid=4242
+    )
+    first = server._persist_terminal_outcome(
+        job, {"status": "done", "output_path": "/tmp/out.md"}
+    )
+    assert first is True
+    assert job._outcome_persisted is True
+    assert "pruned-id" not in server.jobs
+
+    # Simulate some unrelated job's finalizer pruning this now-completed,
+    # no-longer-protected record out of the registry entirely.
+    server._write_registry({})
+    assert "pruned-id" not in server._load_registry()
+
+    second = server._persist_terminal_outcome(
+        job, {"status": "done", "output_path": "/tmp/out.md"}
+    )
+    assert second is True
+    # Must stay pruned - not resurrected via fallback_start.
+    assert "pruned-id" not in server._load_registry()
+
+
 def test_list_jobs_clamps_negative_limit():
     server._record_job_started(
         "some-id", backend="swift", input_path="/tmp/a.wav", num_speakers=1, pid=1
