@@ -65,45 +65,83 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# Every field a well-formed record has - anything missing one of these would
+# raise KeyError the moment _reconcile_registry_on_startup, _prune_registry,
+# list_jobs, etc. index into it.
+_RECORD_FIELDS = {
+    "job_id",
+    "backend",
+    "input_path",
+    "num_speakers",
+    "pid",
+    "status",
+    "output_path",
+    "error",
+    "started_at",
+    "finished_at",
+}
+
+
+def _is_valid_record(key: str, value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and _RECORD_FIELDS.issubset(value)
+        and value.get("job_id") == key
+    )
+
+
 def _load_registry() -> dict[str, dict]:
     try:
         data = json.loads(JOBS_FILE.read_text())
     except (OSError, ValueError):
         return {}
     # Defend against a corrupted/hand-edited file: valid JSON that isn't the
-    # shape we expect (e.g. "[]", "null", or a record that isn't an object)
-    # must not crash callers like _reconcile_registry_on_startup, which runs
-    # at import time - that would take the whole server down.
+    # shape we expect (e.g. "[]", "null", a record that isn't an object, or
+    # one missing fields other code indexes directly) must not crash callers
+    # like _reconcile_registry_on_startup, which runs at import time - that
+    # would take the whole server down.
     if not isinstance(data, dict):
         return {}
-    return {k: v for k, v in data.items() if isinstance(v, dict)}
+    return {k: v for k, v in data.items() if _is_valid_record(k, v)}
 
 
-def _write_registry(registry: dict[str, dict]) -> None:
+def _write_registry(registry: dict[str, dict]) -> bool:
     """Atomically replace the registry file so a crash mid-write can't leave
-    it corrupted. Persistence is best-effort: a failure here is logged, not
-    raised - it must never take down a job or the server."""
+    it corrupted. Persistence is best-effort - a failure here is logged, not
+    raised, since it must never take down a job or the server - but the
+    result is still reported so a caller (_update_job_record) can tell
+    whether the update it just made is actually durable."""
     try:
         JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = JOBS_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(registry, indent=2))
         os.replace(tmp, JOBS_FILE)
+        return True
     except (OSError, TypeError) as e:
         # TypeError: a value in the registry wasn't JSON-serializable - a
         # bug elsewhere, but persistence failing must never take a job or
         # the server down over it.
         logger.warning("failed to persist job registry: %s", e)
+        return False
 
 
-def _prune_registry(registry: dict[str, dict]) -> None:
+def _prune_registry(registry: dict[str, dict], *, protect: str | None = None) -> None:
     """Drop the oldest *completed* entries beyond MAX_PERSISTED_JOBS. Never
     drops a "running" entry - losing track of an in-flight job is exactly
-    the bug this registry exists to fix."""
+    the bug this registry exists to fix - nor `protect`, the record a caller
+    (_update_job_record) just finalized: it may well be the oldest by
+    started_at (it could have been running a long time), and evicting it in
+    the very call that persists it would make that call falsely report the
+    update as durable."""
     overflow = len(registry) - MAX_PERSISTED_JOBS
     if overflow <= 0:
         return
     completed = sorted(
-        (r for r in registry.values() if r["status"] != "running"),
+        (
+            r
+            for r in registry.values()
+            if r["status"] != "running" and r["job_id"] != protect
+        ),
         key=lambda r: r["started_at"],
     )
     for record in completed[:overflow]:
@@ -134,10 +172,10 @@ def _record_job_started(
 def _update_job_record(
     job_id: str, *, status: str, output_path: str | None, error: str | None
 ) -> bool:
-    """Returns True if a record for job_id existed and was updated - i.e.
-    it's now safe to rely on the registry alone for this job, since a
-    caller (Job._finalize_and_persist) uses this to decide whether it can
-    drop its own in-memory handle."""
+    """Returns True only if a record for job_id existed and the update
+    actually reached disk - i.e. it's now safe to rely on the registry alone
+    for this job, since a caller (Job._finalize_and_persist) uses this to
+    decide whether it can drop its own in-memory handle."""
     with _registry_lock:
         registry = _load_registry()
         record = registry.get(job_id)
@@ -147,9 +185,8 @@ def _update_job_record(
         record["output_path"] = output_path
         record["error"] = error
         record["finished_at"] = _now_iso()
-        _prune_registry(registry)
-        _write_registry(registry)
-        return True
+        _prune_registry(registry, protect=job_id)
+        return _write_registry(registry)
 
 
 def _reconcile_registry_on_startup() -> None:
@@ -172,6 +209,11 @@ def _reconcile_registry_on_startup() -> None:
                 record["finished_at"] = _now_iso()
                 changed = True
         if changed:
+            # Every entry converted above just became prunable (no longer
+            # "running"), so a registry that was over-cap only with running
+            # entries - which _prune_registry could never touch until now -
+            # needs a pass here too, not just from the next started/updated job.
+            _prune_registry(registry)
             _write_registry(registry)
 
 
@@ -254,6 +296,11 @@ class Job:
     _exit_seen_at: float | None = field(default=None, init=False)
     _error_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _stall_reported: bool = field(default=False, init=False)
+    # Guards against the finalizer thread (started in __post_init__, i.e.
+    # before this Job has necessarily been inserted into `jobs`) evicting a
+    # key that transcribe() then re-adds afterward - see _finalize_and_persist.
+    _lifecycle_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+    _eviction_pending: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         threading.Thread(target=self._collect_stdout, daemon=True).start()
@@ -293,8 +340,20 @@ class Job:
         # registry actually has it, though - a Job with no registry entry
         # (e.g. one built directly rather than via transcribe()) would
         # otherwise become unreachable by any get_transcript call.
-        if persisted:
-            jobs.pop(self.job_id, None)
+        if not persisted:
+            return
+        with self._lifecycle_lock:
+            # For a job that completes near-instantly, this thread (started
+            # in __post_init__) can reach here before transcribe() has
+            # inserted `self` into `jobs` at all - popping now would be a
+            # silent no-op, and the later insertion would then leave this
+            # already-finished Job (and its stdout/stderr) in `jobs`
+            # permanently, with nothing left to ever evict it again. Flag it
+            # instead so transcribe() can evict it itself once it does insert.
+            if jobs.get(self.job_id) is self:
+                del jobs[self.job_id]
+            else:
+                self._eviction_pending = True
 
     def _record_collector_error(self, message: str) -> None:
         with self._error_lock:
@@ -516,7 +575,16 @@ def transcribe(file_path: str, num_speakers: int) -> dict:
         num_speakers=num_speakers,
         pid=proc.pid,
     )
-    jobs[job_id] = Job(proc=proc, backend=backend_name, job_id=job_id)
+    job = Job(proc=proc, backend=backend_name, job_id=job_id)
+    with job._lifecycle_lock:
+        # The finalizer thread Job.__post_init__ just started may have
+        # already run to completion and found nothing to evict (this key
+        # didn't exist yet) - in which case it left a flag here rather than
+        # silently no-op'ing, since inserting unconditionally below would
+        # otherwise leave an already-finished Job (full stdout/stderr and
+        # all) in `jobs` permanently. See Job._finalize_and_persist.
+        if not job._eviction_pending:
+            jobs[job_id] = job
     logger.info(
         "started job %s (backend=%s, pid=%s, file=%s, num_speakers=%s)",
         job_id,

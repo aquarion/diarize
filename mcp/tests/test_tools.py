@@ -910,12 +910,51 @@ def test_load_registry_returns_empty_on_non_dict_json():
     assert server._load_registry() == {}
 
 
+def _full_record(job_id: str, **overrides) -> dict:
+    record = {
+        "job_id": job_id,
+        "backend": "swift",
+        "input_path": "/tmp/a.wav",
+        "num_speakers": 1,
+        "pid": 1,
+        "status": "done",
+        "output_path": "/tmp/a.md",
+        "error": None,
+        "started_at": "2020-01-01T00:00:00",
+        "finished_at": "2020-01-01T01:00:00",
+    }
+    record.update(overrides)
+    return record
+
+
 def test_load_registry_drops_non_dict_records():
+    good = _full_record("good")
     server.JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    server.JOBS_FILE.write_text(
-        json.dumps({"good": {"job_id": "good", "status": "done"}, "bad": "not a record"})
-    )
-    assert server._load_registry() == {"good": {"job_id": "good", "status": "done"}}
+    server.JOBS_FILE.write_text(json.dumps({"good": good, "bad": "not a record"}))
+    assert server._load_registry() == {"good": good}
+
+
+def test_load_registry_drops_records_missing_required_fields():
+    # A hand-edited or partially corrupted jobs.json could have a record
+    # missing a field that _reconcile_registry_on_startup/_prune_registry
+    # index directly (e.g. "status", "started_at", "job_id") - loading it
+    # unchanged would crash those callers, one of them at import time.
+    good = _full_record("good")
+    incomplete = {"job_id": "incomplete", "status": "running"}
+    server.JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    server.JOBS_FILE.write_text(json.dumps({"good": good, "incomplete": incomplete}))
+    assert server._load_registry() == {"good": good}
+
+
+def test_load_registry_drops_records_with_mismatched_job_id():
+    # _prune_registry deletes by record["job_id"], which must match the
+    # dict key it's stored under, or that delete targets the wrong entry
+    # (or a KeyError if the claimed job_id isn't a key at all).
+    good = _full_record("good")
+    mismatched = _full_record("other-id")
+    server.JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    server.JOBS_FILE.write_text(json.dumps({"good": good, "mismatched-key": mismatched}))
+    assert server._load_registry() == {"good": good}
 
 
 def test_update_job_record_prunes(monkeypatch):
@@ -943,6 +982,95 @@ def test_update_job_record_returns_false_when_no_record_exists():
         )
         is False
     )
+
+
+def test_update_job_record_protects_just_updated_record_from_its_own_prune(
+    monkeypatch,
+):
+    # Without protecting the record being finalized, pruning could remove
+    # the very entry this call just wrote (e.g. because it's the oldest, or
+    # only, completed record) while still reporting success - after which
+    # the finalizer would evict the live Job, and the job becomes truly
+    # unrecoverable: not in `jobs`, not in the registry either.
+    monkeypatch.setattr(server, "MAX_PERSISTED_JOBS", 1)
+    server._record_job_started(
+        "a-id", backend="swift", input_path="/tmp/a.wav", num_speakers=1, pid=1
+    )
+    server._record_job_started(
+        "b-id", backend="swift", input_path="/tmp/b.wav", num_speakers=1, pid=2
+    )
+
+    result = server._update_job_record(
+        "a-id", status="done", output_path="/tmp/a.md", error=None
+    )
+
+    assert result is True
+    assert "a-id" in server._load_registry()
+
+
+def test_update_job_record_returns_false_when_write_fails(monkeypatch):
+    server._record_job_started(
+        "write-fail-id", backend="swift", input_path="/tmp/a.wav", num_speakers=1, pid=1
+    )
+    monkeypatch.setattr(server, "_write_registry", lambda registry: False)
+
+    result = server._update_job_record(
+        "write-fail-id", status="done", output_path="/tmp/a.md", error=None
+    )
+
+    assert result is False
+
+
+def test_reconcile_registry_on_startup_prunes_all_running_over_cap(monkeypatch):
+    # _prune_registry alone can never touch a "running" entry, so a
+    # registry that's over cap purely on running jobs stayed over cap
+    # indefinitely until reconciliation converted them to a prunable
+    # terminal status - reconciliation needs its own prune pass for that,
+    # not just the one in _record_job_started/_update_job_record.
+    monkeypatch.setattr(server, "MAX_PERSISTED_JOBS", 1)
+    server._record_job_started(
+        "old-running-id", backend="swift", input_path="/tmp/a.wav", num_speakers=1, pid=1
+    )
+    server._record_job_started(
+        "new-running-id", backend="swift", input_path="/tmp/b.wav", num_speakers=1, pid=2
+    )
+    assert len(server._load_registry()) == 2
+
+    server._reconcile_registry_on_startup()
+
+    registry = server._load_registry()
+    assert len(registry) == 1
+    assert "new-running-id" in registry
+
+
+def test_transcribe_construction_race_does_not_leak_or_lose_job(tmp_path):
+    # Job.__post_init__ (called during construction, before transcribe() has
+    # necessarily inserted the Job into `jobs`) starts a finalizer thread
+    # that can, for a near-instantly completing job, run to completion
+    # first. Force that ordering deterministically instead of racing it,
+    # and confirm the job is neither leaked into `jobs` forever nor lost
+    # from the registry.
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    transcript = tmp_path / "t.md"
+    mock_proc = _make_proc(f"    local       : {transcript}\n".encode(), b"", 0)
+
+    real_post_init = server.Job.__post_init__
+
+    def _post_init_and_wait_for_finalizer(self):
+        real_post_init(self)
+        deadline = time.monotonic() + 2.0
+        while not self._eviction_pending and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ), patch.object(server.Job, "__post_init__", _post_init_and_wait_for_finalizer):
+        result = server.transcribe(str(audio), 2)
+
+    assert result["job_id"] not in server.jobs
+    record = server._load_registry()[result["job_id"]]
+    assert record["status"] == "done"
 
 
 def test_list_jobs_clamps_negative_limit():
