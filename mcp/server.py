@@ -152,8 +152,8 @@ def _load_registry() -> dict[str, dict]:
     # Defend against a corrupted/hand-edited file: valid JSON that isn't the
     # shape we expect (e.g. "[]", "null", a record that isn't an object, or
     # one missing fields other code indexes directly) must not crash callers
-    # like _reconcile_registry_on_startup, which runs at import time - that
-    # would take the whole server down.
+    # like _reconcile_registry_on_startup, which runs at server startup -
+    # that would prevent the server from starting at all.
     if not isinstance(data, dict):
         return {}
     return {k: v for k, v in data.items() if _is_valid_record(k, v)}
@@ -1046,7 +1046,7 @@ def list_jobs(limit: int = 20) -> dict:
     ones from before a server restart, which get_transcript alone can't see.
 
     Returns {"jobs": [{"job_id", "backend", "input_path", "num_speakers",
-    "status", "output_path", "error", "started_at", "finished_at"}, ...]}.
+    "pid", "status", "output_path", "error", "started_at", "finished_at"}, ...]}.
     A job still tracked live also carries "message" and, once transcription
     reports fine-grained progress, "fraction"/"stage" - see get_transcript.
     """
