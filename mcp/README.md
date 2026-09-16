@@ -20,6 +20,11 @@ when invoking the `python/` backend) resolves/syncs `.venv` from
 that can go stale or point at a Python interpreter that's since moved
 (the original motivation for this over a plain `pip`/venv setup).
 
+Run at most one instance of this server against a given `jobs.json` at a
+time. Its job registry is coordinated with in-process locking only - there's
+no cross-process file locking - so two live instances can race and corrupt
+each other's writes to it.
+
 ## Claude Desktop Configuration
 
 Point `command` at your `uv` binary's **absolute path**, not just `"uv"` —
@@ -97,8 +102,10 @@ Lists recent transcription jobs, most recently started first - including ones
 from before a server restart, which `get_transcript` alone can't surface
 without already knowing their `job_id`.
 
-Returns `{"jobs": [{"job_id", "backend", "input_path", "num_speakers",
-"status", "output_path", "error", "started_at", "finished_at"}, ...]}`. A job
+Returns `{"jobs": [{"job_id", "backend", "input_path", "num_speakers", "pid",
+"status", "output_path", "error", "started_at", "finished_at"}, ...]}`. `pid`
+is the backend process's id, recorded for diagnostic use (e.g. checking
+whether a job the registry still shows as "running" genuinely is). A job
 still running also carries `"message"` and, once available, `"fraction"` /
 `"stage"` - the same fields `get_transcript` reports for it.
 

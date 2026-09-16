@@ -1,6 +1,8 @@
 import io
 import json
+import os
 import subprocess
+import sys
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -946,7 +948,11 @@ def test_get_transcript_reads_done_job_from_registry_when_not_live(tmp_path):
 
 def test_get_transcript_reads_done_job_missing_file_from_registry(tmp_path):
     server._record_job_started(
-        "past-missing-id", backend="swift", input_path="/tmp/a.wav", num_speakers=2, pid=1
+        "past-missing-id",
+        backend="swift",
+        input_path="/tmp/a.wav",
+        num_speakers=2,
+        pid=1,
     )
     server._update_job_record(
         "past-missing-id",
@@ -961,7 +967,11 @@ def test_get_transcript_reads_done_job_missing_file_from_registry(tmp_path):
 
 def test_get_transcript_reads_failed_job_from_registry_when_not_live():
     server._record_job_started(
-        "past-failed-id", backend="swift", input_path="/tmp/a.wav", num_speakers=2, pid=1
+        "past-failed-id",
+        backend="swift",
+        input_path="/tmp/a.wav",
+        num_speakers=2,
+        pid=1,
     )
     server._update_job_record(
         "past-failed-id", status="failed", output_path=None, error="exit code 1"
@@ -995,14 +1005,22 @@ def test_get_transcript_registry_running_but_not_live_reports_interrupted():
     # "interrupted" on startup, but get_transcript must not claim a job with
     # no live handle is still "running" even if that somehow didn't happen.
     server._record_job_started(
-        "stale-running-id", backend="swift", input_path="/tmp/a.wav", num_speakers=2, pid=1
+        "stale-running-id",
+        backend="swift",
+        input_path="/tmp/a.wav",
+        num_speakers=2,
+        pid=1,
     )
 
     result = server.get_transcript("stale-running-id")
     assert result["status"] == "interrupted"
 
 
-def test_reconcile_registry_on_startup_marks_running_as_interrupted():
+def test_reconcile_registry_on_startup_marks_running_as_interrupted(monkeypatch):
+    # pid liveness is exercised separately below - here it's forced dead so
+    # this test is about the status/error/finished_at transition itself,
+    # not tied to a real (and possibly coincidentally-live) pid.
+    monkeypatch.setattr(server, "_pid_is_alive", lambda pid: False)
     server._record_job_started(
         "reconcile-id", backend="swift", input_path="/tmp/a.wav", num_speakers=2, pid=1
     )
@@ -1015,9 +1033,39 @@ def test_reconcile_registry_on_startup_marks_running_as_interrupted():
     assert record["finished_at"] is not None
 
 
+def test_reconcile_registry_on_startup_leaves_live_pid_running(monkeypatch):
+    # A "running" record whose pid is still alive most likely belongs to a
+    # different, still-live server process (accidentally started alongside
+    # this one) - not one this reconciliation pass has any business
+    # overwriting to "interrupted".
+    monkeypatch.setattr(server, "_pid_is_alive", lambda pid: True)
+    server._record_job_started(
+        "still-live-id", backend="swift", input_path="/tmp/a.wav", num_speakers=2, pid=1
+    )
+
+    server._reconcile_registry_on_startup()
+
+    record = server._load_registry()["still-live-id"]
+    assert record["status"] == "running"
+
+
+def test_pid_is_alive_true_for_current_process():
+    assert server._pid_is_alive(os.getpid()) is True
+
+
+def test_pid_is_alive_false_for_exited_process():
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    assert server._pid_is_alive(proc.pid) is False
+
+
 def test_reconcile_registry_on_startup_leaves_terminal_statuses_alone():
     server._record_job_started(
-        "already-done-id", backend="swift", input_path="/tmp/a.wav", num_speakers=2, pid=1
+        "already-done-id",
+        backend="swift",
+        input_path="/tmp/a.wav",
+        num_speakers=2,
+        pid=1,
     )
     server._update_job_record(
         "already-done-id", status="done", output_path="/tmp/out.md", error=None
@@ -1089,7 +1137,9 @@ def test_load_registry_drops_records_with_mismatched_job_id():
     good = _full_record("good")
     mismatched = _full_record("other-id")
     server.JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    server.JOBS_FILE.write_text(json.dumps({"good": good, "mismatched-key": mismatched}))
+    server.JOBS_FILE.write_text(
+        json.dumps({"good": good, "mismatched-key": mismatched})
+    )
     assert server._load_registry() == {"good": good}
 
 
@@ -1178,12 +1228,16 @@ def test_update_job_record_prunes(monkeypatch):
     server._record_job_started(
         "old-id", backend="swift", input_path="/tmp/a.wav", num_speakers=1, pid=1
     )
-    server._update_job_record("old-id", status="done", output_path="/tmp/a.md", error=None)
+    server._update_job_record(
+        "old-id", status="done", output_path="/tmp/a.md", error=None
+    )
     server._record_job_started(
         "new-id", backend="swift", input_path="/tmp/b.wav", num_speakers=1, pid=2
     )
 
-    server._update_job_record("new-id", status="done", output_path="/tmp/b.md", error=None)
+    server._update_job_record(
+        "new-id", status="done", output_path="/tmp/b.md", error=None
+    )
 
     assert set(server._load_registry()) == {"new-id"}
 
@@ -1251,7 +1305,7 @@ def test_update_job_record_reconstructs_record_preserves_started_at():
     assert record["started_at"] == "2020-01-01T00:00:00+00:00"
 
 
-def test_update_job_record_reconstructs_record_falls_back_to_now_when_started_at_empty():
+def test_update_job_record_reconstructs_falls_back_to_now_when_started_at_empty():
     # A Job constructed without a real started_at (its "" default - e.g. one
     # built directly by a test, or hypothetically some future code path
     # that skips transcribe()) must not propagate that empty string into a
@@ -1358,7 +1412,9 @@ def test_transcribe_still_tracks_job_live_when_all_registry_writes_fail(tmp_path
     unblock.set()
 
 
-def test_transcribe_does_not_hold_registry_lock_during_retry_sleep(tmp_path, monkeypatch):
+def test_transcribe_does_not_hold_registry_lock_during_retry_sleep(
+    tmp_path, monkeypatch
+):
     # A registry write failure for one job must not stall every other job's
     # registry access for the whole retry budget - see _record_job_started
     # and transcribe(). Force a slow retry delay and confirm another thread
@@ -1482,12 +1538,21 @@ def test_reconcile_registry_on_startup_prunes_all_running_over_cap(monkeypatch):
     # indefinitely until reconciliation converted them to a prunable
     # terminal status - reconciliation needs its own prune pass for that,
     # not just the one in _record_job_started/_update_job_record.
+    monkeypatch.setattr(server, "_pid_is_alive", lambda pid: False)
     monkeypatch.setattr(server, "MAX_PERSISTED_JOBS", 1)
     server._record_job_started(
-        "old-running-id", backend="swift", input_path="/tmp/a.wav", num_speakers=1, pid=1
+        "old-running-id",
+        backend="swift",
+        input_path="/tmp/a.wav",
+        num_speakers=1,
+        pid=1,
     )
     server._record_job_started(
-        "new-running-id", backend="swift", input_path="/tmp/b.wav", num_speakers=1, pid=2
+        "new-running-id",
+        backend="swift",
+        input_path="/tmp/b.wav",
+        num_speakers=1,
+        pid=2,
     )
     assert len(server._load_registry()) == 2
 
@@ -1498,7 +1563,7 @@ def test_reconcile_registry_on_startup_prunes_all_running_over_cap(monkeypatch):
     assert "new-running-id" in registry
 
 
-def test_reconcile_registry_on_startup_prunes_over_cap_terminal_records_even_when_nothing_changed(
+def test_reconcile_registry_on_startup_prunes_over_cap_terminal_when_unchanged(
     monkeypatch,
 ):
     # A registry already over MAX_PERSISTED_JOBS with only terminal records
@@ -1699,7 +1764,11 @@ def test_prune_registry_drops_oldest_completed_first(monkeypatch):
     monkeypatch.setattr(server, "MAX_PERSISTED_JOBS", 2)
     registry = {
         "old": {"job_id": "old", "status": "done", "started_at": "2020-01-01T00:00:00"},
-        "mid": {"job_id": "mid", "status": "failed", "started_at": "2020-06-01T00:00:00"},
+        "mid": {
+            "job_id": "mid",
+            "status": "failed",
+            "started_at": "2020-06-01T00:00:00",
+        },
         "new": {"job_id": "new", "status": "done", "started_at": "2021-01-01T00:00:00"},
         "still-running": {
             "job_id": "still-running",
@@ -1725,7 +1794,9 @@ def test_prune_registry_protects_pending_eviction_entries(monkeypatch):
     server._record_job_started(
         "a-id", backend="swift", input_path="/tmp/a.wav", num_speakers=1, pid=1
     )
-    server._update_job_record("a-id", status="done", output_path="/tmp/a.md", error=None)
+    server._update_job_record(
+        "a-id", status="done", output_path="/tmp/a.md", error=None
+    )
     server._pending_eviction.add("a-id")
     try:
         server._record_job_started(
@@ -1744,7 +1815,11 @@ def test_prune_registry_protects_pending_eviction_entries(monkeypatch):
 
 def test_list_jobs_merges_registry_and_live_state(tmp_path):
     server._record_job_started(
-        "old-done-id", backend="python", input_path="/tmp/old.wav", num_speakers=1, pid=1
+        "old-done-id",
+        backend="python",
+        input_path="/tmp/old.wav",
+        num_speakers=1,
+        pid=1,
     )
     server._update_job_record(
         "old-done-id", status="done", output_path="/tmp/old.md", error=None

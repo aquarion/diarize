@@ -129,7 +129,18 @@ def _is_valid_record(key: str, value: object) -> bool:
 def _load_registry() -> dict[str, dict]:
     try:
         data = json.loads(JOBS_FILE.read_text())
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        # Expected and silent: no job has ever started yet.
+        return {}
+    except (OSError, ValueError) as e:
+        # A genuinely corrupted file or a transient I/O error (permissions,
+        # a disk/NFS hiccup) - as opposed to FileNotFoundError, which just
+        # means no job has started yet. Still degrades to an empty registry
+        # (a caller crashing here, e.g. _reconcile_registry_on_startup at
+        # import time, would take the whole server down) but logs loudly
+        # rather than silently, unlike before, so a real problem - and the
+        # records a subsequent write could overwrite - is at least visible.
+        logger.error("failed to read job registry at %s: %s", JOBS_FILE, e)
         return {}
     # Defend against a corrupted/hand-edited file: valid JSON that isn't the
     # shape we expect (e.g. "[]", "null", a record that isn't an object, or
@@ -291,17 +302,55 @@ def _update_job_record(
         return _write_registry(registry)
 
 
+def _pid_is_alive(pid: int) -> bool:
+    """Best-effort liveness check, used only so _reconcile_registry_on_startup
+    doesn't clobber a job that's genuinely still running under a *different*,
+    still-live server process - this module supports exactly one live server
+    instance managing a given jobs.json at a time; this is a defense against
+    misreconciling if a second one is ever accidentally started, not general
+    cross-process coordination (there's no cross-process locking around the
+    registry file itself). Treats any check failure as "alive": the safer
+    direction is leaving a possibly-dead job's record at "running" a little
+    longer, not wrongly overwriting a live one's outcome."""
+    if _HAS_PROCESS_GROUP_KILL:
+        # POSIX: signal 0 is a well-defined no-op existence check - it never
+        # actually signals the process. Windows has no equivalent (its
+        # os.kill maps straight to TerminateProcess, so sig=0 there would
+        # not be a safe no-op check), hence the separate tasklist branch.
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True
+        return True
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return str(pid) in result.stdout
+    except Exception:
+        return True
+
+
 def _reconcile_registry_on_startup() -> None:
     """A job recorded as "running" from a previous server process cannot
     actually still be tracked as running - that process's handle to the
     subprocess (and its stdout/stderr pipes) is gone. Mark these
     "interrupted" rather than leaving them to look perpetually in-progress,
-    so a caller knows to check for output on disk or just re-run."""
+    so a caller knows to check for output on disk or just re-run - unless
+    its pid is still alive, meaning some *other* live server process (this
+    one starting up alongside it, most likely by mistake) is probably still
+    actually tracking it; leave those alone rather than misreconciling them
+    out from under that other process."""
     with _registry_lock:
         registry = _load_registry()
         changed = False
         for record in registry.values():
-            if record["status"] == "running":
+            if record["status"] == "running" and not _pid_is_alive(record["pid"]):
                 record["status"] = "interrupted"
                 record["error"] = (
                     "the MCP server restarted while this job was running; "
@@ -322,9 +371,6 @@ def _reconcile_registry_on_startup() -> None:
         _prune_registry(registry)
         if changed or len(registry) != before:
             _write_registry(registry)
-
-
-_reconcile_registry_on_startup()
 
 
 class BackendUnavailableError(Exception):
@@ -428,7 +474,9 @@ class Job:
     # its own background thread), only by tests that need to know a
     # monkeypatched failure function is safe to revert without a retry
     # attempt still in flight landing on the real implementation afterward.
-    _finalizer_done: threading.Event = field(default_factory=threading.Event, init=False)
+    _finalizer_done: threading.Event = field(
+        default_factory=threading.Event, init=False
+    )
 
     def __post_init__(self) -> None:
         threading.Thread(target=self._collect_stdout, daemon=True).start()
@@ -455,7 +503,9 @@ class Job:
                 # waiting on _stdout_done specifically would busy-spin for
                 # however long stderr outlives stdout.
                 pending = (
-                    self._stderr_done if self._stdout_done.is_set() else self._stdout_done
+                    self._stderr_done
+                    if self._stdout_done.is_set()
+                    else self._stdout_done
                 )
                 pending.wait(timeout=0.5)
             outcome = _resolve_job_outcome(self)
@@ -478,6 +528,16 @@ class Job:
                 self.job_id,
                 outcome["status"],
                 _PERSIST_RETRY_ATTEMPTS,
+            )
+        except Exception:
+            # Matches the collector threads' own except Exception pattern:
+            # an unhandled exception here would otherwise hit Python's
+            # default thread excepthook (stderr, not mcp.log) and silently
+            # kill this thread, leaving the job stuck "running" until a
+            # lucky poll resolves it live or a restart wrongly marks it
+            # "interrupted" over its real outcome.
+            logger.exception(
+                "job %s: finalizer thread failed unexpectedly", self.job_id
             )
         finally:
             self._finalizer_done.set()
@@ -757,7 +817,16 @@ def transcribe(file_path: str, num_speakers: int) -> dict:
         # registry record, and the finalizer will still persist a full
         # record via fallback_start once the job completes (see
         # _persist_terminal_outcome) - this job just can't survive a
-        # restart before then.
+        # restart before then. Logged at error, matching the finalizer's own
+        # exhausted-retries logging: a restart before completion would lose
+        # this job entirely (report "unknown" rather than "interrupted").
+        logger.error(
+            "job %s: failed to persist initial 'running' record after %d "
+            "attempts; the job is still tracked live, but a server restart "
+            "before it completes will lose it entirely",
+            job_id,
+            _PERSIST_RETRY_ATTEMPTS,
+        )
         _track_job(job)
     logger.info(
         "started job %s (backend=%s, pid=%s, file=%s, num_speakers=%s)",
@@ -1022,7 +1091,9 @@ def list_jobs(limit: int = 20) -> dict:
             outcome = _resolve_job_outcome(job)
             _persist_terminal_outcome(job, outcome)
             record["status"] = outcome["status"]
-            record["output_path"] = outcome.get("output_path", record.get("output_path"))
+            record["output_path"] = outcome.get(
+                "output_path", record.get("output_path")
+            )
             record["error"] = outcome.get("error", record.get("error"))
             record["finished_at"] = record.get("finished_at") or _now_iso()
         registry[job_id] = record
@@ -1110,4 +1181,8 @@ def set_config(key: str, value: str) -> dict:
 
 
 if __name__ == "__main__":
+    # Deliberately not run at import time: importing this module (e.g. for
+    # tests, or any tooling) must not itself reconcile - and possibly
+    # rewrite - a real, on-disk jobs.json as a side effect.
+    _reconcile_registry_on_startup()
     mcp.run()
