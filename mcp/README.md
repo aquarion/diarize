@@ -1,6 +1,6 @@
 # Diarize MCP Server
 
-MCP server that exposes `transcribe`, `get_transcript`, `get_config`, and `set_config` tools to Claude Desktop.
+MCP server that exposes `transcribe`, `get_transcript`, `list_jobs`, `get_config`, and `set_config` tools to Claude Desktop.
 
 ## Setup
 
@@ -19,6 +19,11 @@ when invoking the `python/` backend) resolves/syncs `.venv` from
 `pyproject.toml` + `uv.lock` on every launch — no separately-managed venv
 that can go stale or point at a Python interpreter that's since moved
 (the original motivation for this over a plain `pip`/venv setup).
+
+Run at most one instance of this server against a given `jobs.json` at a
+time. Its job registry is coordinated with in-process locking only - there's
+no cross-process file locking - so two live instances can race and corrupt
+each other's writes to it.
 
 ## Claude Desktop Configuration
 
@@ -66,7 +71,10 @@ Returns `{"job_id": "<uuid>", "backend": "swift"|"python"}` or `{"error": "..."}
 
 ### `get_transcript(job_id)`
 
-Polls the job started by `transcribe`.
+Polls the job started by `transcribe`. Job state is persisted to a small
+on-disk registry (`jobs.json` next to the log file) as soon as it's known, so
+a job started before an MCP server restart is still recognized afterward -
+`job_id` isn't forgotten just because the process that started it is gone.
 
 Returns one of:
 - `{"status": "running"}` — still processing. May also include `"message"`
@@ -74,6 +82,36 @@ Returns one of:
   reports fine-grained progress, `"fraction"` (0-1) and `"stage"`.
 - `{"status": "done", "transcript": "<markdown>", "output_path": "<path>"}` — finished
 - `{"status": "failed", "error": "<message>"}` — something went wrong
+- `{"status": "interrupted", "error": "<message>"}` — the MCP server
+  restarted while this job was running, so its actual outcome is unknown;
+  check the configured output location, or re-run
+- `{"status": "unknown", "error": "no such job_id"}` — this `job_id` was
+  never seen, *or* it's old enough to have been pruned from the registry.
+  The registry is capped at 200 entries total, but a still-running job is
+  never pruned - only the oldest *completed* entries are, once the cap is
+  exceeded, so with many jobs running at once fewer than 200 completed
+  ones may be retained (and the file can briefly exceed 200 entries while
+  they're all running). Distinct from `"failed"`: not evidence of an
+  error. But unlike a job that was truly never seen, a pruned one may have
+  completed and written real output - check the configured output
+  location before re-running.
+
+### `list_jobs(limit=20)`
+
+Lists recent transcription jobs, most recently started first - including ones
+from before a server restart, which `get_transcript` alone can't surface
+without already knowing their `job_id`.
+
+Returns `{"jobs": [{"job_id", "backend", "input_path", "num_speakers", "pid",
+"status", "output_path", "error", "started_at", "finished_at"}, ...]}`. `pid`
+is the backend process's id, recorded for diagnostic use only (e.g. manually
+checking whether a process is still around) - not evidence either way about
+whether this server is still tracking the job: it converts every persisted
+`"running"` record to `"interrupted"` on restart unconditionally, since a
+backend child can outlive a crashed/restarted server and a live pid doesn't
+prove anything is still watching it. A job still running also carries
+`"message"` and, once available, `"fraction"` / `"stage"` - the same fields
+`get_transcript` reports for it.
 
 ### `get_config(key)`
 
