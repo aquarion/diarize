@@ -54,7 +54,14 @@ if not logger.handlers:
 # after the process that ran it is gone.
 
 JOBS_FILE = LOG_DIR / "jobs.json"
-_registry_lock = threading.Lock()
+# Reentrant: transcribe() holds this across both writing a job's initial
+# registry record and inserting its live handle into `jobs` (see below), so
+# that a job's finalizer thread - which also takes this lock, from a
+# different thread, while handling a job that finishes fast enough to race
+# its own construction - can still acquire it (blocking briefly) rather than
+# deadlocking against the same thread already holding it further up the
+# call stack.
+_registry_lock = threading.RLock()
 
 # Keep the on-disk registry bounded so it can't grow forever over a long
 # server lifetime.
@@ -365,6 +372,12 @@ class Job:
     # key that transcribe() then re-adds afterward - see _finalize_and_persist.
     _lifecycle_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _eviction_pending: bool = field(default=False, init=False)
+    # Set once _finalize_and_persist has made its last attempt (successful
+    # or not) - not used by production code (which never needs to wait for
+    # its own background thread), only by tests that need to know a
+    # monkeypatched failure function is safe to revert without a retry
+    # attempt still in flight landing on the real implementation afterward.
+    _finalizer_done: threading.Event = field(default_factory=threading.Event, init=False)
 
     def __post_init__(self) -> None:
         threading.Thread(target=self._collect_stdout, daemon=True).start()
@@ -377,38 +390,46 @@ class Job:
         threading.Thread(target=self._finalize_and_persist, daemon=True).start()
 
     def _finalize_and_persist(self) -> None:
-        # Mirrors get_transcript's own is_complete()/stalled() check rather
-        # than just waiting on the done Events: a stalled job (collectors
-        # stuck, process already exited) never sets those Events, and
-        # without this loop this thread would block forever, leaving the
-        # registry stuck at "running" instead of picking up the "failed"
-        # outcome stalled() detection makes available via collector_error.
-        while not self.is_complete() and not self.stalled():
-            # Wait on whichever collector hasn't finished yet - waiting on
-            # an already-set Event returns immediately, so always waiting on
-            # _stdout_done specifically would busy-spin for however long
-            # stderr outlives stdout.
-            pending = self._stderr_done if self._stdout_done.is_set() else self._stdout_done
-            pending.wait(timeout=0.5)
-        outcome = _resolve_job_outcome(self)
-        for attempt in range(_PERSIST_RETRY_ATTEMPTS):
-            if _persist_terminal_outcome(self, outcome):
-                return
-            if attempt < _PERSIST_RETRY_ATTEMPTS - 1:
-                time.sleep(_PERSIST_RETRY_DELAY)
-        # A transient failure (disk full, permissions) never got a chance to
-        # heal within the retry budget - the live handle is deliberately
-        # kept (not evicted) so get_transcript/list_jobs can still resolve
-        # this job correctly from it; only surviving an actual server
-        # restart before some future write succeeds is lost.
-        logger.error(
-            "job %s: failed to persist final outcome (%s) after %d attempts; "
-            "the live handle is being kept so it can still be resolved, but "
-            "this outcome will be lost if the server restarts first",
-            self.job_id,
-            outcome["status"],
-            _PERSIST_RETRY_ATTEMPTS,
-        )
+        try:
+            # Mirrors get_transcript's own is_complete()/stalled() check
+            # rather than just waiting on the done Events: a stalled job
+            # (collectors stuck, process already exited) never sets those
+            # Events, and without this loop this thread would block
+            # forever, leaving the registry stuck at "running" instead of
+            # picking up the "failed" outcome stalled() detection makes
+            # available via collector_error.
+            while not self.is_complete() and not self.stalled():
+                # Wait on whichever collector hasn't finished yet - waiting
+                # on an already-set Event returns immediately, so always
+                # waiting on _stdout_done specifically would busy-spin for
+                # however long stderr outlives stdout.
+                pending = (
+                    self._stderr_done if self._stdout_done.is_set() else self._stdout_done
+                )
+                pending.wait(timeout=0.5)
+            outcome = _resolve_job_outcome(self)
+            for attempt in range(_PERSIST_RETRY_ATTEMPTS):
+                if _persist_terminal_outcome(self, outcome):
+                    return
+                if attempt < _PERSIST_RETRY_ATTEMPTS - 1:
+                    time.sleep(_PERSIST_RETRY_DELAY)
+            # A transient failure (disk full, permissions) never got a
+            # chance to heal within the retry budget - the live handle is
+            # deliberately kept (not evicted) so get_transcript/list_jobs
+            # can still resolve this job correctly from it; only surviving
+            # an actual server restart before some future write succeeds
+            # is lost.
+            logger.error(
+                "job %s: failed to persist final outcome (%s) after %d "
+                "attempts; the live handle is being kept so it can still "
+                "be resolved, but this outcome will be lost if the server "
+                "restarts first",
+                self.job_id,
+                outcome["status"],
+                _PERSIST_RETRY_ATTEMPTS,
+            )
+        finally:
+            self._finalizer_done.set()
 
     def _record_collector_error(self, message: str) -> None:
         with self._error_lock:
@@ -620,32 +641,41 @@ def transcribe(file_path: str, num_speakers: int) -> dict:
                 e,
             )
     job_id = str(uuid.uuid4())
-    # Record before constructing Job: Job.__post_init__ spawns the finalizer
-    # thread immediately, which would find no record to update if the job
-    # somehow finished and that thread ran before this record existed.
-    _record_job_started(
-        job_id,
-        backend=backend_name,
-        input_path=str(p),
-        num_speakers=num_speakers,
-        pid=proc.pid,
-    )
-    job = Job(
-        proc=proc,
-        backend=backend_name,
-        job_id=job_id,
-        input_path=str(p),
-        num_speakers=num_speakers,
-    )
-    with job._lifecycle_lock:
-        # The finalizer thread Job.__post_init__ just started may have
-        # already run to completion and found nothing to evict (this key
-        # didn't exist yet) - in which case it left a flag here rather than
-        # silently no-op'ing, since inserting unconditionally below would
-        # otherwise leave an already-finished Job (full stdout/stderr and
-        # all) in `jobs` permanently. See Job._finalize_and_persist.
-        if not job._eviction_pending:
-            jobs[job_id] = job
+    # Both steps happen under _registry_lock (reentrant - see its
+    # definition) as one atomic unit: otherwise a concurrent list_jobs()
+    # call could load the registry right after _record_job_started writes
+    # this job as "running" but before it's inserted into `jobs` below,
+    # and - having no live handle to show for it - misclassify it as
+    # orphaned/interrupted even though it's about to be tracked normally.
+    with _registry_lock:
+        # Record before constructing Job: Job.__post_init__ spawns the
+        # finalizer thread immediately, which would find no record to
+        # update if the job somehow finished and that thread ran before
+        # this record existed.
+        _record_job_started(
+            job_id,
+            backend=backend_name,
+            input_path=str(p),
+            num_speakers=num_speakers,
+            pid=proc.pid,
+        )
+        job = Job(
+            proc=proc,
+            backend=backend_name,
+            job_id=job_id,
+            input_path=str(p),
+            num_speakers=num_speakers,
+        )
+        with job._lifecycle_lock:
+            # The finalizer thread Job.__post_init__ just started may have
+            # already run to completion and found nothing to evict (this
+            # key didn't exist yet) - in which case it left a flag here
+            # rather than silently no-op'ing, since inserting
+            # unconditionally below would otherwise leave an
+            # already-finished Job (full stdout/stderr and all) in `jobs`
+            # permanently. See Job._finalize_and_persist.
+            if not job._eviction_pending:
+                jobs[job_id] = job
     logger.info(
         "started job %s (backend=%s, pid=%s, file=%s, num_speakers=%s)",
         job_id,
@@ -844,11 +874,17 @@ def list_jobs(limit: int = 20) -> dict:
     A job still tracked live also carries "message" and, once transcription
     reports fine-grained progress, "fraction"/"stage" - see get_transcript.
     """
-    registry = _load_registry()
-    # Snapshot via list(): transcribe() can insert into `jobs` from another
-    # thread mid-request, and iterating the live dict directly can raise
-    # "dictionary changed size during iteration".
-    jobs_snapshot = list(jobs.items())
+    # Both read together under _registry_lock: transcribe() writes a job's
+    # registry record and inserts it into `jobs` as one atomic unit under
+    # the same lock (see transcribe()), so reading them separately here
+    # could otherwise catch a job in between - registered but not yet
+    # live - and the orphaned-running fail-safe below would then
+    # misclassify it as interrupted rather than about to be tracked.
+    # list() also avoids "dictionary changed size during iteration" against
+    # a concurrent transcribe() insertion.
+    with _registry_lock:
+        registry = _load_registry()
+        jobs_snapshot = list(jobs.items())
     live_ids = {job_id for job_id, _ in jobs_snapshot}
     for job_id, job in jobs_snapshot:
         record = dict(
@@ -857,8 +893,8 @@ def list_jobs(limit: int = 20) -> dict:
                 {
                     "job_id": job_id,
                     "backend": job.backend,
-                    "input_path": None,
-                    "num_speakers": None,
+                    "input_path": job.input_path,
+                    "num_speakers": job.num_speakers,
                     "pid": job.proc.pid,
                     "status": "running",
                     "output_path": None,

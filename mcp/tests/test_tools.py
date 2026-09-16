@@ -847,10 +847,9 @@ def test_finalizer_keeps_live_handle_after_exhausting_retries(tmp_path, monkeypa
         result = server.transcribe(str(audio), 2)
 
     job_id = result["job_id"]
-    _wait(server.jobs[job_id])
-    # Give the (tiny, since _PERSIST_RETRY_DELAY is 0.01s) retry loop time
-    # to exhaust its attempts and give up.
-    time.sleep(0.5)
+    job = server.jobs[job_id]
+    _wait(job)
+    job._finalizer_done.wait(timeout=2.0)
     # A registry that can never be written must not lose the job: keeping
     # the live handle (rather than evicting on a false promise) means
     # get_transcript can still resolve it correctly from memory.
@@ -874,7 +873,12 @@ def test_get_transcript_persists_immediately_on_live_completion(tmp_path):
         result = server.transcribe(str(audio), 2)
 
     job_id = result["job_id"]
-    _wait(server.jobs[job_id])
+    # The finalizer can race ahead of this line and (since persistence here
+    # is real, unlike the exhausted-retries test above) already evict the
+    # job once it completes - in which case there's nothing left to wait on.
+    live_job = server.jobs.get(job_id)
+    if live_job is not None:
+        _wait(live_job)
 
     server.get_transcript(job_id)
 
@@ -906,6 +910,12 @@ def test_list_jobs_persists_immediately_on_live_completion(tmp_path, monkeypatch
     job = server.Job(proc=proc, backend="swift", job_id="list-persist-id")
     server.jobs["list-persist-id"] = job
     _wait(job)
+    # Let the finalizer's own retry loop fully exhaust and give up before
+    # capturing the baseline call count below - otherwise a still-in-flight
+    # retry could land on the *real* _update_job_record right after this
+    # test returns and monkeypatch reverts, writing to whatever jobs.json
+    # exists by the time a later test runs.
+    job._finalizer_done.wait(timeout=2.0)
 
     calls_before = call_count["n"]
     server.list_jobs()
@@ -1190,7 +1200,15 @@ def test_persist_terminal_outcome_reconstructs_missing_record(tmp_path):
         input_path="/tmp/a.wav",
         num_speakers=3,
     )
-    server.jobs["never-recorded-id"] = job
+    # Mirror transcribe()'s own lifecycle-lock-aware insertion: the
+    # finalizer thread (started by the Job() constructor above) can
+    # complete and flag _eviction_pending before this line, since
+    # persistence here is real (that's what this test is verifying) rather
+    # than mocked to always fail. An unconditional insert would then
+    # silently defeat that eviction.
+    with job._lifecycle_lock:
+        if not job._eviction_pending:
+            server.jobs["never-recorded-id"] = job
 
     record = _wait_for_terminal_record("never-recorded-id")
     assert record["status"] == "done"
@@ -1259,34 +1277,46 @@ def test_reconcile_registry_on_startup_prunes_all_running_over_cap(monkeypatch):
     assert "new-running-id" in registry
 
 
-def test_transcribe_construction_race_does_not_leak_or_lose_job(tmp_path):
-    # Job.__post_init__ (called during construction, before transcribe() has
-    # necessarily inserted the Job into `jobs`) starts a finalizer thread
-    # that can, for a near-instantly completing job, run to completion
-    # first. Force that ordering deterministically instead of racing it,
-    # and confirm the job is neither leaked into `jobs` forever nor lost
-    # from the registry.
-    audio = tmp_path / "audio.wav"
-    audio.touch()
-    transcript = tmp_path / "t.md"
-    mock_proc = _make_proc(f"    local       : {transcript}\n".encode(), b"", 0)
+def test_persist_terminal_outcome_flags_eviction_pending_when_not_yet_inserted():
+    # transcribe() now holds _registry_lock (reentrant) across writing a
+    # job's initial record and inserting it into `jobs` as one atomic unit,
+    # which structurally prevents a finalizer from completing
+    # _persist_terminal_outcome (whose first step also needs that lock)
+    # before insertion - so this can no longer be forced end-to-end through
+    # transcribe() itself. Exercise the underlying mechanism directly
+    # instead: a Job not yet present in `jobs` at all (as if some future
+    # caller inserted after resolving its outcome, or another code path)
+    # must be flagged rather than silently ignored, so whoever inserts it
+    # later can still honor that flag - see transcribe()'s own check.
+    proc = MagicMock()
+    proc.pid = 4242
+    with patch.object(server.Job, "__post_init__", lambda self: None):
+        job = server.Job(proc=proc, backend="swift", job_id="not-inserted-id")
 
-    real_post_init = server.Job.__post_init__
+    server._record_job_started(
+        "not-inserted-id",
+        backend="swift",
+        input_path="/tmp/a.wav",
+        num_speakers=1,
+        pid=4242,
+    )
 
-    def _post_init_and_wait_for_finalizer(self):
-        real_post_init(self)
-        deadline = time.monotonic() + 2.0
-        while not self._eviction_pending and time.monotonic() < deadline:
-            time.sleep(0.01)
+    persisted = server._persist_terminal_outcome(
+        job, {"status": "done", "output_path": "/tmp/out.md"}
+    )
 
-    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
-        "subprocess.Popen", return_value=mock_proc
-    ), patch.object(server.Job, "__post_init__", _post_init_and_wait_for_finalizer):
-        result = server.transcribe(str(audio), 2)
-
-    assert result["job_id"] not in server.jobs
-    record = server._load_registry()[result["job_id"]]
+    assert persisted is True
+    assert job._eviction_pending is True
+    assert "not-inserted-id" not in server.jobs
+    record = server._load_registry()["not-inserted-id"]
     assert record["status"] == "done"
+
+    # And the flag is honored by an insertion that checks it afterward,
+    # mirroring transcribe()'s own lifecycle-lock-aware insert.
+    with job._lifecycle_lock:
+        if not job._eviction_pending:
+            server.jobs["not-inserted-id"] = job
+    assert "not-inserted-id" not in server.jobs
 
 
 def test_list_jobs_clamps_negative_limit():
@@ -1362,6 +1392,12 @@ def test_list_jobs_sets_finished_at_for_completed_live_job_not_yet_finalized(
     job = server.Job(proc=proc, backend="swift", job_id="finished-at-id")
     server.jobs["finished-at-id"] = job
     _wait(job)
+    # Let the finalizer's own retry loop (against the mocked, always-failing
+    # _update_job_record) fully exhaust and give up before this test
+    # returns - otherwise a still-in-flight retry could land on the *real*
+    # _update_job_record right after monkeypatch reverts, writing to
+    # whatever jobs.json exists by the time a later test runs.
+    job._finalizer_done.wait(timeout=2.0)
 
     result = server.list_jobs()
     by_id = {entry["job_id"]: entry for entry in result["jobs"]}
@@ -1479,6 +1515,12 @@ def test_list_jobs_recomputes_outcome_for_completed_job_not_yet_finalized(
     job = server.Job(proc=proc, backend="swift", job_id="fresh-done-id")
     server.jobs["fresh-done-id"] = job
     _wait(job)
+    # Let the finalizer's own retry loop (against the mocked, always-failing
+    # _update_job_record) fully exhaust and give up before this test
+    # returns - otherwise a still-in-flight retry could land on the *real*
+    # _update_job_record right after monkeypatch reverts, writing to
+    # whatever jobs.json exists by the time a later test runs.
+    job._finalizer_done.wait(timeout=2.0)
 
     result = server.list_jobs()
     by_id = {entry["job_id"]: entry for entry in result["jobs"]}
