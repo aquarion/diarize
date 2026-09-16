@@ -94,6 +94,11 @@ def _is_valid_record(key: str, value: object) -> bool:
         isinstance(value, dict)
         and _RECORD_FIELDS.issubset(value)
         and value.get("job_id") == key
+        # isinstance check first: `x in a_set` hashes x, and a list/dict
+        # value for "status" would raise TypeError rather than just fail
+        # the membership test - defeating the whole point of validating
+        # before this reaches _reconcile_registry_on_startup at import time.
+        and isinstance(value.get("status"), str)
         and value.get("status") in _VALID_STATUSES
         and isinstance(value.get("backend"), str)
         and isinstance(value.get("input_path"), str)
@@ -149,14 +154,23 @@ def _write_registry(registry: dict[str, dict]) -> bool:
         return False
 
 
+# job_ids currently between "just persisted a terminal outcome" and "live
+# handle evicted" (see _persist_terminal_outcome) - always accessed under
+# _registry_lock. A *different* job's _update_job_record call in that window
+# must not prune one of these: its own `protect` argument only shields
+# itself, and once its write lands and returns True, the caller commits to
+# evicting the live Job on the strength of that promise. Without also
+# excluding this set, another finalizer completing at the same moment could
+# prune the first job's now-unprotected record before it gets a chance to
+# act on that promise, leaving the job in neither `jobs` nor the registry.
+_pending_eviction: set[str] = set()
+
+
 def _prune_registry(registry: dict[str, dict], *, protect: str | None = None) -> None:
     """Drop the oldest *completed* entries beyond MAX_PERSISTED_JOBS. Never
     drops a "running" entry - losing track of an in-flight job is exactly
-    the bug this registry exists to fix - nor `protect`, the record a caller
-    (_update_job_record) just finalized: it may well be the oldest by
-    started_at (it could have been running a long time), and evicting it in
-    the very call that persists it would make that call falsely report the
-    update as durable."""
+    the bug this registry exists to fix - nor `protect` nor anything in
+    _pending_eviction (see above)."""
     overflow = len(registry) - MAX_PERSISTED_JOBS
     if overflow <= 0:
         return
@@ -164,7 +178,9 @@ def _prune_registry(registry: dict[str, dict], *, protect: str | None = None) ->
         (
             r
             for r in registry.values()
-            if r["status"] != "running" and r["job_id"] != protect
+            if r["status"] != "running"
+            and r["job_id"] != protect
+            and r["job_id"] not in _pending_eviction
         ),
         key=lambda r: r["started_at"],
     )
@@ -194,17 +210,36 @@ def _record_job_started(
 
 
 def _update_job_record(
-    job_id: str, *, status: str, output_path: str | None, error: str | None
+    job_id: str,
+    *,
+    status: str,
+    output_path: str | None,
+    error: str | None,
+    fallback_start: dict | None = None,
 ) -> bool:
-    """Returns True only if a record for job_id existed and the update
+    """Returns True only if a record for job_id exists and the update
     actually reached disk - i.e. it's now safe to rely on the registry alone
     for this job, since a caller (Job._finalize_and_persist) uses this to
-    decide whether it can drop its own in-memory handle."""
+    decide whether it can drop its own in-memory handle.
+
+    If no record exists yet - e.g. _record_job_started's own initial write
+    failed - and `fallback_start` (backend/input_path/num_speakers/pid) is
+    given, one is created here instead of giving up, so a transient failure
+    on that first write doesn't strand the terminal outcome forever no
+    matter how many times the caller retries: every retry would otherwise
+    keep finding nothing to update."""
     with _registry_lock:
         registry = _load_registry()
         record = registry.get(job_id)
         if record is None:
-            return False  # e.g. registry file was lost/wiped after the job started
+            if fallback_start is None:
+                return False
+            record = {
+                **fallback_start,
+                "job_id": job_id,
+                "started_at": _now_iso(),
+            }
+            registry[job_id] = record
         record["status"] = status
         record["output_path"] = output_path
         record["error"] = error
@@ -309,6 +344,11 @@ class Job:
     proc: subprocess.Popen
     backend: str
     job_id: str = ""
+    # Carried only so the finalizer can reconstruct a registry record via
+    # _update_job_record's fallback_start if _record_job_started's own
+    # initial write failed - not otherwise used by this class.
+    input_path: str = ""
+    num_speakers: int = 0
     stdout: str = field(default="", init=False)
     stderr: str = field(default="", init=False)
     last_message: str = field(default="", init=False)
@@ -590,7 +630,13 @@ def transcribe(file_path: str, num_speakers: int) -> dict:
         num_speakers=num_speakers,
         pid=proc.pid,
     )
-    job = Job(proc=proc, backend=backend_name, job_id=job_id)
+    job = Job(
+        proc=proc,
+        backend=backend_name,
+        job_id=job_id,
+        input_path=str(p),
+        num_speakers=num_speakers,
+    )
     with job._lifecycle_lock:
         # The finalizer thread Job.__post_init__ just started may have
         # already run to completion and found nothing to evict (this key
@@ -662,26 +708,47 @@ def _persist_terminal_outcome(job: Job, outcome: dict) -> bool:
     whichever notices first closes the window where a server restart could
     otherwise reconcile an already-finished job to "interrupted" before the
     finalizer's own next check got around to persisting it."""
-    persisted = _update_job_record(
-        job.job_id,
-        status=outcome["status"],
-        output_path=outcome.get("output_path"),
-        error=outcome.get("error"),
-    )
-    if not persisted:
-        return False
-    with job._lifecycle_lock:
-        # For a job that completes near-instantly, this can run before
-        # transcribe() has inserted `job` into `jobs` at all - popping now
-        # would be a silent no-op, and the later insertion would then leave
-        # this already-finished Job (and its stdout/stderr) in `jobs`
-        # permanently, with nothing left to ever evict it again. Flag it
-        # instead so transcribe() can evict it itself once it does insert.
-        if jobs.get(job.job_id) is job:
-            del jobs[job.job_id]
-        else:
-            job._eviction_pending = True
-    return True
+    # Held from just before the write through eviction (not just during the
+    # write itself) so a *different* job's _prune_registry call in that
+    # window can't remove this job's just-written record before this
+    # function gets to act on the promise that record's existence made -
+    # see _pending_eviction and _prune_registry.
+    with _registry_lock:
+        _pending_eviction.add(job.job_id)
+    try:
+        persisted = _update_job_record(
+            job.job_id,
+            status=outcome["status"],
+            output_path=outcome.get("output_path"),
+            error=outcome.get("error"),
+            fallback_start={
+                "backend": job.backend,
+                "input_path": job.input_path,
+                "num_speakers": job.num_speakers,
+                "pid": job.proc.pid,
+                "output_path": None,
+                "error": None,
+                "finished_at": None,
+            },
+        )
+        if not persisted:
+            return False
+        with job._lifecycle_lock:
+            # For a job that completes near-instantly, this can run before
+            # transcribe() has inserted `job` into `jobs` at all - popping
+            # now would be a silent no-op, and the later insertion would
+            # then leave this already-finished Job (and its stdout/stderr)
+            # in `jobs` permanently, with nothing left to ever evict it
+            # again. Flag it instead so transcribe() can evict it itself
+            # once it does insert.
+            if jobs.get(job.job_id) is job:
+                del jobs[job.job_id]
+            else:
+                job._eviction_pending = True
+        return True
+    finally:
+        with _registry_lock:
+            _pending_eviction.discard(job.job_id)
 
 
 @mcp.tool()
@@ -740,6 +807,18 @@ def _read_transcript_result(path: str, job_id: str) -> dict:
     return {"status": "done", "transcript": transcript_text, "output_path": path}
 
 
+# A registry entry can say "running" with no live Job behind it - normally
+# _reconcile_registry_on_startup converts these to "interrupted" before the
+# server starts serving requests, but that conversion is itself a
+# best-effort write that can fail (see _reconcile_registry_on_startup). Both
+# get_transcript and list_jobs fail safe here rather than claim a job with
+# no live handle is still running.
+_ORPHANED_RUNNING_ERROR = (
+    "job is no longer being tracked; check the configured output location, "
+    "or re-run the transcription"
+)
+
+
 def _get_transcript_from_registry(job_id: str) -> dict:
     """get_transcript's fallback for a job_id no longer (or never) tracked
     live - e.g. because the server restarted since it was started. Consults
@@ -751,14 +830,7 @@ def _get_transcript_from_registry(job_id: str) -> dict:
     if record["status"] == "done":
         return _read_transcript_result(record["output_path"], job_id)
     if record["status"] == "running":
-        # Shouldn't normally happen - _reconcile_registry_on_startup converts
-        # these to "interrupted" before the server starts serving requests -
-        # but fail safe rather than claim a job with no live handle is running.
-        return {
-            "status": "interrupted",
-            "error": "job is no longer being tracked; check the configured "
-            "output location, or re-run the transcription",
-        }
+        return {"status": "interrupted", "error": _ORPHANED_RUNNING_ERROR}
     return {"status": record["status"], "error": record.get("error") or "unknown error"}
 
 
@@ -776,7 +848,9 @@ def list_jobs(limit: int = 20) -> dict:
     # Snapshot via list(): transcribe() can insert into `jobs` from another
     # thread mid-request, and iterating the live dict directly can raise
     # "dictionary changed size during iteration".
-    for job_id, job in list(jobs.items()):
+    jobs_snapshot = list(jobs.items())
+    live_ids = {job_id for job_id, _ in jobs_snapshot}
+    for job_id, job in jobs_snapshot:
         record = dict(
             registry.get(
                 job_id,
@@ -816,6 +890,15 @@ def list_jobs(limit: int = 20) -> dict:
             record["error"] = outcome.get("error", record.get("error"))
             record["finished_at"] = record.get("finished_at") or _now_iso()
         registry[job_id] = record
+    for job_id, record in registry.items():
+        # Same fail-safe as _get_transcript_from_registry: a registry-only
+        # entry (no live handle backing it, e.g. this server is post-restart
+        # and reconciliation's own write failed) must not be shown as
+        # "running" - see _ORPHANED_RUNNING_ERROR.
+        if job_id not in live_ids and record["status"] == "running":
+            record["status"] = "interrupted"
+            record["error"] = _ORPHANED_RUNNING_ERROR
+            record["finished_at"] = record.get("finished_at") or _now_iso()
     entries = sorted(
         registry.values(), key=lambda r: r.get("started_at") or "", reverse=True
     )

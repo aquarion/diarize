@@ -14,9 +14,11 @@ def clear_jobs():
     # it, and an unsynchronized unlink here could be clobbered by that late
     # write, leaking a stray record into the next test.
     server.jobs.clear()
+    server._pending_eviction.clear()
     with server._registry_lock:
         server.JOBS_FILE.unlink(missing_ok=True)
     yield
     server.jobs.clear()
+    server._pending_eviction.clear()
     with server._registry_lock:
         server.JOBS_FILE.unlink(missing_ok=True)

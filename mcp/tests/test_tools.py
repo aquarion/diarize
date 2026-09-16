@@ -1078,6 +1078,18 @@ def test_load_registry_drops_records_with_mismatched_job_id():
     assert server._load_registry() == {"good": good}
 
 
+def test_load_registry_drops_records_with_unhashable_status_without_crashing():
+    # A list/dict value for "status" would make `x in _VALID_STATUSES` raise
+    # TypeError (set membership hashes the operand) rather than just fail
+    # validation - which would crash _reconcile_registry_on_startup at
+    # import time, exactly what this validation exists to prevent.
+    good = _full_record("good")
+    bad = _full_record("bad", status=["running"])
+    server.JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    server.JOBS_FILE.write_text(json.dumps({"good": good, "bad": bad}))
+    assert server._load_registry() == {"good": good}
+
+
 def test_load_registry_drops_records_with_unknown_status():
     good = _full_record("good")
     bogus = _full_record("bogus", status="not-a-real-status")
@@ -1133,6 +1145,59 @@ def test_update_job_record_returns_false_when_no_record_exists():
         )
         is False
     )
+
+
+def test_update_job_record_reconstructs_record_via_fallback_start():
+    # If _record_job_started's own initial write failed (e.g. a transient
+    # disk error), there's no record for a later retry to find no matter
+    # how many times it tries - fallback_start lets it create one instead
+    # of giving up, so the terminal outcome isn't stranded.
+    result = server._update_job_record(
+        "reconstructed-id",
+        status="done",
+        output_path="/tmp/x.md",
+        error=None,
+        fallback_start={
+            "backend": "swift",
+            "input_path": "/tmp/a.wav",
+            "num_speakers": 2,
+            "pid": 4242,
+        },
+    )
+
+    assert result is True
+    record = server._load_registry()["reconstructed-id"]
+    assert record["status"] == "done"
+    assert record["output_path"] == "/tmp/x.md"
+    assert record["backend"] == "swift"
+    assert record["input_path"] == "/tmp/a.wav"
+    assert record["num_speakers"] == 2
+    assert record["pid"] == 4242
+    assert record["started_at"] is not None
+
+
+def test_persist_terminal_outcome_reconstructs_missing_record(tmp_path):
+    # End-to-end: a Job whose registry record never existed (simulating the
+    # initial write having failed) must still be persisted and evicted when
+    # its outcome is resolved, via Job.input_path/num_speakers.
+    transcript = tmp_path / "t.md"
+    mock_proc = _make_proc(f"    local       : {transcript}\n".encode(), b"", 0)
+    mock_proc.pid = 4242
+    job = server.Job(
+        proc=mock_proc,
+        backend="swift",
+        job_id="never-recorded-id",
+        input_path="/tmp/a.wav",
+        num_speakers=3,
+    )
+    server.jobs["never-recorded-id"] = job
+
+    record = _wait_for_terminal_record("never-recorded-id")
+    assert record["status"] == "done"
+    assert record["backend"] == "swift"
+    assert record["input_path"] == "/tmp/a.wav"
+    assert record["num_speakers"] == 3
+    assert "never-recorded-id" not in server.jobs
 
 
 def test_update_job_record_protects_just_updated_record_from_its_own_prune(
@@ -1321,6 +1386,35 @@ def test_prune_registry_drops_oldest_completed_first(monkeypatch):
     assert set(registry) == {"new", "still-running"}
 
 
+def test_prune_registry_protects_pending_eviction_entries(monkeypatch):
+    # A cross-finalizer race: finalizer A's own _update_job_record call only
+    # protects A's own record from ITS pruning pass (via `protect`), not
+    # from a separately-running finalizer B's later pruning pass. Without
+    # also excluding _pending_eviction, B's prune could remove A's
+    # just-written record before A gets to act on the promise that record's
+    # existence made (evicting A's live handle) - leaving A in neither
+    # `jobs` nor the registry.
+    monkeypatch.setattr(server, "MAX_PERSISTED_JOBS", 1)
+    server._record_job_started(
+        "a-id", backend="swift", input_path="/tmp/a.wav", num_speakers=1, pid=1
+    )
+    server._update_job_record("a-id", status="done", output_path="/tmp/a.md", error=None)
+    server._pending_eviction.add("a-id")
+    try:
+        server._record_job_started(
+            "b-id", backend="swift", input_path="/tmp/b.wav", num_speakers=1, pid=2
+        )
+        server._update_job_record(
+            "b-id", status="done", output_path="/tmp/b.md", error=None
+        )
+
+        registry = server._load_registry()
+        assert "a-id" in registry
+        assert "b-id" in registry
+    finally:
+        server._pending_eviction.discard("a-id")
+
+
 def test_list_jobs_merges_registry_and_live_state(tmp_path):
     server._record_job_started(
         "old-done-id", backend="python", input_path="/tmp/old.wav", num_speakers=1, pid=1
@@ -1390,6 +1484,25 @@ def test_list_jobs_recomputes_outcome_for_completed_job_not_yet_finalized(
     by_id = {entry["job_id"]: entry for entry in result["jobs"]}
     assert by_id["fresh-done-id"]["status"] == "done"
     assert by_id["fresh-done-id"]["output_path"] == str(transcript)
+
+
+def test_list_jobs_reports_orphaned_running_registry_entry_as_interrupted():
+    # Same fail-safe as get_transcript: a registry-only entry with no live
+    # handle (e.g. a startup reconciliation write that itself failed) must
+    # not be shown as still "running".
+    server._record_job_started(
+        "orphaned-running-id",
+        backend="swift",
+        input_path="/tmp/a.wav",
+        num_speakers=1,
+        pid=1,
+    )
+
+    result = server.list_jobs()
+
+    by_id = {entry["job_id"]: entry for entry in result["jobs"]}
+    assert by_id["orphaned-running-id"]["status"] == "interrupted"
+    assert by_id["orphaned-running-id"]["error"] == server._ORPHANED_RUNNING_ERROR
 
 
 def test_list_jobs_respects_limit():
