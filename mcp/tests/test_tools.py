@@ -798,31 +798,36 @@ def test_finalizer_retries_persistence_after_transient_write_failure(
     monkeypatch.setattr(server, "_PERSIST_RETRY_ATTEMPTS", 3)
     monkeypatch.setattr(server, "_PERSIST_RETRY_DELAY", 0.01)
 
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    transcript = tmp_path / "t.md"
+    transcript.write_text("hello")
+    mock_proc, unblock = _make_blocking_proc(
+        stdout=f"    local       : {transcript}\n".encode()
+    )
+
     real_write_registry = server._write_registry
     call_count = {"n": 0}
 
     def _flaky_write(registry):
         call_count["n"] += 1
-        # Call 1 is _record_job_started's initial write (must succeed, or
-        # there's no record at all for a later update to find regardless of
-        # retries) - call 2 is the finalizer's first attempt, made to fail
-        # once here to simulate a transient error before it recovers.
-        if call_count["n"] == 2:
+        # Fails the first call this mock sees, to simulate a transient
+        # error before the finalizer's retry recovers. The collectors stay
+        # blocked (so the finalizer can't possibly race ahead) until this
+        # mock is installed *after* transcribe() has already returned -
+        # i.e. after its own _record_job_started write has already
+        # succeeded for real - so that first call is deterministically the
+        # finalizer's, not a race between the two.
+        if call_count["n"] == 1:
             return False
         return real_write_registry(registry)
-
-    monkeypatch.setattr(server, "_write_registry", _flaky_write)
-
-    audio = tmp_path / "audio.wav"
-    audio.touch()
-    transcript = tmp_path / "t.md"
-    transcript.write_text("hello")
-    mock_proc = _make_proc(f"    local       : {transcript}\n".encode(), b"", 0)
 
     with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
         "subprocess.Popen", return_value=mock_proc
     ):
         result = server.transcribe(str(audio), 2)
+        monkeypatch.setattr(server, "_write_registry", _flaky_write)
+        unblock.set()
 
     record = _wait_for_terminal_record(result["job_id"], timeout=2.0)
     assert record["status"] == "done"
@@ -1130,6 +1135,41 @@ def test_load_registry_drops_records_with_wrong_field_types():
     assert server._load_registry() == {"good": good}
 
 
+def test_record_job_started_does_not_clobber_already_terminal_record():
+    # transcribe() now constructs the Job (and starts its finalizer thread)
+    # before this is even attempted, so for a near-instantly completing job
+    # the finalizer can persist a terminal outcome first. job_id is a fresh
+    # uuid used for the first time by this exact job, so a terminal record
+    # already existing for it can only mean that - overwriting it back to
+    # "running" here would clobber an already-correct outcome.
+    server._update_job_record(
+        "already-done-id",
+        status="done",
+        output_path="/tmp/x.md",
+        error=None,
+        fallback_start={
+            "backend": "swift",
+            "input_path": "/tmp/a.wav",
+            "num_speakers": 1,
+            "pid": 4242,
+            "started_at": "2020-01-01T00:00:00+00:00",
+        },
+    )
+
+    result = server._record_job_started(
+        "already-done-id",
+        backend="swift",
+        input_path="/tmp/a.wav",
+        num_speakers=1,
+        pid=4242,
+    )
+
+    assert result is True
+    record = server._load_registry()["already-done-id"]
+    assert record["status"] == "done"
+    assert record["output_path"] == "/tmp/x.md"
+
+
 def test_update_job_record_prunes(monkeypatch):
     # Pruning previously only happened in _record_job_started, so the
     # registry could stay over MAX_PERSISTED_JOBS indefinitely once no new
@@ -1237,16 +1277,23 @@ def test_update_job_record_reconstructs_record_falls_back_to_now_when_started_at
     assert record["started_at"]
 
 
-def _make_blocking_proc(pid: int = 4242) -> tuple[MagicMock, threading.Event]:
+def _make_blocking_proc(
+    pid: int = 4242, stdout: bytes = b""
+) -> tuple[MagicMock, threading.Event]:
     """A mock subprocess whose stdout/stderr collectors block until
-    unblocked, so a test can inspect state before the finalizer races
-    ahead and persists/evicts the job."""
+    unblocked, so a test can inspect state before the finalizer races ahead
+    and persists/evicts the job. Once unblocked, the stdout collector
+    yields `stdout`'s lines and the job resolves as done/failed exactly as
+    _make_proc's would - so a test can deterministically trigger completion
+    after setting up state that must exist first (e.g. patching in a flaky
+    _write_registry only once transcribe()'s own initial write has already
+    succeeded for real)."""
     unblock = threading.Event()
 
     class _BlockingStdout:
         def __iter__(self):
             unblock.wait()
-            return iter([])
+            return iter(io.BytesIO(stdout).readlines())
 
         def close(self):
             pass
@@ -1254,7 +1301,7 @@ def _make_blocking_proc(pid: int = 4242) -> tuple[MagicMock, threading.Event]:
     proc = MagicMock()
     proc.stdout = _BlockingStdout()
     proc.stderr = io.BytesIO(b"")
-    proc.returncode = None
+    proc.returncode = 0
     proc.poll.return_value = None
     proc.pid = pid
     return proc, unblock
@@ -1274,18 +1321,21 @@ def test_transcribe_retries_registry_write_and_succeeds(tmp_path):
             return False
         return real_write_registry(registry)
 
+    # Assert everything while the collectors are still blocked and the
+    # patch is still in place, then unblock only at the very end: once
+    # unblocked, the finalizer will call the patched _write_registry too
+    # (it's the same job), and if that races ahead of these assertions it
+    # can turn a 2-call count into 3, or persist/evict the job before the
+    # "still running" checks below run.
     with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
         "subprocess.Popen", return_value=mock_proc
     ), patch.object(server, "_write_registry", flaky_write):
-        try:
-            result = server.transcribe(str(audio), 2)
-        finally:
-            unblock.set()
-
-    assert len(calls) == 2
-    assert result["job_id"] in server.jobs
-    record = server._load_registry()[result["job_id"]]
-    assert record["status"] == "running"
+        result = server.transcribe(str(audio), 2)
+        assert len(calls) == 2
+        assert result["job_id"] in server.jobs
+        record = server._load_registry()[result["job_id"]]
+        assert record["status"] == "running"
+    unblock.set()
 
 
 def test_transcribe_still_tracks_job_live_when_all_registry_writes_fail(tmp_path):
@@ -1293,16 +1343,19 @@ def test_transcribe_still_tracks_job_live_when_all_registry_writes_fail(tmp_path
     audio.touch()
     mock_proc, unblock = _make_blocking_proc()
 
+    # Same ordering as above: assert before unblocking. Once unblocked, the
+    # finalizer's own call to the still-patched (always failing)
+    # _write_registry would keep the record absent either way here, but
+    # unblocking first and reverting the patch on `with` exit could let a
+    # racing finalizer thread persist via the *real* _write_registry before
+    # these assertions run, flipping both of them.
     with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
         "subprocess.Popen", return_value=mock_proc
     ), patch.object(server, "_write_registry", lambda registry: False):
-        try:
-            result = server.transcribe(str(audio), 2)
-        finally:
-            unblock.set()
-
-    assert result["job_id"] in server.jobs
-    assert result["job_id"] not in server._load_registry()
+        result = server.transcribe(str(audio), 2)
+        assert result["job_id"] in server.jobs
+        assert result["job_id"] not in server._load_registry()
+    unblock.set()
 
 
 def test_transcribe_does_not_hold_registry_lock_during_retry_sleep(tmp_path, monkeypatch):
@@ -1338,19 +1391,20 @@ def test_transcribe_does_not_hold_registry_lock_during_retry_sleep(tmp_path, mon
             acquired.set()
             server._registry_lock.release()
 
+    # Assert while still patched/blocked, same reasoning as the other two
+    # transcribe() retry tests above - unblocking before checking len(calls)
+    # would let the finalizer's own call to the still-patched flaky_write
+    # add a third entry before the assertion runs.
     with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
         "subprocess.Popen", return_value=mock_proc
     ), patch.object(server, "_write_registry", flaky_write):
         checker = threading.Thread(target=try_acquire_during_sleep, daemon=True)
         checker.start()
-        try:
-            server.transcribe(str(audio), 2)
-        finally:
-            unblock.set()
+        server.transcribe(str(audio), 2)
         checker.join(timeout=3.0)
-
-    assert len(calls) == 2
-    assert acquired.is_set()
+        assert len(calls) == 2
+        assert acquired.is_set()
+    unblock.set()
 
 
 def test_persist_terminal_outcome_reconstructs_missing_record(tmp_path):
@@ -1442,6 +1496,39 @@ def test_reconcile_registry_on_startup_prunes_all_running_over_cap(monkeypatch):
     registry = server._load_registry()
     assert len(registry) == 1
     assert "new-running-id" in registry
+
+
+def test_reconcile_registry_on_startup_prunes_over_cap_terminal_records_even_when_nothing_changed(
+    monkeypatch,
+):
+    # A registry already over MAX_PERSISTED_JOBS with only terminal records
+    # (nothing to convert from "running", e.g. left behind by the benign
+    # transient overshoot _update_job_record's own protect/_pending_eviction
+    # can allow) used to skip pruning here entirely, since the write was
+    # gated on `changed` - leaving it over cap indefinitely across a
+    # restart instead of just until the next job event.
+    monkeypatch.setattr(server, "MAX_PERSISTED_JOBS", 1)
+    server._record_job_started(
+        "old-done-id", backend="swift", input_path="/tmp/a.wav", num_speakers=1, pid=1
+    )
+    server._update_job_record(
+        "old-done-id", status="done", output_path="/tmp/a.md", error=None
+    )
+    monkeypatch.setattr(server, "MAX_PERSISTED_JOBS", 2)
+    server._record_job_started(
+        "new-done-id", backend="swift", input_path="/tmp/b.wav", num_speakers=1, pid=2
+    )
+    server._update_job_record(
+        "new-done-id", status="done", output_path="/tmp/b.md", error=None
+    )
+    monkeypatch.setattr(server, "MAX_PERSISTED_JOBS", 1)
+    assert len(server._load_registry()) == 2
+
+    server._reconcile_registry_on_startup()
+
+    registry = server._load_registry()
+    assert len(registry) == 1
+    assert "new-done-id" in registry
 
 
 def test_persist_terminal_outcome_flags_eviction_pending_when_not_yet_inserted():

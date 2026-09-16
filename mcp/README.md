@@ -81,11 +81,15 @@ Returns one of:
   restarted while this job was running, so its actual outcome is unknown;
   check the configured output location, or re-run
 - `{"status": "unknown", "error": "no such job_id"}` — this `job_id` was
-  never seen, *or* it's old enough to have been pruned from the registry
-  (capped at the 200 most recent completed jobs). Distinct from `"failed"`:
-  not evidence of an error. But unlike a job that was truly never seen, a
-  pruned one may have completed and written real output - check the
-  configured output location before re-running.
+  never seen, *or* it's old enough to have been pruned from the registry.
+  The registry is capped at 200 entries total, but a still-running job is
+  never pruned - only the oldest *completed* entries are, once the cap is
+  exceeded, so with many jobs running at once fewer than 200 completed
+  ones may be retained (and the file can briefly exceed 200 entries while
+  they're all running). Distinct from `"failed"`: not evidence of an
+  error. But unlike a job that was truly never seen, a pruned one may have
+  completed and written real output - check the configured output
+  location before re-running.
 
 ### `list_jobs(limit=20)`
 

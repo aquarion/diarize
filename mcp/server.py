@@ -215,6 +215,18 @@ def _record_job_started(
     list_jobs, other finalizers) for the whole retry budget."""
     with _registry_lock:
         registry = _load_registry()
+        existing = registry.get(job_id)
+        if existing is not None and existing["status"] != "running":
+            # job_id is a freshly minted uuid used for the first time by
+            # this call's own job, so a terminal record already existing
+            # for it can only mean that job's own finalizer thread (started
+            # the moment transcribe() constructed it, before this retry
+            # loop ever got a chance to run) raced ahead and persisted its
+            # outcome already - e.g. a near-instantly completing job.
+            # Report success without touching it: writing "running" here
+            # would clobber an already-correct terminal record right back
+            # to looking in-progress.
+            return True
         registry[job_id] = {
             "job_id": job_id,
             "backend": backend,
@@ -298,12 +310,17 @@ def _reconcile_registry_on_startup() -> None:
                 )
                 record["finished_at"] = _now_iso()
                 changed = True
-        if changed:
-            # Every entry converted above just became prunable (no longer
-            # "running"), so a registry that was over-cap only with running
-            # entries - which _prune_registry could never touch until now -
-            # needs a pass here too, not just from the next started/updated job.
-            _prune_registry(registry)
+        # Always attempt a prune pass, not just when something above
+        # changed: a registry that's already over MAX_PERSISTED_JOBS with
+        # only terminal records (e.g. left behind by a burst of concurrent
+        # finalizers - see _pending_eviction) would otherwise stay over cap
+        # across a restart indefinitely, since nothing else prunes it until
+        # the next job starts or finishes. Only a pruned-away entry or an
+        # interrupted-conversion above needs a write, though - not every
+        # startup should touch disk.
+        before = len(registry)
+        _prune_registry(registry)
+        if changed or len(registry) != before:
             _write_registry(registry)
 
 
@@ -597,33 +614,16 @@ class Job:
         return True
 
 
-def _construct_and_track_job(
-    *,
-    proc: subprocess.Popen,
-    backend_name: str,
-    job_id: str,
-    input_path: str,
-    num_speakers: int,
-    started_at: str,
-) -> Job:
-    """Builds this job's live handle and inserts it into `jobs`, unless its
-    finalizer thread (started by Job.__post_init__, immediately below) has
-    already run to completion and found nothing to evict - in which case it
-    left a flag here for us to honor instead, so an already-finished Job
-    (full stdout/stderr and all) doesn't get added back permanently. See
+def _track_job(job: Job) -> None:
+    """Inserts job into `jobs`, unless its finalizer thread (started by
+    Job.__post_init__, as soon as the Job was constructed) has already run
+    to completion and found nothing to evict - in which case it left a flag
+    here for us to honor instead, so an already-finished Job (full
+    stdout/stderr and all) doesn't get added back permanently. See
     Job._finalize_and_persist."""
-    job = Job(
-        proc=proc,
-        backend=backend_name,
-        job_id=job_id,
-        input_path=input_path,
-        num_speakers=num_speakers,
-        started_at=started_at,
-    )
     with job._lifecycle_lock:
         if not job._eviction_pending:
-            jobs[job_id] = job
-    return job
+            jobs[job.job_id] = job
 
 
 def _reap_caffeinate(watcher: subprocess.Popen, pid: int) -> None:
@@ -708,7 +708,21 @@ def transcribe(file_path: str, num_speakers: int) -> dict:
     # so a later fallback reconstruction (see _update_job_record) reports
     # this job's real start time rather than whenever it happened to finish.
     started_at = _now_iso()
-    job: Job | None = None
+    # Constructed immediately - before attempting the registry write below -
+    # so its stdout/stderr collector threads start draining the backend's
+    # pipes right away. If construction instead waited on a registry-write
+    # retry loop (as an earlier version of this function did), a backend
+    # that emits enough output during that multi-second retry window could
+    # block writing to its own undrained, now-full stdout/stderr pipe.
+    job = Job(
+        proc=proc,
+        backend=backend_name,
+        job_id=job_id,
+        input_path=str(p),
+        num_speakers=num_speakers,
+        started_at=started_at,
+    )
+    tracked = False
     for attempt in range(_PERSIST_RETRY_ATTEMPTS):
         # The write and the `jobs` insertion happen under _registry_lock
         # (reentrant - see its definition) as one atomic unit only on the
@@ -731,33 +745,20 @@ def transcribe(file_path: str, num_speakers: int) -> dict:
                 pid=proc.pid,
                 started_at=started_at,
             ):
-                job = _construct_and_track_job(
-                    proc=proc,
-                    backend_name=backend_name,
-                    job_id=job_id,
-                    input_path=str(p),
-                    num_speakers=num_speakers,
-                    started_at=started_at,
-                )
+                _track_job(job)
+                tracked = True
                 break
         if attempt < _PERSIST_RETRY_ATTEMPTS - 1:
             time.sleep(_PERSIST_RETRY_DELAY)
-    if job is None:
-        # Every attempt failed - the subprocess above is already running
-        # regardless, so it must still be tracked live even with no durable
-        # "running" record. list_jobs's synthetic fallback covers a live
-        # job with no registry record, and the finalizer will still persist
-        # a full record via fallback_start once the job completes (see
+    if not tracked:
+        # Every attempt failed - the job is already running regardless, so
+        # it must still be tracked live even with no durable "running"
+        # record. list_jobs's synthetic fallback covers a live job with no
+        # registry record, and the finalizer will still persist a full
+        # record via fallback_start once the job completes (see
         # _persist_terminal_outcome) - this job just can't survive a
         # restart before then.
-        job = _construct_and_track_job(
-            proc=proc,
-            backend_name=backend_name,
-            job_id=job_id,
-            input_path=str(p),
-            num_speakers=num_speakers,
-            started_at=started_at,
-        )
+        _track_job(job)
     logger.info(
         "started job %s (backend=%s, pid=%s, file=%s, num_speakers=%s)",
         job_id,
@@ -820,22 +821,21 @@ def _persist_terminal_outcome(job: Job, outcome: dict) -> bool:
     whichever notices first closes the window where a server restart could
     otherwise reconcile an already-finished job to "interrupted" before the
     finalizer's own next check got around to persisting it."""
-    # Held from just before the write through eviction (not just during the
-    # write itself) so a *different* job's _prune_registry call in that
-    # window can't remove this job's just-written record before this
-    # function gets to act on the promise that record's existence made -
-    # see _pending_eviction and _prune_registry.
-    with job._lifecycle_lock:
-        # A prior call for this exact job (almost always its own finalizer
-        # thread, but get_transcript/list_jobs can reach here too - see
-        # this function's docstring) may have already durably persisted
-        # this outcome. E.g. list_jobs takes a snapshot, then before its
-        # loop reaches this job, the job finishes, gets fully persisted and
-        # evicted by its own finalizer, and its now-completed record gets
-        # pruned by some unrelated job's finalizer (it's simply the oldest
-        # completed one once no longer "running"). Were we to proceed here,
-        # _update_job_record's fallback_start would reconstruct a fresh
-        # record for a job the 200-entry cap already forgot on purpose.
+    # The whole check-then-persist-then-evict sequence runs under one
+    # unbroken _registry_lock hold (reentrant, so _update_job_record's own
+    # internal `with _registry_lock:` nests harmlessly) rather than
+    # re-acquiring the lock between steps. Two truly concurrent callers for
+    # the same job - almost always its own finalizer thread racing
+    # get_transcript/list_jobs - would otherwise both read _outcome_persisted
+    # as False before either finishes, and the second could still resurrect
+    # an already-pruned record via fallback_start after the first caller's
+    # full persist+evict+prune cycle completed in between the check and the
+    # write. Nesting job._lifecycle_lock *inside* this (never the reverse)
+    # matches the only other place that takes both locks (transcribe() via
+    # _track_job), avoiding a lock-ordering deadlock.
+    with _registry_lock:
+        # A prior call for this exact job may have already durably
+        # persisted this outcome - see this function's docstring.
         # _outcome_persisted (set only after a previous call's write
         # actually succeeded) is the signal for that - unlike checking
         # `jobs.get(job.job_id) is not job`, it can't be confused with the
@@ -843,43 +843,41 @@ def _persist_terminal_outcome(job: Job, outcome: dict) -> bool:
         # simply hasn't been inserted into `jobs` yet.
         if job._outcome_persisted:
             return True
-    with _registry_lock:
         _pending_eviction.add(job.job_id)
-    try:
-        persisted = _update_job_record(
-            job.job_id,
-            status=outcome["status"],
-            output_path=outcome.get("output_path"),
-            error=outcome.get("error"),
-            fallback_start={
-                "backend": job.backend,
-                "input_path": job.input_path,
-                "num_speakers": job.num_speakers,
-                "pid": job.proc.pid,
-                "started_at": job.started_at,
-                "output_path": None,
-                "error": None,
-                "finished_at": None,
-            },
-        )
-        if not persisted:
-            return False
-        with job._lifecycle_lock:
+        try:
+            persisted = _update_job_record(
+                job.job_id,
+                status=outcome["status"],
+                output_path=outcome.get("output_path"),
+                error=outcome.get("error"),
+                fallback_start={
+                    "backend": job.backend,
+                    "input_path": job.input_path,
+                    "num_speakers": job.num_speakers,
+                    "pid": job.proc.pid,
+                    "started_at": job.started_at,
+                    "output_path": None,
+                    "error": None,
+                    "finished_at": None,
+                },
+            )
+            if not persisted:
+                return False
             job._outcome_persisted = True
-            # For a job that completes near-instantly, this can run before
-            # transcribe() has inserted `job` into `jobs` at all - popping
-            # now would be a silent no-op, and the later insertion would
-            # then leave this already-finished Job (and its stdout/stderr)
-            # in `jobs` permanently, with nothing left to ever evict it
-            # again. Flag it instead so transcribe() can evict it itself
-            # once it does insert.
-            if jobs.get(job.job_id) is job:
-                del jobs[job.job_id]
-            else:
-                job._eviction_pending = True
-        return True
-    finally:
-        with _registry_lock:
+            with job._lifecycle_lock:
+                # For a job that completes near-instantly, this can run
+                # before transcribe() has inserted `job` into `jobs` at all
+                # - popping now would be a silent no-op, and the later
+                # insertion would then leave this already-finished Job (and
+                # its stdout/stderr) in `jobs` permanently, with nothing
+                # left to ever evict it again. Flag it instead so
+                # transcribe() can evict it itself once it does insert.
+                if jobs.get(job.job_id) is job:
+                    del jobs[job.job_id]
+                else:
+                    job._eviction_pending = True
+            return True
+        finally:
             _pending_eviction.discard(job.job_id)
 
 
