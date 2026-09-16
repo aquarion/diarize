@@ -82,11 +82,35 @@ _RECORD_FIELDS = {
 }
 
 
+# A status other than one of these is either a bug or hand-edited
+# corruption; _reconcile_registry_on_startup and _prune_registry both
+# special-case "running" specifically, so anything else must be one of the
+# statuses this module actually assigns.
+_VALID_STATUSES = {"running", "done", "failed", "interrupted"}
+
+
 def _is_valid_record(key: str, value: object) -> bool:
-    return (
+    if not (
         isinstance(value, dict)
         and _RECORD_FIELDS.issubset(value)
         and value.get("job_id") == key
+        and value.get("status") in _VALID_STATUSES
+        and isinstance(value.get("backend"), str)
+        and isinstance(value.get("input_path"), str)
+        and isinstance(value.get("num_speakers"), int)
+        and isinstance(value.get("pid"), int)
+        # started_at is always set by the time a record is written; unlike
+        # output_path/error/finished_at it's never legitimately None.
+        and isinstance(value.get("started_at"), str)
+    ):
+        return False
+    # output_path/error/finished_at are None until the job completes, and
+    # strings afterward - list_jobs's sort key and _prune_registry both
+    # index started_at (checked above) and would otherwise raise comparing
+    # incompatible types (e.g. a hand-edited int) against real records.
+    return all(
+        value.get(f) is None or isinstance(value.get(f), str)
+        for f in ("output_path", "error", "finished_at")
     )
 
 
@@ -327,33 +351,24 @@ class Job:
             pending = self._stderr_done if self._stdout_done.is_set() else self._stdout_done
             pending.wait(timeout=0.5)
         outcome = _resolve_job_outcome(self)
-        persisted = _update_job_record(
+        for attempt in range(_PERSIST_RETRY_ATTEMPTS):
+            if _persist_terminal_outcome(self, outcome):
+                return
+            if attempt < _PERSIST_RETRY_ATTEMPTS - 1:
+                time.sleep(_PERSIST_RETRY_DELAY)
+        # A transient failure (disk full, permissions) never got a chance to
+        # heal within the retry budget - the live handle is deliberately
+        # kept (not evicted) so get_transcript/list_jobs can still resolve
+        # this job correctly from it; only surviving an actual server
+        # restart before some future write succeeds is lost.
+        logger.error(
+            "job %s: failed to persist final outcome (%s) after %d attempts; "
+            "the live handle is being kept so it can still be resolved, but "
+            "this outcome will be lost if the server restarts first",
             self.job_id,
-            status=outcome["status"],
-            output_path=outcome.get("output_path"),
-            error=outcome.get("error"),
+            outcome["status"],
+            _PERSIST_RETRY_ATTEMPTS,
         )
-        # Everything needed to answer a later get_transcript/list_jobs call
-        # for this job now lives in the (tiny) persisted record - drop the
-        # live handle so a long-running server doesn't retain every job's
-        # full stdout/stderr in memory forever. Only once we know the
-        # registry actually has it, though - a Job with no registry entry
-        # (e.g. one built directly rather than via transcribe()) would
-        # otherwise become unreachable by any get_transcript call.
-        if not persisted:
-            return
-        with self._lifecycle_lock:
-            # For a job that completes near-instantly, this thread (started
-            # in __post_init__) can reach here before transcribe() has
-            # inserted `self` into `jobs` at all - popping now would be a
-            # silent no-op, and the later insertion would then leave this
-            # already-finished Job (and its stdout/stderr) in `jobs`
-            # permanently, with nothing left to ever evict it again. Flag it
-            # instead so transcribe() can evict it itself once it does insert.
-            if jobs.get(self.job_id) is self:
-                del jobs[self.job_id]
-            else:
-                self._eviction_pending = True
 
     def _record_collector_error(self, message: str) -> None:
         with self._error_lock:
@@ -631,6 +646,44 @@ def _resolve_job_outcome(job: Job) -> dict:
     return {"status": "done", "output_path": path}
 
 
+# How hard Job._finalize_and_persist tries to ride out a transient registry
+# write failure (disk full, permissions) before giving up on this job ever
+# surviving a restart.
+_PERSIST_RETRY_ATTEMPTS = 5
+_PERSIST_RETRY_DELAY = 1.0
+
+
+def _persist_terminal_outcome(job: Job, outcome: dict) -> bool:
+    """Persists a job's terminal outcome and, once durable, evicts its live
+    handle from `jobs`. Idempotent (a second call after eviction is a
+    harmless no-op registry write) and safe to call from multiple places:
+    both the finalizer thread and get_transcript/list_jobs call this the
+    moment either one resolves a terminal outcome for a live job, so
+    whichever notices first closes the window where a server restart could
+    otherwise reconcile an already-finished job to "interrupted" before the
+    finalizer's own next check got around to persisting it."""
+    persisted = _update_job_record(
+        job.job_id,
+        status=outcome["status"],
+        output_path=outcome.get("output_path"),
+        error=outcome.get("error"),
+    )
+    if not persisted:
+        return False
+    with job._lifecycle_lock:
+        # For a job that completes near-instantly, this can run before
+        # transcribe() has inserted `job` into `jobs` at all - popping now
+        # would be a silent no-op, and the later insertion would then leave
+        # this already-finished Job (and its stdout/stderr) in `jobs`
+        # permanently, with nothing left to ever evict it again. Flag it
+        # instead so transcribe() can evict it itself once it does insert.
+        if jobs.get(job.job_id) is job:
+            del jobs[job.job_id]
+        else:
+            job._eviction_pending = True
+    return True
+
+
 @mcp.tool()
 def get_transcript(job_id: str) -> dict:
     """Poll a transcription job.
@@ -647,8 +700,10 @@ def get_transcript(job_id: str) -> dict:
       restarted while this job was running - its actual outcome is unknown.
       {"status": "unknown", "error": "no such job_id"} if this job_id was
       never seen, or is old enough to have been pruned from the registry
-      (distinct from "failed": nothing to act on, no compute to
-      retry-avoid).
+      (distinct from "failed": not evidence of an error - but unlike a job
+      that was truly never seen, a pruned one may have completed and
+      written real output, so check the configured output location before
+      re-running).
     """
     job = jobs.get(job_id)
     if job is None:
@@ -662,6 +717,12 @@ def get_transcript(job_id: str) -> dict:
             result["stage"] = job.last_stage
         return result
     outcome = _resolve_job_outcome(job)
+    # Persist immediately rather than leaving it solely to the finalizer
+    # thread's own (up to 0.5s later) check: without this, a restart in the
+    # narrow window right after this poll but before that thread wakes up
+    # could reconcile a job this call already reported "done" to
+    # "interrupted" for whoever asks next.
+    _persist_terminal_outcome(job, outcome)
     if outcome["status"] != "done":
         return outcome
     return _read_transcript_result(outcome["output_path"], job_id)
@@ -744,8 +805,12 @@ def list_jobs(limit: int = 20) -> dict:
             # The job finished, but the background finalizer thread that
             # persists this to disk runs asynchronously - compute the
             # outcome directly rather than risk showing a stale "running"
-            # snapshot from before it's had a chance to write.
+            # snapshot from before it's had a chance to write, and persist
+            # it immediately ourselves (same as get_transcript) so a
+            # restart right after this call can't reconcile a job we just
+            # reported as done/failed to "interrupted" instead.
             outcome = _resolve_job_outcome(job)
+            _persist_terminal_outcome(job, outcome)
             record["status"] = outcome["status"]
             record["output_path"] = outcome.get("output_path", record.get("output_path"))
             record["error"] = outcome.get("error", record.get("error"))

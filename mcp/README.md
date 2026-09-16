@@ -83,7 +83,9 @@ Returns one of:
 - `{"status": "unknown", "error": "no such job_id"}` — this `job_id` was
   never seen, *or* it's old enough to have been pruned from the registry
   (capped at the 200 most recent completed jobs). Distinct from `"failed"`:
-  there's nothing to act on, and no compute to avoid retrying.
+  not evidence of an error. But unlike a job that was truly never seen, a
+  pruned one may have completed and written real output - check the
+  configured output location before re-running.
 
 ### `list_jobs(limit=20)`
 

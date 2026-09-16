@@ -792,6 +792,127 @@ def test_finalizer_persists_failed_status_for_stalled_job(monkeypatch):
         never_release.set()
 
 
+def test_finalizer_retries_persistence_after_transient_write_failure(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(server, "_PERSIST_RETRY_ATTEMPTS", 3)
+    monkeypatch.setattr(server, "_PERSIST_RETRY_DELAY", 0.01)
+
+    real_write_registry = server._write_registry
+    call_count = {"n": 0}
+
+    def _flaky_write(registry):
+        call_count["n"] += 1
+        # Call 1 is _record_job_started's initial write (must succeed, or
+        # there's no record at all for a later update to find regardless of
+        # retries) - call 2 is the finalizer's first attempt, made to fail
+        # once here to simulate a transient error before it recovers.
+        if call_count["n"] == 2:
+            return False
+        return real_write_registry(registry)
+
+    monkeypatch.setattr(server, "_write_registry", _flaky_write)
+
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    transcript = tmp_path / "t.md"
+    transcript.write_text("hello")
+    mock_proc = _make_proc(f"    local       : {transcript}\n".encode(), b"", 0)
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ):
+        result = server.transcribe(str(audio), 2)
+
+    record = _wait_for_terminal_record(result["job_id"], timeout=2.0)
+    assert record["status"] == "done"
+    assert call_count["n"] >= 2
+    assert result["job_id"] not in server.jobs
+
+
+def test_finalizer_keeps_live_handle_after_exhausting_retries(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_PERSIST_RETRY_ATTEMPTS", 2)
+    monkeypatch.setattr(server, "_PERSIST_RETRY_DELAY", 0.01)
+    monkeypatch.setattr(server, "_write_registry", lambda registry: False)
+
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    transcript = tmp_path / "t.md"
+    transcript.write_text("hello")
+    mock_proc = _make_proc(f"    local       : {transcript}\n".encode(), b"", 0)
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ):
+        result = server.transcribe(str(audio), 2)
+
+    job_id = result["job_id"]
+    _wait(server.jobs[job_id])
+    # Give the (tiny, since _PERSIST_RETRY_DELAY is 0.01s) retry loop time
+    # to exhaust its attempts and give up.
+    time.sleep(0.5)
+    # A registry that can never be written must not lose the job: keeping
+    # the live handle (rather than evicting on a false promise) means
+    # get_transcript can still resolve it correctly from memory.
+    assert job_id in server.jobs
+    result2 = server.get_transcript(job_id)
+    assert result2["status"] == "done"
+
+
+def test_get_transcript_persists_immediately_on_live_completion(tmp_path):
+    # Without this, a restart in the narrow window between this poll and
+    # the finalizer's own next check (up to 0.5s later) could reconcile a
+    # job this call already reported "done" to "interrupted".
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    transcript = tmp_path / "t.md"
+    mock_proc = _make_proc(f"    local       : {transcript}\n".encode(), b"", 0)
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ):
+        result = server.transcribe(str(audio), 2)
+
+    job_id = result["job_id"]
+    _wait(server.jobs[job_id])
+
+    server.get_transcript(job_id)
+
+    record = server._load_registry()[job_id]
+    assert record["status"] == "done"
+
+
+def test_list_jobs_persists_immediately_on_live_completion(tmp_path, monkeypatch):
+    # Kept as a no-op (always False) throughout so the finalizer can't beat
+    # list_jobs to it and evict the job first - we want to observe
+    # list_jobs's own call.
+    call_count = {"n": 0}
+
+    def _counting_update(*args, **kwargs):
+        call_count["n"] += 1
+        return False
+
+    monkeypatch.setattr(server, "_update_job_record", _counting_update)
+
+    transcript = tmp_path / "t.md"
+    proc = _make_proc(f"    local       : {transcript}\n".encode(), b"", 0)
+    server._record_job_started(
+        "list-persist-id",
+        backend="swift",
+        input_path="/tmp/a.wav",
+        num_speakers=2,
+        pid=proc.pid,
+    )
+    job = server.Job(proc=proc, backend="swift", job_id="list-persist-id")
+    server.jobs["list-persist-id"] = job
+    _wait(job)
+
+    calls_before = call_count["n"]
+    server.list_jobs()
+
+    assert call_count["n"] > calls_before
+
+
 def test_get_transcript_reads_done_job_from_registry_when_not_live(tmp_path):
     transcript = tmp_path / "transcript.md"
     transcript.write_text("# Meeting\n\nAlice: Hello.")
@@ -954,6 +1075,36 @@ def test_load_registry_drops_records_with_mismatched_job_id():
     mismatched = _full_record("other-id")
     server.JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
     server.JOBS_FILE.write_text(json.dumps({"good": good, "mismatched-key": mismatched}))
+    assert server._load_registry() == {"good": good}
+
+
+def test_load_registry_drops_records_with_unknown_status():
+    good = _full_record("good")
+    bogus = _full_record("bogus", status="not-a-real-status")
+    server.JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    server.JOBS_FILE.write_text(json.dumps({"good": good, "bogus": bogus}))
+    assert server._load_registry() == {"good": good}
+
+
+def test_load_registry_drops_records_with_wrong_field_types():
+    # A hand-edited non-string started_at would otherwise crash list_jobs's
+    # sort (comparing str against the wrong type) and _prune_registry's
+    # sort key.
+    good = _full_record("good")
+    bad_started_at = _full_record("bad-started-at", started_at=12345)
+    bad_num_speakers = _full_record("bad-num-speakers", num_speakers="two")
+    bad_output_path = _full_record("bad-output-path", output_path=123)
+    server.JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    server.JOBS_FILE.write_text(
+        json.dumps(
+            {
+                "good": good,
+                "bad-started-at": bad_started_at,
+                "bad-num-speakers": bad_num_speakers,
+                "bad-output-path": bad_output_path,
+            }
+        )
+    )
     assert server._load_registry() == {"good": good}
 
 
