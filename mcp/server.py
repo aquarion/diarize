@@ -196,24 +196,45 @@ def _prune_registry(registry: dict[str, dict], *, protect: str | None = None) ->
 
 
 def _record_job_started(
-    job_id: str, *, backend: str, input_path: str, num_speakers: int, pid: int
-) -> None:
+    job_id: str,
+    *,
+    backend: str,
+    input_path: str,
+    num_speakers: int,
+    pid: int,
+    started_at: str | None = None,
+) -> bool:
+    """Returns whether the initial "running" record actually reached disk.
+
+    Retried up to _PERSIST_RETRY_ATTEMPTS times (same budget as a terminal
+    write - see _finalize_and_persist) rather than accepting the first
+    failure: without this, a transient write failure right as a job starts
+    would leave it with no record at all - not even "running" - until it
+    finishes and its finalizer reconstructs one via fallback_start. A
+    restart in that window would report a real, in-progress job_id as
+    "unknown" (never seen) instead of "interrupted" (lost track of it)."""
+    when = started_at or _now_iso()
     with _registry_lock:
-        registry = _load_registry()
-        registry[job_id] = {
-            "job_id": job_id,
-            "backend": backend,
-            "input_path": input_path,
-            "num_speakers": num_speakers,
-            "pid": pid,
-            "status": "running",
-            "output_path": None,
-            "error": None,
-            "started_at": _now_iso(),
-            "finished_at": None,
-        }
-        _prune_registry(registry)
-        _write_registry(registry)
+        for attempt in range(_PERSIST_RETRY_ATTEMPTS):
+            registry = _load_registry()
+            registry[job_id] = {
+                "job_id": job_id,
+                "backend": backend,
+                "input_path": input_path,
+                "num_speakers": num_speakers,
+                "pid": pid,
+                "status": "running",
+                "output_path": None,
+                "error": None,
+                "started_at": when,
+                "finished_at": None,
+            }
+            _prune_registry(registry)
+            if _write_registry(registry):
+                return True
+            if attempt < _PERSIST_RETRY_ATTEMPTS - 1:
+                time.sleep(_PERSIST_RETRY_DELAY)
+        return False
 
 
 def _update_job_record(
@@ -241,10 +262,16 @@ def _update_job_record(
         if record is None:
             if fallback_start is None:
                 return False
+            # "started_at" defaults to now, but fallback_start (see
+            # _persist_terminal_outcome) always carries the job's actual
+            # start time and must win - stamping "now" here instead would
+            # make a reconstructed record look like it just started,
+            # corrupting list_jobs's chronological order and letting a
+            # long-finished job dodge pruning ahead of genuinely recent ones.
             record = {
-                **fallback_start,
                 "job_id": job_id,
                 "started_at": _now_iso(),
+                **fallback_start,
             }
             registry[job_id] = record
         record["status"] = status
@@ -353,9 +380,13 @@ class Job:
     job_id: str = ""
     # Carried only so the finalizer can reconstruct a registry record via
     # _update_job_record's fallback_start if _record_job_started's own
-    # initial write failed - not otherwise used by this class.
+    # initial write failed - not otherwise used by this class. started_at
+    # in particular must be the job's actual start time (set by transcribe()
+    # to the same value it passes to _record_job_started), not the time of
+    # reconstruction - see _update_job_record.
     input_path: str = ""
     num_speakers: int = 0
+    started_at: str = ""
     stdout: str = field(default="", init=False)
     stderr: str = field(default="", init=False)
     last_message: str = field(default="", init=False)
@@ -657,13 +688,17 @@ def transcribe(file_path: str, num_speakers: int) -> dict:
         # Record before constructing Job: Job.__post_init__ spawns the
         # finalizer thread immediately, which would find no record to
         # update if the job somehow finished and that thread ran before
-        # this record existed.
+        # this record existed. Both get the same started_at so a later
+        # fallback reconstruction (see _update_job_record) reports this
+        # job's real start time rather than whenever it happened to finish.
+        started_at = _now_iso()
         _record_job_started(
             job_id,
             backend=backend_name,
             input_path=str(p),
             num_speakers=num_speakers,
             pid=proc.pid,
+            started_at=started_at,
         )
         job = Job(
             proc=proc,
@@ -671,6 +706,7 @@ def transcribe(file_path: str, num_speakers: int) -> dict:
             job_id=job_id,
             input_path=str(p),
             num_speakers=num_speakers,
+            started_at=started_at,
         )
         with job._lifecycle_lock:
             # The finalizer thread Job.__post_init__ just started may have
@@ -780,6 +816,7 @@ def _persist_terminal_outcome(job: Job, outcome: dict) -> bool:
                 "input_path": job.input_path,
                 "num_speakers": job.num_speakers,
                 "pid": job.proc.pid,
+                "started_at": job.started_at,
                 "output_path": None,
                 "error": None,
                 "finished_at": None,

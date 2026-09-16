@@ -1186,6 +1186,67 @@ def test_update_job_record_reconstructs_record_via_fallback_start():
     assert record["started_at"] is not None
 
 
+def test_update_job_record_reconstructs_record_preserves_started_at():
+    # fallback_start's own started_at (the job's real start time) must win
+    # over the placeholder "now" this function would otherwise stamp -
+    # using reconstruction time here would make a job that's been running
+    # for hours look like it just started, corrupting list_jobs's ordering
+    # and letting it dodge pruning ahead of genuinely recent jobs.
+    result = server._update_job_record(
+        "reconstructed-with-start-id",
+        status="done",
+        output_path="/tmp/x.md",
+        error=None,
+        fallback_start={
+            "backend": "swift",
+            "input_path": "/tmp/a.wav",
+            "num_speakers": 2,
+            "pid": 4242,
+            "started_at": "2020-01-01T00:00:00+00:00",
+        },
+    )
+
+    assert result is True
+    record = server._load_registry()["reconstructed-with-start-id"]
+    assert record["started_at"] == "2020-01-01T00:00:00+00:00"
+
+
+def test_record_job_started_retries_on_transient_write_failure(monkeypatch):
+    # A transient _write_registry failure right as a job starts must not
+    # leave it with no record at all - not even "running" - until it
+    # finishes and its finalizer reconstructs one via fallback_start.
+    real_write_registry = server._write_registry
+    calls = []
+
+    def flaky_write(registry):
+        calls.append(registry)
+        if len(calls) == 1:
+            return False
+        return real_write_registry(registry)
+
+    monkeypatch.setattr(server, "_write_registry", flaky_write)
+
+    result = server._record_job_started(
+        "flaky-start-id", backend="swift", input_path="/tmp/a.wav", num_speakers=1, pid=1
+    )
+
+    assert result is True
+    assert len(calls) == 2
+    record = server._load_registry()["flaky-start-id"]
+    assert record["status"] == "running"
+
+
+def test_record_job_started_gives_up_after_exhausting_retries(monkeypatch):
+    monkeypatch.setattr(server, "_write_registry", lambda registry: False)
+
+    result = server._record_job_started(
+        "always-fails-id", backend="swift", input_path="/tmp/a.wav", num_speakers=1, pid=1
+    )
+
+    assert result is False
+    assert "always-fails-id" not in server._load_registry()
+
+
 def test_persist_terminal_outcome_reconstructs_missing_record(tmp_path):
     # End-to-end: a Job whose registry record never existed (simulating the
     # initial write having failed) must still be persisted and evicted when
