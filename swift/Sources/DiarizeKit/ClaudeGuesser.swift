@@ -64,7 +64,11 @@ public enum ClaudeGuesser {
             throw DiarizeError.claudeAPIFailed(error.localizedDescription)
         }
 
-        guard case .text(let text) = response.content.first else {
+        // .text now carries a second associated value (citations) - matching
+        // with a single binding used to implicitly tuple-match both values
+        // together (deprecated), silently making `text` a (String, Citations?)
+        // tuple instead of the String this code actually wants.
+        guard case .text(let text, _) = response.content.first else {
             throw DiarizeError.claudeAPIFailed("No text content in Claude response")
         }
 
