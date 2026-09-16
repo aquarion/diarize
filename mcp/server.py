@@ -873,6 +873,20 @@ def _resolve_job_outcome(job: Job) -> dict:
             "job %s: could not find transcript path in stdout:\n%s", job_id, job.stdout
         )
         return {"status": "failed", "error": "could not find transcript path in output"}
+    try:
+        Path(path).read_text()
+    except Exception as e:
+        # Same check _read_transcript_result makes before handing a "done"
+        # transcript back to a live caller - duplicated here (rather than
+        # left for that later call alone) so the *persisted* record can't
+        # disagree with it: without this, a missing/unreadable output file
+        # would get durably recorded as "done"/error=None here, while a
+        # live poll right now correctly reports "failed" - and once this
+        # job's live handle is evicted, nothing more will ever recompute
+        # that record, so registry-only readers (list_jobs, a restart) would
+        # see a permanently wrong "done" no live poll ever actually returned.
+        logger.error("job %s: transcript at %s is not readable: %s", job_id, path, e)
+        return {"status": "failed", "error": str(e)}
     return {"status": "done", "output_path": path}
 
 

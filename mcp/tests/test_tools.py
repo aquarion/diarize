@@ -491,6 +491,27 @@ def test_get_transcript_missing_path(tmp_path):
     assert "transcript path" in result["error"]
 
 
+def test_get_transcript_unreadable_output_reports_failed_and_persists_it(tmp_path):
+    # A backend that exits 0 and reports a transcript path whose file isn't
+    # actually readable must not get durably recorded as "done"/error=None:
+    # once this job's live handle is evicted, nothing else would ever
+    # recompute that record, so a registry-only reader (list_jobs, a
+    # restart) would see a permanently wrong "done" no live poll ever
+    # actually returned.
+    missing = tmp_path / "gone.md"
+    proc = _make_proc(f"    local       : {missing}\n".encode(), b"", 0)
+    job = server.Job(proc=proc, backend="swift", job_id="unreadable-id")
+    server.jobs["unreadable-id"] = job
+    _wait(job)
+
+    result = server.get_transcript("unreadable-id")
+    assert result["status"] == "failed"
+
+    record = _wait_for_terminal_record("unreadable-id")
+    assert record["status"] == "failed"
+    assert record["error"]
+
+
 def test_get_transcript_waits_for_slow_stderr():
     """Job must not report failure with a truncated error while stderr is
     still being collected, even though stdout finishes first."""
@@ -715,6 +736,7 @@ def test_finalizer_persists_done_status(tmp_path):
     audio = tmp_path / "audio.wav"
     audio.touch()
     transcript = tmp_path / "t.md"
+    transcript.write_text("hello")
     mock_proc = _make_proc(f"    local       : {transcript}\n".encode(), b"", 0)
 
     with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
@@ -871,6 +893,7 @@ def test_get_transcript_persists_immediately_on_live_completion(tmp_path):
     audio = tmp_path / "audio.wav"
     audio.touch()
     transcript = tmp_path / "t.md"
+    transcript.write_text("hello")
     mock_proc = _make_proc(f"    local       : {transcript}\n".encode(), b"", 0)
 
     with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
@@ -1556,6 +1579,7 @@ def test_persist_terminal_outcome_reconstructs_missing_record(tmp_path):
     # initial write having failed) must still be persisted and evicted when
     # its outcome is resolved, via Job.input_path/num_speakers.
     transcript = tmp_path / "t.md"
+    transcript.write_text("hello")
     mock_proc = _make_proc(f"    local       : {transcript}\n".encode(), b"", 0)
     mock_proc.pid = 4242
     job = server.Job(
@@ -1957,6 +1981,7 @@ def test_list_jobs_recomputes_outcome_for_completed_job_not_yet_finalized(
     monkeypatch.setattr(server, "_update_job_record", lambda *a, **k: None)
 
     transcript = tmp_path / "t.md"
+    transcript.write_text("hello")
     proc = _make_proc(f"    local       : {transcript}\n".encode(), b"", 0)
     server._record_job_started(
         "fresh-done-id",

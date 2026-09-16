@@ -104,10 +104,14 @@ without already knowing their `job_id`.
 
 Returns `{"jobs": [{"job_id", "backend", "input_path", "num_speakers", "pid",
 "status", "output_path", "error", "started_at", "finished_at"}, ...]}`. `pid`
-is the backend process's id, recorded for diagnostic use (e.g. checking
-whether a job the registry still shows as "running" genuinely is). A job
-still running also carries `"message"` and, once available, `"fraction"` /
-`"stage"` - the same fields `get_transcript` reports for it.
+is the backend process's id, recorded for diagnostic use only (e.g. manually
+checking whether a process is still around) - not evidence either way about
+whether this server is still tracking the job: it converts every persisted
+`"running"` record to `"interrupted"` on restart unconditionally, since a
+backend child can outlive a crashed/restarted server and a live pid doesn't
+prove anything is still watching it. A job still running also carries
+`"message"` and, once available, `"fraction"` / `"stage"` - the same fields
+`get_transcript` reports for it.
 
 ### `get_config(key)`
 
