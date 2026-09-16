@@ -2,7 +2,6 @@ import io
 import json
 import os
 import subprocess
-import sys
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -1016,11 +1015,7 @@ def test_get_transcript_registry_running_but_not_live_reports_interrupted():
     assert result["status"] == "interrupted"
 
 
-def test_reconcile_registry_on_startup_marks_running_as_interrupted(monkeypatch):
-    # pid liveness is exercised separately below - here it's forced dead so
-    # this test is about the status/error/finished_at transition itself,
-    # not tied to a real (and possibly coincidentally-live) pid.
-    monkeypatch.setattr(server, "_pid_is_alive", lambda pid: False)
+def test_reconcile_registry_on_startup_marks_running_as_interrupted():
     server._record_job_started(
         "reconcile-id", backend="swift", input_path="/tmp/a.wav", num_speakers=2, pid=1
     )
@@ -1033,30 +1028,24 @@ def test_reconcile_registry_on_startup_marks_running_as_interrupted(monkeypatch)
     assert record["finished_at"] is not None
 
 
-def test_reconcile_registry_on_startup_leaves_live_pid_running(monkeypatch):
-    # A "running" record whose pid is still alive most likely belongs to a
-    # different, still-live server process (accidentally started alongside
-    # this one) - not one this reconciliation pass has any business
-    # overwriting to "interrupted".
-    monkeypatch.setattr(server, "_pid_is_alive", lambda pid: True)
+def test_reconcile_registry_on_startup_marks_running_as_interrupted_even_if_pid_alive():
+    # transcribe()'s backend child runs in its own session and can easily
+    # outlive a crashed/restarted server, with nothing left to ever finalize
+    # it - so a still-alive pid must not be treated as evidence some other
+    # live server instance owns this job (that used to leave it "running"
+    # forever; see _reconcile_registry_on_startup's docstring).
     server._record_job_started(
-        "still-live-id", backend="swift", input_path="/tmp/a.wav", num_speakers=2, pid=1
+        "live-pid-id",
+        backend="swift",
+        input_path="/tmp/a.wav",
+        num_speakers=2,
+        pid=os.getpid(),
     )
 
     server._reconcile_registry_on_startup()
 
-    record = server._load_registry()["still-live-id"]
-    assert record["status"] == "running"
-
-
-def test_pid_is_alive_true_for_current_process():
-    assert server._pid_is_alive(os.getpid()) is True
-
-
-def test_pid_is_alive_false_for_exited_process():
-    proc = subprocess.Popen([sys.executable, "-c", "pass"])
-    proc.wait()
-    assert server._pid_is_alive(proc.pid) is False
+    record = server._load_registry()["live-pid-id"]
+    assert record["status"] == "interrupted"
 
 
 def test_reconcile_registry_on_startup_leaves_terminal_statuses_alone():
@@ -1077,10 +1066,109 @@ def test_reconcile_registry_on_startup_leaves_terminal_statuses_alone():
     assert record["status"] == "done"
 
 
-def test_load_registry_returns_empty_on_corrupt_file():
+def test_load_registry_raises_unreadable_on_corrupt_file():
+    # Unlike a missing file (no job has ever started - a real empty
+    # registry), corrupt JSON must not be silently treated as empty: a
+    # write-path caller building on top of that would atomically replace
+    # the file with just its own record, erasing every other persisted job.
     server.JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
     server.JOBS_FILE.write_text("not json{{{")
-    assert server._load_registry() == {}
+    try:
+        server._load_registry()
+        assert False, "expected _RegistryUnreadable"
+    except server._RegistryUnreadable:
+        pass
+
+
+def test_load_registry_raises_unreadable_on_read_error(monkeypatch):
+    def _boom(*args, **kwargs):
+        raise OSError("permission denied")
+
+    server.JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    server.JOBS_FILE.write_text("{}")
+    monkeypatch.setattr(server.Path, "read_text", _boom)
+    try:
+        server._load_registry()
+        assert False, "expected _RegistryUnreadable"
+    except server._RegistryUnreadable:
+        pass
+
+
+def test_record_job_started_does_not_wipe_registry_when_unreadable(monkeypatch):
+    # A transient read failure must not be treated as "no jobs yet" - that
+    # would make this write an atomic replace containing only the new
+    # record, silently erasing every previously persisted job.
+    server._record_job_started(
+        "pre-existing-id",
+        backend="swift",
+        input_path="/tmp/a.wav",
+        num_speakers=1,
+        pid=1,
+    )
+
+    def _boom():
+        raise server._RegistryUnreadable("boom")
+
+    monkeypatch.setattr(server, "_load_registry", _boom)
+    result = server._record_job_started(
+        "new-id", backend="swift", input_path="/tmp/b.wav", num_speakers=1, pid=2
+    )
+    assert result is False
+
+    monkeypatch.undo()
+    registry = server._load_registry()
+    assert "pre-existing-id" in registry
+    assert "new-id" not in registry
+
+
+def test_update_job_record_does_not_wipe_registry_when_unreadable(monkeypatch):
+    server._record_job_started(
+        "pre-existing-id2",
+        backend="swift",
+        input_path="/tmp/a.wav",
+        num_speakers=1,
+        pid=1,
+    )
+
+    def _boom():
+        raise server._RegistryUnreadable("boom")
+
+    monkeypatch.setattr(server, "_load_registry", _boom)
+    result = server._update_job_record(
+        "pre-existing-id2", status="done", output_path="/tmp/a.md", error=None
+    )
+    assert result is False
+
+    monkeypatch.undo()
+    registry = server._load_registry()
+    assert registry["pre-existing-id2"]["status"] == "running"
+
+
+def test_reconcile_registry_on_startup_skips_write_when_unreadable(monkeypatch):
+    def _boom():
+        raise server._RegistryUnreadable("boom")
+
+    monkeypatch.setattr(server, "_load_registry", _boom)
+    server._reconcile_registry_on_startup()  # must not raise
+
+
+def test_get_transcript_reports_unavailable_when_registry_unreadable(monkeypatch):
+    def _boom():
+        raise server._RegistryUnreadable("boom")
+
+    monkeypatch.setattr(server, "_load_registry", _boom)
+    result = server.get_transcript("whatever-id")
+    assert result["status"] == "unknown"
+    assert "registry" in result["error"]
+
+
+def test_list_jobs_degrades_when_registry_unreadable(monkeypatch):
+    def _boom():
+        raise server._RegistryUnreadable("boom")
+
+    monkeypatch.setattr(server, "_load_registry", _boom)
+    result = server.list_jobs()  # must not raise
+    assert result == {"jobs": []}
 
 
 def test_load_registry_returns_empty_on_non_dict_json():
@@ -1538,7 +1626,6 @@ def test_reconcile_registry_on_startup_prunes_all_running_over_cap(monkeypatch):
     # indefinitely until reconciliation converted them to a prunable
     # terminal status - reconciliation needs its own prune pass for that,
     # not just the one in _record_job_started/_update_job_record.
-    monkeypatch.setattr(server, "_pid_is_alive", lambda pid: False)
     monkeypatch.setattr(server, "MAX_PERSISTED_JOBS", 1)
     server._record_job_started(
         "old-running-id",

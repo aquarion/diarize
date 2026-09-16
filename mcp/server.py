@@ -126,6 +126,17 @@ def _is_valid_record(key: str, value: object) -> bool:
     )
 
 
+class _RegistryUnreadable(Exception):
+    """Raised by _load_registry() for a read failure that must not be
+    treated as an empty registry, unlike FileNotFoundError (see below): a
+    write-path caller that mistook this for "no jobs yet" would then
+    atomically replace the file with just its own new/updated record,
+    silently erasing every other persisted job. Callers that only read
+    (e.g. get_transcript's registry fallback) may still degrade to
+    reporting nothing found; callers that write must catch this and skip
+    the write instead."""
+
+
 def _load_registry() -> dict[str, dict]:
     try:
         data = json.loads(JOBS_FILE.read_text())
@@ -135,13 +146,9 @@ def _load_registry() -> dict[str, dict]:
     except (OSError, ValueError) as e:
         # A genuinely corrupted file or a transient I/O error (permissions,
         # a disk/NFS hiccup) - as opposed to FileNotFoundError, which just
-        # means no job has started yet. Still degrades to an empty registry
-        # (a caller crashing here, e.g. _reconcile_registry_on_startup at
-        # import time, would take the whole server down) but logs loudly
-        # rather than silently, unlike before, so a real problem - and the
-        # records a subsequent write could overwrite - is at least visible.
+        # means no job has started yet.
         logger.error("failed to read job registry at %s: %s", JOBS_FILE, e)
-        return {}
+        raise _RegistryUnreadable(str(e)) from e
     # Defend against a corrupted/hand-edited file: valid JSON that isn't the
     # shape we expect (e.g. "[]", "null", a record that isn't an object, or
     # one missing fields other code indexes directly) must not crash callers
@@ -225,7 +232,15 @@ def _record_job_started(
     doesn't stall every other job's registry access (get_transcript,
     list_jobs, other finalizers) for the whole retry budget."""
     with _registry_lock:
-        registry = _load_registry()
+        try:
+            registry = _load_registry()
+        except _RegistryUnreadable:
+            # Skip the write rather than risk building it on top of a
+            # registry _load_registry couldn't actually read - see
+            # _RegistryUnreadable. Reported as a failed attempt, same as a
+            # failed write, so transcribe()'s own retry loop naturally
+            # retries it.
+            return False
         existing = registry.get(job_id)
         if existing is not None and existing["status"] != "running":
             # job_id is a freshly minted uuid used for the first time by
@@ -274,7 +289,14 @@ def _update_job_record(
     matter how many times the caller retries: every retry would otherwise
     keep finding nothing to update."""
     with _registry_lock:
-        registry = _load_registry()
+        try:
+            registry = _load_registry()
+        except _RegistryUnreadable:
+            # Same reasoning as _record_job_started: don't build a write on
+            # top of a registry that couldn't actually be read. The
+            # finalizer's own retry loop (or a later get_transcript/
+            # list_jobs call, which also invoke this) will try again.
+            return False
         record = registry.get(job_id)
         if record is None:
             if fallback_start is None:
@@ -302,55 +324,35 @@ def _update_job_record(
         return _write_registry(registry)
 
 
-def _pid_is_alive(pid: int) -> bool:
-    """Best-effort liveness check, used only so _reconcile_registry_on_startup
-    doesn't clobber a job that's genuinely still running under a *different*,
-    still-live server process - this module supports exactly one live server
-    instance managing a given jobs.json at a time; this is a defense against
-    misreconciling if a second one is ever accidentally started, not general
-    cross-process coordination (there's no cross-process locking around the
-    registry file itself). Treats any check failure as "alive": the safer
-    direction is leaving a possibly-dead job's record at "running" a little
-    longer, not wrongly overwriting a live one's outcome."""
-    if _HAS_PROCESS_GROUP_KILL:
-        # POSIX: signal 0 is a well-defined no-op existence check - it never
-        # actually signals the process. Windows has no equivalent (its
-        # os.kill maps straight to TerminateProcess, so sig=0 there would
-        # not be a safe no-op check), hence the separate tasklist branch.
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except OSError:
-            return True
-        return True
-    try:
-        result = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        return str(pid) in result.stdout
-    except Exception:
-        return True
-
-
 def _reconcile_registry_on_startup() -> None:
     """A job recorded as "running" from a previous server process cannot
     actually still be tracked as running - that process's handle to the
-    subprocess (and its stdout/stderr pipes) is gone. Mark these
-    "interrupted" rather than leaving them to look perpetually in-progress,
-    so a caller knows to check for output on disk or just re-run - unless
-    its pid is still alive, meaning some *other* live server process (this
-    one starting up alongside it, most likely by mistake) is probably still
-    actually tracking it; leave those alone rather than misreconciling them
-    out from under that other process."""
+    subprocess (and its stdout/stderr pipes) is gone, and there's no
+    reattachment path (see transcribe()). Mark these "interrupted" rather
+    than leaving them to look perpetually in-progress, so a caller knows to
+    check for output on disk or just re-run.
+
+    This used to skip a record whose pid was still alive, on the theory
+    that it must belong to a different, still-live server process. That
+    doesn't actually hold: transcribe()'s backend child runs in its own
+    session, so it can easily outlive a crashed/restarted server while
+    nothing is left to ever finalize it - which left such a record stuck at
+    "running" forever, worse than the misclassification it was meant to
+    prevent (which self-heals: a genuinely-still-live other instance's own
+    finalizer overwrites this with the real outcome once that job actually
+    finishes, since _update_job_record always writes unconditionally)."""
     with _registry_lock:
-        registry = _load_registry()
+        try:
+            registry = _load_registry()
+        except _RegistryUnreadable:
+            # Don't write anything on top of a registry that couldn't
+            # actually be read - see _RegistryUnreadable. Reconciliation
+            # just doesn't run this startup; already logged by
+            # _load_registry.
+            return
         changed = False
         for record in registry.values():
-            if record["status"] == "running" and not _pid_is_alive(record["pid"]):
+            if record["status"] == "running":
                 record["status"] = "interrupted"
                 record["error"] = (
                     "the MCP server restarted while this job was running; "
@@ -1023,7 +1025,12 @@ def _get_transcript_from_registry(job_id: str) -> dict:
     live - e.g. because the server restarted since it was started. Consults
     the persisted registry so a restart can't turn "this job existed" into
     "unknown job_id"."""
-    record = _load_registry().get(job_id)
+    try:
+        record = _load_registry().get(job_id)
+    except _RegistryUnreadable as e:
+        # Read-only here - no write to protect - so degrade to a clear
+        # "can't tell right now" rather than crashing this tool call.
+        return {"status": "unknown", "error": f"job registry unavailable: {e}"}
     if record is None:
         return {"status": "unknown", "error": "no such job_id"}
     if record["status"] == "done":
@@ -1052,7 +1059,15 @@ def list_jobs(limit: int = 20) -> dict:
     # list() also avoids "dictionary changed size during iteration" against
     # a concurrent transcribe() insertion.
     with _registry_lock:
-        registry = _load_registry()
+        try:
+            registry = _load_registry()
+        except _RegistryUnreadable:
+            # Read-only for this response - no write here risks clobbering
+            # anything (per-job terminal updates below go through
+            # _persist_terminal_outcome/_update_job_record, which already
+            # guard against this themselves). Worst case this call just
+            # can't show older completed jobs this time.
+            registry = {}
         jobs_snapshot = list(jobs.items())
     live_ids = {job_id for job_id, _ in jobs_snapshot}
     for job_id, job in jobs_snapshot:
