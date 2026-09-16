@@ -1211,10 +1211,60 @@ def test_update_job_record_reconstructs_record_preserves_started_at():
     assert record["started_at"] == "2020-01-01T00:00:00+00:00"
 
 
-def test_record_job_started_retries_on_transient_write_failure(monkeypatch):
-    # A transient _write_registry failure right as a job starts must not
-    # leave it with no record at all - not even "running" - until it
-    # finishes and its finalizer reconstructs one via fallback_start.
+def test_update_job_record_reconstructs_record_falls_back_to_now_when_started_at_empty():
+    # A Job constructed without a real started_at (its "" default - e.g. one
+    # built directly by a test, or hypothetically some future code path
+    # that skips transcribe()) must not propagate that empty string into a
+    # reconstructed record: "" is technically a valid str (passes
+    # _is_valid_record's type check) but is a meaningless timestamp that
+    # would sort before every real one and confuse list_jobs's ordering.
+    result = server._update_job_record(
+        "reconstructed-empty-start-id",
+        status="done",
+        output_path="/tmp/x.md",
+        error=None,
+        fallback_start={
+            "backend": "swift",
+            "input_path": "/tmp/a.wav",
+            "num_speakers": 2,
+            "pid": 4242,
+            "started_at": "",
+        },
+    )
+
+    assert result is True
+    record = server._load_registry()["reconstructed-empty-start-id"]
+    assert record["started_at"]
+
+
+def _make_blocking_proc(pid: int = 4242) -> tuple[MagicMock, threading.Event]:
+    """A mock subprocess whose stdout/stderr collectors block until
+    unblocked, so a test can inspect state before the finalizer races
+    ahead and persists/evicts the job."""
+    unblock = threading.Event()
+
+    class _BlockingStdout:
+        def __iter__(self):
+            unblock.wait()
+            return iter([])
+
+        def close(self):
+            pass
+
+    proc = MagicMock()
+    proc.stdout = _BlockingStdout()
+    proc.stderr = io.BytesIO(b"")
+    proc.returncode = None
+    proc.poll.return_value = None
+    proc.pid = pid
+    return proc, unblock
+
+
+def test_transcribe_retries_registry_write_and_succeeds(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    mock_proc, unblock = _make_blocking_proc()
+
     real_write_registry = server._write_registry
     calls = []
 
@@ -1224,27 +1274,83 @@ def test_record_job_started_retries_on_transient_write_failure(monkeypatch):
             return False
         return real_write_registry(registry)
 
-    monkeypatch.setattr(server, "_write_registry", flaky_write)
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ), patch.object(server, "_write_registry", flaky_write):
+        try:
+            result = server.transcribe(str(audio), 2)
+        finally:
+            unblock.set()
 
-    result = server._record_job_started(
-        "flaky-start-id", backend="swift", input_path="/tmp/a.wav", num_speakers=1, pid=1
-    )
-
-    assert result is True
     assert len(calls) == 2
-    record = server._load_registry()["flaky-start-id"]
+    assert result["job_id"] in server.jobs
+    record = server._load_registry()[result["job_id"]]
     assert record["status"] == "running"
 
 
-def test_record_job_started_gives_up_after_exhausting_retries(monkeypatch):
-    monkeypatch.setattr(server, "_write_registry", lambda registry: False)
+def test_transcribe_still_tracks_job_live_when_all_registry_writes_fail(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    mock_proc, unblock = _make_blocking_proc()
 
-    result = server._record_job_started(
-        "always-fails-id", backend="swift", input_path="/tmp/a.wav", num_speakers=1, pid=1
-    )
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ), patch.object(server, "_write_registry", lambda registry: False):
+        try:
+            result = server.transcribe(str(audio), 2)
+        finally:
+            unblock.set()
 
-    assert result is False
-    assert "always-fails-id" not in server._load_registry()
+    assert result["job_id"] in server.jobs
+    assert result["job_id"] not in server._load_registry()
+
+
+def test_transcribe_does_not_hold_registry_lock_during_retry_sleep(tmp_path, monkeypatch):
+    # A registry write failure for one job must not stall every other job's
+    # registry access for the whole retry budget - see _record_job_started
+    # and transcribe(). Force a slow retry delay and confirm another thread
+    # can still acquire _registry_lock quickly (e.g. as list_jobs/another
+    # transcribe() call would) *during* transcribe()'s sleep between
+    # attempts - a short acquire timeout well under the retry delay means
+    # this can only succeed if the lock was actually released for the
+    # sleep, not just eventually freed once transcribe() finishes.
+    monkeypatch.setattr(server, "_PERSIST_RETRY_DELAY", 2.0)
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    mock_proc, unblock = _make_blocking_proc()
+
+    real_write_registry = server._write_registry
+    calls = []
+
+    def flaky_write(registry):
+        calls.append(registry)
+        if len(calls) == 1:
+            return False
+        return real_write_registry(registry)
+
+    acquired = threading.Event()
+
+    def try_acquire_during_sleep():
+        # Give transcribe()'s first (failing) attempt a moment to finish
+        # and enter its 2s sleep before we try.
+        time.sleep(0.3)
+        if server._registry_lock.acquire(timeout=0.5):
+            acquired.set()
+            server._registry_lock.release()
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ), patch.object(server, "_write_registry", flaky_write):
+        checker = threading.Thread(target=try_acquire_during_sleep, daemon=True)
+        checker.start()
+        try:
+            server.transcribe(str(audio), 2)
+        finally:
+            unblock.set()
+        checker.join(timeout=3.0)
+
+    assert len(calls) == 2
+    assert acquired.is_set()
 
 
 def test_persist_terminal_outcome_reconstructs_missing_record(tmp_path):

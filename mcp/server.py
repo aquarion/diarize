@@ -204,37 +204,31 @@ def _record_job_started(
     pid: int,
     started_at: str | None = None,
 ) -> bool:
-    """Returns whether the initial "running" record actually reached disk.
+    """Writes this job's initial "running" record in a single attempt and
+    reports whether it actually reached disk.
 
-    Retried up to _PERSIST_RETRY_ATTEMPTS times (same budget as a terminal
-    write - see _finalize_and_persist) rather than accepting the first
-    failure: without this, a transient write failure right as a job starts
-    would leave it with no record at all - not even "running" - until it
-    finishes and its finalizer reconstructs one via fallback_start. A
-    restart in that window would report a real, in-progress job_id as
-    "unknown" (never seen) instead of "interrupted" (lost track of it)."""
-    when = started_at or _now_iso()
+    Deliberately not retried in here: transcribe() (the only real caller)
+    drives its own retry loop and only holds _registry_lock while an
+    individual attempt is in flight, sleeping between attempts with the
+    lock released so a transient failure for one job's registration
+    doesn't stall every other job's registry access (get_transcript,
+    list_jobs, other finalizers) for the whole retry budget."""
     with _registry_lock:
-        for attempt in range(_PERSIST_RETRY_ATTEMPTS):
-            registry = _load_registry()
-            registry[job_id] = {
-                "job_id": job_id,
-                "backend": backend,
-                "input_path": input_path,
-                "num_speakers": num_speakers,
-                "pid": pid,
-                "status": "running",
-                "output_path": None,
-                "error": None,
-                "started_at": when,
-                "finished_at": None,
-            }
-            _prune_registry(registry)
-            if _write_registry(registry):
-                return True
-            if attempt < _PERSIST_RETRY_ATTEMPTS - 1:
-                time.sleep(_PERSIST_RETRY_DELAY)
-        return False
+        registry = _load_registry()
+        registry[job_id] = {
+            "job_id": job_id,
+            "backend": backend,
+            "input_path": input_path,
+            "num_speakers": num_speakers,
+            "pid": pid,
+            "status": "running",
+            "output_path": None,
+            "error": None,
+            "started_at": started_at or _now_iso(),
+            "finished_at": None,
+        }
+        _prune_registry(registry)
+        return _write_registry(registry)
 
 
 def _update_job_record(
@@ -262,16 +256,19 @@ def _update_job_record(
         if record is None:
             if fallback_start is None:
                 return False
-            # "started_at" defaults to now, but fallback_start (see
-            # _persist_terminal_outcome) always carries the job's actual
-            # start time and must win - stamping "now" here instead would
-            # make a reconstructed record look like it just started,
-            # corrupting list_jobs's chronological order and letting a
-            # long-finished job dodge pruning ahead of genuinely recent ones.
+            # fallback_start (see _persist_terminal_outcome) carries the
+            # job's actual start time and must win over the "now" default
+            # below - stamping "now" here instead would make a
+            # reconstructed record look like it just started, corrupting
+            # list_jobs's chronological order and letting a long-finished
+            # job dodge pruning ahead of genuinely recent ones. Resolved
+            # with `or` rather than a plain dict-merge override so a Job
+            # constructed without a real started_at (its "" default) falls
+            # back to "now" instead of writing an empty string to disk.
             record = {
                 "job_id": job_id,
-                "started_at": _now_iso(),
                 **fallback_start,
+                "started_at": fallback_start.get("started_at") or _now_iso(),
             }
             registry[job_id] = record
         record["status"] = status
@@ -600,6 +597,35 @@ class Job:
         return True
 
 
+def _construct_and_track_job(
+    *,
+    proc: subprocess.Popen,
+    backend_name: str,
+    job_id: str,
+    input_path: str,
+    num_speakers: int,
+    started_at: str,
+) -> Job:
+    """Builds this job's live handle and inserts it into `jobs`, unless its
+    finalizer thread (started by Job.__post_init__, immediately below) has
+    already run to completion and found nothing to evict - in which case it
+    left a flag here for us to honor instead, so an already-finished Job
+    (full stdout/stderr and all) doesn't get added back permanently. See
+    Job._finalize_and_persist."""
+    job = Job(
+        proc=proc,
+        backend=backend_name,
+        job_id=job_id,
+        input_path=input_path,
+        num_speakers=num_speakers,
+        started_at=started_at,
+    )
+    with job._lifecycle_lock:
+        if not job._eviction_pending:
+            jobs[job_id] = job
+    return job
+
+
 def _reap_caffeinate(watcher: subprocess.Popen, pid: int) -> None:
     """Reap the caffeinate watcher so it can't linger as a zombie after it
     self-exits (which happens once the backend pid dies). Runs on a daemon
@@ -678,46 +704,60 @@ def transcribe(file_path: str, num_speakers: int) -> dict:
                 e,
             )
     job_id = str(uuid.uuid4())
-    # Both steps happen under _registry_lock (reentrant - see its
-    # definition) as one atomic unit: otherwise a concurrent list_jobs()
-    # call could load the registry right after _record_job_started writes
-    # this job as "running" but before it's inserted into `jobs` below,
-    # and - having no live handle to show for it - misclassify it as
-    # orphaned/interrupted even though it's about to be tracked normally.
-    with _registry_lock:
-        # Record before constructing Job: Job.__post_init__ spawns the
-        # finalizer thread immediately, which would find no record to
-        # update if the job somehow finished and that thread ran before
-        # this record existed. Both get the same started_at so a later
-        # fallback reconstruction (see _update_job_record) reports this
-        # job's real start time rather than whenever it happened to finish.
-        started_at = _now_iso()
-        _record_job_started(
-            job_id,
-            backend=backend_name,
-            input_path=str(p),
-            num_speakers=num_speakers,
-            pid=proc.pid,
-            started_at=started_at,
-        )
-        job = Job(
+    # started_at is shared between the registry record and the Job itself
+    # so a later fallback reconstruction (see _update_job_record) reports
+    # this job's real start time rather than whenever it happened to finish.
+    started_at = _now_iso()
+    job: Job | None = None
+    for attempt in range(_PERSIST_RETRY_ATTEMPTS):
+        # The write and the `jobs` insertion happen under _registry_lock
+        # (reentrant - see its definition) as one atomic unit only on the
+        # attempt that actually succeeds: otherwise a concurrent list_jobs()
+        # call could load the registry right after this writes the job as
+        # "running" but before it's inserted into `jobs`, and - having no
+        # live handle to show for it - misclassify it as orphaned/
+        # interrupted even though it's about to be tracked normally. A
+        # *failed* attempt writes nothing, so it doesn't need that
+        # protection - and releasing the lock before sleeping between
+        # attempts (rather than holding it the whole retry budget) means a
+        # registry write failure for this job doesn't stall every other
+        # job's get_transcript/list_jobs/finalizer in the meantime.
+        with _registry_lock:
+            if _record_job_started(
+                job_id,
+                backend=backend_name,
+                input_path=str(p),
+                num_speakers=num_speakers,
+                pid=proc.pid,
+                started_at=started_at,
+            ):
+                job = _construct_and_track_job(
+                    proc=proc,
+                    backend_name=backend_name,
+                    job_id=job_id,
+                    input_path=str(p),
+                    num_speakers=num_speakers,
+                    started_at=started_at,
+                )
+                break
+        if attempt < _PERSIST_RETRY_ATTEMPTS - 1:
+            time.sleep(_PERSIST_RETRY_DELAY)
+    if job is None:
+        # Every attempt failed - the subprocess above is already running
+        # regardless, so it must still be tracked live even with no durable
+        # "running" record. list_jobs's synthetic fallback covers a live
+        # job with no registry record, and the finalizer will still persist
+        # a full record via fallback_start once the job completes (see
+        # _persist_terminal_outcome) - this job just can't survive a
+        # restart before then.
+        job = _construct_and_track_job(
             proc=proc,
-            backend=backend_name,
+            backend_name=backend_name,
             job_id=job_id,
             input_path=str(p),
             num_speakers=num_speakers,
             started_at=started_at,
         )
-        with job._lifecycle_lock:
-            # The finalizer thread Job.__post_init__ just started may have
-            # already run to completion and found nothing to evict (this
-            # key didn't exist yet) - in which case it left a flag here
-            # rather than silently no-op'ing, since inserting
-            # unconditionally below would otherwise leave an
-            # already-finished Job (full stdout/stderr and all) in `jobs`
-            # permanently. See Job._finalize_and_persist.
-            if not job._eviction_pending:
-                jobs[job_id] = job
     logger.info(
         "started job %s (backend=%s, pid=%s, file=%s, num_speakers=%s)",
         job_id,
@@ -961,7 +1001,7 @@ def list_jobs(limit: int = 20) -> dict:
                     "status": "running",
                     "output_path": None,
                     "error": None,
-                    "started_at": None,
+                    "started_at": job.started_at or None,
                     "finished_at": None,
                 },
             )
