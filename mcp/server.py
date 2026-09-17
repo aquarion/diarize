@@ -19,10 +19,10 @@ from urllib.parse import unquote
 
 from platformdirs import user_log_dir
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 REPO_ROOT = Path(__file__).parent.parent
-mcp = FastMCP("diarize")
+mcp = MCPServer("diarize")
 jobs: dict[str, Job] = {}
 
 LOG_DIR = Path(os.environ.get("DIARIZE_LOG_DIR", user_log_dir("diarize")))
