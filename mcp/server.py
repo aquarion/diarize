@@ -449,6 +449,11 @@ class Job:
     input_path: str = ""
     num_speakers: int = 0
     started_at: str = ""
+    # Set when transcribe()'s caller supplied output_path: the backend was
+    # told (via --vault-output) to write there instead of templating a
+    # destination from config, so _resolve_job_outcome can use this path
+    # directly rather than scraping it back out of stdout.
+    output_path_override: str | None = None
     stdout: str = field(default="", init=False)
     stderr: str = field(default="", init=False)
     last_message: str = field(default="", init=False)
@@ -700,8 +705,16 @@ def _reap_caffeinate(watcher: subprocess.Popen, pid: int) -> None:
 
 
 @mcp.tool()
-def transcribe(file_path: str, num_speakers: int) -> dict:
+def transcribe(
+    file_path: str, num_speakers: int, output_path: str | None = None
+) -> dict:
     """Start a transcription and diarization job.
+
+    output_path, if given, overrides the configured vault destination for
+    this job only (stored vault_path/vault_subdir/vault_filename_template
+    config is untouched) - the transcript is written exactly there instead
+    of being templated from config. Parent directories are created as
+    needed.
 
     Returns {"job_id": "<uuid>", "backend": "swift"|"python"} on success,
     or {"error": "<message>"} on failure.
@@ -709,13 +722,19 @@ def transcribe(file_path: str, num_speakers: int) -> dict:
     p = Path(file_path).expanduser()
     if not p.exists():
         return {"error": f"file not found: {file_path}"}
+    resolved_output: str | None = None
+    if output_path:
+        resolved_output = str(Path(output_path).expanduser())
     try:
         backend_name, cmd = select_backend()
     except BackendUnavailableError as e:
         logger.error("no backend available for %s: %s", p, e)
         return {"error": f"no backend available: {e}"}
+    argv = cmd + [str(p), str(num_speakers), "--yes"]
+    if resolved_output is not None:
+        argv += ["--vault-output", resolved_output]
     proc = subprocess.Popen(
-        cmd + [str(p), str(num_speakers), "--yes"],
+        argv,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         stdin=subprocess.DEVNULL,
@@ -783,6 +802,7 @@ def transcribe(file_path: str, num_speakers: int) -> dict:
         input_path=str(p),
         num_speakers=num_speakers,
         started_at=started_at,
+        output_path_override=resolved_output,
     )
     tracked = False
     for attempt in range(_PERSIST_RETRY_ATTEMPTS):
@@ -867,12 +887,24 @@ def _resolve_job_outcome(job: Job) -> dict:
             "status": "failed",
             "error": job.stderr or f"exit code {job.proc.returncode}",
         }
-    path = parse_transcript_path(job.stdout, job.backend)
-    if path is None:
-        logger.error(
-            "job %s: could not find transcript path in stdout:\n%s", job_id, job.stdout
-        )
-        return {"status": "failed", "error": "could not find transcript path in output"}
+    if job.output_path_override is not None:
+        # The backend was told exactly where to write via --vault-output, so
+        # that's the transcript's location - no need to scrape stdout for
+        # it (and stdout's "local"/"vault" lines are about the *default*
+        # destination, which isn't where this job's output actually is).
+        path = job.output_path_override
+    else:
+        path = parse_transcript_path(job.stdout, job.backend)
+        if path is None:
+            logger.error(
+                "job %s: could not find transcript path in stdout:\n%s",
+                job_id,
+                job.stdout,
+            )
+            return {
+                "status": "failed",
+                "error": "could not find transcript path in output",
+            }
     try:
         Path(path).read_text()
     except Exception as e:
