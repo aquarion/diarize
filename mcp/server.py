@@ -724,7 +724,13 @@ def transcribe(
         return {"error": f"file not found: {file_path}"}
     resolved_output: str | None = None
     if output_path:
-        resolved_output = str(Path(output_path).expanduser())
+        # Must be absolute, not just expanded: the backend subprocess runs
+        # with cwd=REPO_ROOT (below), while this process's own cwd is
+        # wherever it was launched from (e.g. mcp/, per the Claude Desktop
+        # config) - a relative path would get written relative to one
+        # directory and later read back by _resolve_job_outcome relative to
+        # the other.
+        resolved_output = str(Path(output_path).expanduser().resolve())
     try:
         backend_name, cmd = select_backend()
     except BackendUnavailableError as e:

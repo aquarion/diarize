@@ -109,7 +109,7 @@ def test_transcribe_forwards_output_path_as_vault_output_flag(tmp_path):
         server.transcribe(str(audio), 2, output_path=str(target))
 
     argv = mock_popen.call_args_list[0].args[0]
-    assert argv[-2:] == ["--vault-output", str(target)]
+    assert argv[-2:] == ["--vault-output", str(target.resolve())]
 
 
 def test_transcribe_expands_user_in_output_path(tmp_path, monkeypatch):
@@ -128,7 +128,31 @@ def test_transcribe_expands_user_in_output_path(tmp_path, monkeypatch):
         server.transcribe(str(audio), 2, output_path="~/out.md")
 
     argv = mock_popen.call_args_list[0].args[0]
-    assert argv[-2:] == ["--vault-output", str(tmp_path / "out.md")]
+    assert argv[-2:] == ["--vault-output", str((tmp_path / "out.md").resolve())]
+
+
+def test_transcribe_resolves_relative_output_path_against_server_cwd(
+    tmp_path, monkeypatch
+):
+    # The backend subprocess runs with cwd=REPO_ROOT, which is not
+    # necessarily this process's own cwd (e.g. Claude Desktop launches this
+    # server with mcp/ as cwd, per the README). A relative output_path must
+    # resolve against *this* process's cwd before being forwarded, or the
+    # backend would write it relative to REPO_ROOT while _resolve_job_outcome
+    # later reads it back relative to wherever this process actually runs.
+    monkeypatch.chdir(tmp_path)
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    mock_proc = _make_proc(b"", b"", 0)
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ) as mock_popen:
+        server.transcribe(str(audio), 2, output_path="relative/out.md")
+
+    argv = mock_popen.call_args_list[0].args[0]
+    expected = str((tmp_path / "relative" / "out.md").resolve())
+    assert argv[-2:] == ["--vault-output", expected]
 
 
 def test_transcribe_omits_vault_output_flag_by_default(tmp_path):
