@@ -97,6 +97,77 @@ def test_transcribe_spawns_backend_in_own_process_group(tmp_path):
     assert mock_popen.call_args_list[0].kwargs["start_new_session"] is True
 
 
+def test_transcribe_forwards_output_path_as_vault_output_flag(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    target = tmp_path / "elsewhere" / "transcript.md"
+    mock_proc = _make_proc(b"", b"", 0)
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ) as mock_popen:
+        server.transcribe(str(audio), 2, output_path=str(target))
+
+    argv = mock_popen.call_args_list[0].args[0]
+    assert argv[-2:] == ["--vault-output", str(target.resolve())]
+
+
+def test_transcribe_expands_user_in_output_path(tmp_path, monkeypatch):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    # Path.expanduser() reads HOME on POSIX but prefers USERPROFILE on
+    # Windows (where it's always set, e.g. to the CI runner's real profile
+    # dir) - both need overriding for this to be cross-platform.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    mock_proc = _make_proc(b"", b"", 0)
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ) as mock_popen:
+        server.transcribe(str(audio), 2, output_path="~/out.md")
+
+    argv = mock_popen.call_args_list[0].args[0]
+    assert argv[-2:] == ["--vault-output", str((tmp_path / "out.md").resolve())]
+
+
+def test_transcribe_resolves_relative_output_path_against_server_cwd(
+    tmp_path, monkeypatch
+):
+    # The backend subprocess runs with cwd=REPO_ROOT, which is not
+    # necessarily this process's own cwd (e.g. Claude Desktop launches this
+    # server with mcp/ as cwd, per the README). A relative output_path must
+    # resolve against *this* process's cwd before being forwarded, or the
+    # backend would write it relative to REPO_ROOT while _resolve_job_outcome
+    # later reads it back relative to wherever this process actually runs.
+    monkeypatch.chdir(tmp_path)
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    mock_proc = _make_proc(b"", b"", 0)
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ) as mock_popen:
+        server.transcribe(str(audio), 2, output_path="relative/out.md")
+
+    argv = mock_popen.call_args_list[0].args[0]
+    expected = str((tmp_path / "relative" / "out.md").resolve())
+    assert argv[-2:] == ["--vault-output", expected]
+
+
+def test_transcribe_omits_vault_output_flag_by_default(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    mock_proc = _make_proc(b"    local       : /tmp/t.md\n", b"", 0)
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ) as mock_popen:
+        server.transcribe(str(audio), 2)
+
+    assert "--vault-output" not in mock_popen.call_args_list[0].args[0]
+
+
 def test_kill_after_collector_error_signals_process_group(monkeypatch):
     # os.killpg/getpgid and signal.SIGKILL are all POSIX-only, so this test
     # forces the POSIX branch and fakes all three into existence (create=True)
@@ -749,6 +820,44 @@ def test_finalizer_persists_done_status(tmp_path):
     assert record["output_path"] == str(transcript)
     assert record["error"] is None
     assert record["finished_at"] is not None
+
+
+def test_finalizer_uses_output_path_override_directly(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    target = tmp_path / "elsewhere" / "transcript.md"
+    target.parent.mkdir()
+    target.write_text("hello")
+    # Deliberately misleading stdout: if the override weren't honored, the
+    # finalizer would fall back to scraping this "local" line instead.
+    misleading = tmp_path / "wrong.md"
+    misleading.write_text("wrong file")
+    mock_proc = _make_proc(f"    local       : {misleading}\n".encode(), b"", 0)
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ):
+        result = server.transcribe(str(audio), 2, output_path=str(target))
+
+    record = _wait_for_terminal_record(result["job_id"])
+    assert record["status"] == "done"
+    assert record["output_path"] == str(target)
+
+
+def test_finalizer_reports_failed_when_output_path_override_unreadable(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    target = tmp_path / "never-written.md"
+    mock_proc = _make_proc(b"", b"", 0)
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ):
+        result = server.transcribe(str(audio), 2, output_path=str(target))
+
+    record = _wait_for_terminal_record(result["job_id"])
+    assert record["status"] == "failed"
+    assert record["output_path"] is None
 
 
 def test_finalizer_persists_failed_status(tmp_path):

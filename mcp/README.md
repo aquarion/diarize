@@ -63,9 +63,19 @@ Windows — edit `%APPDATA%\Claude\claude_desktop_config.json`:
 
 ## Tools
 
-### `transcribe(file_path, num_speakers)`
+### `transcribe(file_path, num_speakers, output_path=None)`
 
 Starts a transcription job. Picks the Swift CLI on macOS (if built), otherwise the Python CLI.
+
+`output_path`, if given, overrides the configured vault destination for
+this job only - the transcript is written exactly there instead of being
+templated from `vault_path`/`vault_subdir`/`vault_filename_template`
+config, and stored config is left untouched. Parent directories are
+created as needed. `output_path` is resolved to an absolute path (`~`
+expanded, relative paths resolved against this server's own working
+directory) before use, so a relative or `~`-prefixed argument won't be
+echoed back verbatim - once the job finishes, `get_transcript`'s
+`"output_path"` reports that resolved absolute path.
 
 Returns `{"job_id": "<uuid>", "backend": "swift"|"python"}` or `{"error": "..."}`.
 
