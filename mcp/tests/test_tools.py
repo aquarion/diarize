@@ -115,7 +115,11 @@ def test_transcribe_forwards_output_path_as_vault_output_flag(tmp_path):
 def test_transcribe_expands_user_in_output_path(tmp_path, monkeypatch):
     audio = tmp_path / "audio.wav"
     audio.touch()
+    # Path.expanduser() reads HOME on POSIX but prefers USERPROFILE on
+    # Windows (where it's always set, e.g. to the CI runner's real profile
+    # dir) - both need overriding for this to be cross-platform.
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     mock_proc = _make_proc(b"", b"", 0)
 
     with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
