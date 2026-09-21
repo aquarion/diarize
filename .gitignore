@@ -243,3 +243,6 @@ graphify-out
 *.tfstate.*
 *.tfvars
 !*.tfvars.example
+
+# Git worktrees
+.worktrees/
