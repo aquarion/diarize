@@ -102,6 +102,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Override the vault destination path for this file"
         " (e.g. ~/Obsidian/Meetings/standup.md)",
     )
+    transcribe_parser.add_argument(
+        "--backend",
+        choices=["auto", "whisperx", "mlx", "assemblyai", "aws"],
+        default=None,
+        help="Override the configured transcription engine for this run only"
+        " (does not change the saved config)",
+    )
 
     config_common = argparse.ArgumentParser(add_help=False)
     config_common.add_argument(
@@ -223,10 +230,13 @@ def run_transcribe(args: argparse.Namespace) -> int:
         data,
         skip_transcription=args.skip_whisperx,
         non_interactive=args.yes,
+        backend_override=args.backend,
     )
     save_config_data(cfg_path, data)
     cfg = load_config(cfg_path)
     cfg = dataclasses.replace(cfg, num_speakers=args.num_speakers)
+    if args.backend:
+        cfg = dataclasses.replace(cfg, backend=args.backend)
 
     if cfg.extra_path:
         os.environ["PATH"] = (
