@@ -30,6 +30,7 @@ public actor WhisperKitTranscriber: TranscriberProtocol {
         let lastReported = LastReportedFraction()
         let results: [TranscriptionResult] = try await wk.transcribe(
             audioPath: audioURL.path,
+            decodeOptions: DecodingOptions(skipSpecialTokens: true),
             callback: { _ in
                 let fraction = progressBox.fractionCompleted
                 if lastReported.update(to: fraction) {
