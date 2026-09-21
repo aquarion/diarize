@@ -66,3 +66,4 @@ jobs:
       - run: swift test
       - run: ./scripts/build-app.sh
       - run: test -x .build/release/DiarizeApp.app/Contents/MacOS/DiarizeApp
+      - run: test -f .build/release/DiarizeApp.app/Contents/Resources/AppIcon.icns
