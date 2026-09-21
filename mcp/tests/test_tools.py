@@ -168,6 +168,34 @@ def test_transcribe_omits_vault_output_flag_by_default(tmp_path):
     assert "--vault-output" not in mock_popen.call_args_list[0].args[0]
 
 
+def test_transcribe_engine_override_forces_python_and_appends_backend_flag(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    mock_proc = _make_proc(b"", b"", 0)
+
+    with patch(
+        "server.select_backend", return_value=("python", ["/usr/bin/uv"])
+    ) as mock_select, patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+        server.transcribe(str(audio), 2, engine="aws")
+
+    mock_select.assert_called_once_with(force_python=True)
+    argv = mock_popen.call_args_list[0].args[0]
+    assert argv[-2:] == ["--backend", "aws"]
+
+
+def test_transcribe_without_engine_does_not_force_python(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    mock_proc = _make_proc(b"", b"", 0)
+
+    with patch(
+        "server.select_backend", return_value=("swift", ["/bin/echo"])
+    ) as mock_select, patch("subprocess.Popen", return_value=mock_proc):
+        server.transcribe(str(audio), 2)
+
+    mock_select.assert_called_once_with(force_python=False)
+
+
 def test_kill_after_collector_error_signals_process_group(monkeypatch):
     # os.killpg/getpgid and signal.SIGKILL are all POSIX-only, so this test
     # forces the POSIX branch and fakes all three into existence (create=True)

@@ -36,6 +36,10 @@ class AppConfig:
     extra_path: list[str]
     extra_lib_path: list[str]
     num_speakers: int = 2
+    aws_s3_bucket: str = ""
+    aws_region: str = ""
+    aws_profile: str = ""
+    aws_s3_prefix: str = ""
 
 
 DEFAULTS: dict[str, Any] = {
@@ -58,6 +62,10 @@ DEFAULTS: dict[str, Any] = {
     "extra_path": [],
     "extra_lib_path": [],
     "num_speakers": 2,
+    "aws_s3_bucket": "",
+    "aws_region": "",
+    "aws_profile": "",
+    "aws_s3_prefix": "",
 }
 
 _REPO_DEFAULTS = Path(__file__).parent.parent / "config" / "defaults.json"
@@ -65,6 +73,7 @@ _REPO_DEFAULTS = Path(__file__).parent.parent / "config" / "defaults.json"
 REQUIRED_ALWAYS: tuple[str, ...] = ("vault_path",)
 REQUIRED_FOR_WHISPERX: tuple[str, ...] = ("hf_token",)
 REQUIRED_FOR_ASSEMBLYAI: tuple[str, ...] = ("assemblyai_api_key",)
+REQUIRED_FOR_AWS: tuple[str, ...] = ("aws_s3_bucket",)
 
 SECRET_KEYS: tuple[str, ...] = ("hf_token", "assemblyai_api_key")
 
@@ -145,12 +154,15 @@ def prompt_for_required_config(
     data: dict[str, Any],
     skip_transcription: bool = False,
     non_interactive: bool = False,
+    backend_override: str | None = None,
 ) -> dict[str, Any]:
     required = list(REQUIRED_ALWAYS)
     if not skip_transcription:
-        backend = str(data.get("backend", "auto"))
+        backend = backend_override or str(data.get("backend", "auto"))
         if backend == "assemblyai":
             required.extend(REQUIRED_FOR_ASSEMBLYAI)
+        elif backend == "aws":
+            required.extend(REQUIRED_FOR_AWS)
         else:
             required.extend(REQUIRED_FOR_WHISPERX)
 
@@ -158,6 +170,7 @@ def prompt_for_required_config(
         "vault_path": "Obsidian vault path",
         "hf_token": "Hugging Face token",
         "assemblyai_api_key": "AssemblyAI API key",
+        "aws_s3_bucket": "AWS S3 bucket for audio uploads",
     }
 
     changed = False
@@ -230,4 +243,8 @@ def load_config(config_path: Path) -> AppConfig:
         extra_path=[str(p) for p in merged.get("extra_path", [])],
         extra_lib_path=[str(p) for p in merged.get("extra_lib_path", [])],
         num_speakers=int(merged.get("num_speakers", 2)),
+        aws_s3_bucket=str(merged.get("aws_s3_bucket", "")),
+        aws_region=str(merged.get("aws_region", "")),
+        aws_profile=str(merged.get("aws_profile", "")),
+        aws_s3_prefix=str(merged.get("aws_s3_prefix", "")),
     )

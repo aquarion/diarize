@@ -380,12 +380,16 @@ class BackendUnavailableError(Exception):
     selected (not just a generic "no backend available")."""
 
 
-def select_backend() -> tuple[str, list[str]]:
+def select_backend(force_python: bool = False) -> tuple[str, list[str]]:
     """Return (backend_name, argv_prefix).
+
+    force_python skips the swift-first shortcut on Darwin - needed when the
+    caller requested a python-only engine (e.g. aws), which swift has no
+    equivalent of.
 
     Raises BackendUnavailableError if no backend can be used.
     """
-    if platform.system() == "Darwin":
+    if platform.system() == "Darwin" and not force_python:
         swift_cli = REPO_ROOT / "swift" / ".build" / "release" / "diarize"
         if swift_cli.exists():
             return "swift", [str(swift_cli)]
@@ -706,7 +710,10 @@ def _reap_caffeinate(watcher: subprocess.Popen, pid: int) -> None:
 
 @mcp.tool()
 def transcribe(
-    file_path: str, num_speakers: int, output_path: str | None = None
+    file_path: str,
+    num_speakers: int,
+    output_path: str | None = None,
+    engine: str | None = None,
 ) -> dict:
     """Start a transcription and diarization job.
 
@@ -715,6 +722,11 @@ def transcribe(
     config is untouched) - the transcript is written exactly there instead
     of being templated from config. Parent directories are created as
     needed.
+
+    engine, if given (e.g. "aws"), overrides the configured transcription
+    engine for this job only (stored config is untouched) and forces
+    selection of the python backend, since engine choice is a python-backend
+    concept that the swift backend has no equivalent of.
 
     Returns {"job_id": "<uuid>", "backend": "swift"|"python"} on success,
     or {"error": "<message>"} on failure.
@@ -732,13 +744,15 @@ def transcribe(
         # the other.
         resolved_output = str(Path(output_path).expanduser().resolve())
     try:
-        backend_name, cmd = select_backend()
+        backend_name, cmd = select_backend(force_python=engine is not None)
     except BackendUnavailableError as e:
         logger.error("no backend available for %s: %s", p, e)
         return {"error": f"no backend available: {e}"}
     argv = cmd + [str(p), str(num_speakers), "--yes"]
     if resolved_output is not None:
         argv += ["--vault-output", resolved_output]
+    if engine is not None:
+        argv += ["--backend", engine]
     proc = subprocess.Popen(
         argv,
         stdout=subprocess.PIPE,

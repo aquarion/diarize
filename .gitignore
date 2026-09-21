@@ -235,3 +235,14 @@ config.json
 swift/.build
 
 graphify-out
+
+# Terraform (local state)
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+
+# Git worktrees
+.worktrees/
