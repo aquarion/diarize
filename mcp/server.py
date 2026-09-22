@@ -167,7 +167,12 @@ def _write_registry(registry: dict[str, dict]) -> bool:
     whether the update it just made is actually durable."""
     try:
         JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = JOBS_FILE.with_suffix(".json.tmp")
+        # Unique per call, not a fixed "jobs.json.tmp": two processes (e.g.
+        # two MCP clients) writing at once would otherwise both target the
+        # same temp path and torn-write into each other's file before either
+        # os.replace() runs.
+        tmp_name = f"{JOBS_FILE.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        tmp = JOBS_FILE.with_name(tmp_name)
         tmp.write_text(json.dumps(registry, indent=2))
         os.replace(tmp, JOBS_FILE)
         return True
