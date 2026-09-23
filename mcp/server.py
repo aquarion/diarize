@@ -167,10 +167,24 @@ def _write_registry(registry: dict[str, dict]) -> bool:
     whether the update it just made is actually durable."""
     try:
         JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = JOBS_FILE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(registry, indent=2))
-        os.replace(tmp, JOBS_FILE)
-        return True
+        # Unique per call, not a fixed "jobs.json.tmp": two processes (e.g.
+        # two MCP clients) writing at once would otherwise both target the
+        # same temp path and torn-write into each other's file before either
+        # os.replace() runs.
+        tmp_name = f"{JOBS_FILE.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        tmp = JOBS_FILE.with_name(tmp_name)
+        try:
+            tmp.write_text(json.dumps(registry, indent=2))
+            os.replace(tmp, JOBS_FILE)
+            return True
+        finally:
+            # A leftover from a failed write (disk full, a held file handle
+            # on Windows) is now a uniquely-named file, not a fixed name the
+            # next call overwrites - without this it would accumulate
+            # forever instead of staying capped at one. missing_ok=True
+            # makes this a no-op on the success path, where os.replace()
+            # already consumed tmp.
+            tmp.unlink(missing_ok=True)
     except (OSError, TypeError) as e:
         # TypeError: a value in the registry wasn't JSON-serializable - a
         # bug elsewhere, but persistence failing must never take a job or
