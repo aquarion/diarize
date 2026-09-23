@@ -46,6 +46,10 @@ if [ ! -f "$ICON_GLYPH" ]; then
     echo "!! Expected app icon glyph not found at $ICON_GLYPH" >&2
     exit 1
 fi
+if ! command -v npx >/dev/null 2>&1; then
+    echo "!! npx not found - this script renders the app icon via annealer (https://github.com/istic/annealer), which needs Node.js. Install Node (e.g. 'brew install node') and re-run." >&2
+    exit 1
+fi
 
 echo "==> Assembling DiarizeApp.app bundle"
 rm -rf "$APP_BUNDLE"
@@ -91,17 +95,19 @@ cp "$CLI_BIN" "$APP_BUNDLE/Contents/Resources/diarize"
 # Node, which sips/iconutil (both ship with the Xcode CLT) then turn into a
 # classic .icns, same as a flat source image would.
 #
-# Pinned to a commit, not a semver tag: this icon's fill is a designer-authored
-# multi-stop "linear-gradient" (see docs/branding/diarize.icon/icon.json),
-# and annealer's multi-stop-gradient support hasn't shipped in a numbered
-# release yet (only on main). Switch ANNEALER_REF to e.g.
-# "@istic-co/annealer@^1.1.0" once it has.
-ANNEALER_REF="github:istic/annealer#0fa06bb2c156ecbb5199616cfe0c04fb5e868077"
-if ! command -v npx >/dev/null 2>&1; then
-    echo "!! npx not found - this script renders the app icon via annealer (https://github.com/istic/annealer), which needs Node.js. Install Node (e.g. 'brew install node') and re-run." >&2
-    exit 1
-fi
-ICON_RENDER_DIR="$(mktemp -d)"
+# Pinned to a tag, not a floating semver range: this icon's fill is a
+# designer-authored multi-stop "linear-gradient" (see
+# docs/branding/diarize.icon/icon.json), which needs annealer's multi-stop-
+# gradient support (added in v1.1.0). Bump ANNEALER_REF once a newer
+# annealer release fixes something this icon needs.
+ANNEALER_REF="github:istic/annealer#v1.1.0"
+
+ICON_TMP="$(mktemp -d)"
+trap 'rm -rf "$ICON_TMP"' EXIT
+ICON_RENDER_DIR="$ICON_TMP/render"
+ICONSET_DIR="$ICON_TMP/AppIcon.iconset"
+mkdir -p "$ICON_RENDER_DIR" "$ICONSET_DIR"
+
 echo "==> Rendering AppIcon source from $ICON_DIR via annealer"
 # --background-color is required by annealer's CLI but unused for this
 # icon: it's only consulted for "automatic-gradient"/"flat-color" fills,
@@ -113,20 +119,24 @@ npx --yes "$ANNEALER_REF" \
     --target apple \
     --output-dir "$ICON_RENDER_DIR"
 ICON_SRC="$ICON_RENDER_DIR/apple-touch-icon.png"
-if [ ! -f "$ICON_SRC" ]; then
-    echo "!! annealer did not produce $ICON_SRC" >&2
+# Existence alone doesn't rule out annealer exiting 0 with a truncated or
+# malformed write (e.g. a network hiccup fetching the pinned annealer
+# version) - check it's actually a decodable, square image before
+# sips/iconutil treat it as a trusted source for every icon size in the
+# bundle.
+ICON_WIDTH="$(sips -g pixelWidth "$ICON_SRC" 2>/dev/null | awk '/pixelWidth:/{print $2}')"
+ICON_HEIGHT="$(sips -g pixelHeight "$ICON_SRC" 2>/dev/null | awk '/pixelHeight:/{print $2}')"
+if [ -z "$ICON_WIDTH" ] || [ "$ICON_WIDTH" != "$ICON_HEIGHT" ]; then
+    echo "!! annealer output at $ICON_SRC is not a valid square image (got ${ICON_WIDTH:-?}x${ICON_HEIGHT:-?})" >&2
     exit 1
 fi
 
 echo "==> Generating AppIcon.icns from $ICON_SRC"
-ICONSET_DIR="$(mktemp -d)/AppIcon.iconset"
-mkdir -p "$ICONSET_DIR"
 for size in 16 32 128 256 512; do
     sips -z "$size" "$size" "$ICON_SRC" --out "$ICONSET_DIR/icon_${size}x${size}.png" >/dev/null
     double=$((size * 2))
     sips -z "$double" "$double" "$ICON_SRC" --out "$ICONSET_DIR/icon_${size}x${size}@2x.png" >/dev/null
 done
 iconutil -c icns "$ICONSET_DIR" -o "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
-rm -rf "$(dirname "$ICONSET_DIR")"
 
 echo "==> Done: $APP_BUNDLE now bundles the diarize CLI and app icon"
