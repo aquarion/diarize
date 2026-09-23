@@ -15,6 +15,9 @@ macOS app and CLI for audio transcription and speaker diarization. No Python env
 - macOS 14+
 - Apple Silicon (WhisperKit and SpeakerKit are optimised for Apple Neural Engine / Metal)
 - Xcode command line tools (`xcode-select --install`) or full Xcode
+- Node.js (`npx`) — only for `./scripts/build-app.sh`, to render the app
+  icon via [annealer](https://github.com/istic/annealer); not needed for
+  `swift build` on its own
 
 ## Build
 

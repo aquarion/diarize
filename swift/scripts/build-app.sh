@@ -97,6 +97,10 @@ cp "$CLI_BIN" "$APP_BUNDLE/Contents/Resources/diarize"
 # release yet (only on main). Switch ANNEALER_REF to e.g.
 # "@istic-co/annealer@^1.1.0" once it has.
 ANNEALER_REF="github:istic/annealer#0fa06bb2c156ecbb5199616cfe0c04fb5e868077"
+if ! command -v npx >/dev/null 2>&1; then
+    echo "!! npx not found - this script renders the app icon via annealer (https://github.com/istic/annealer), which needs Node.js. Install Node (e.g. 'brew install node') and re-run." >&2
+    exit 1
+fi
 ICON_RENDER_DIR="$(mktemp -d)"
 echo "==> Rendering AppIcon source from $ICON_DIR via annealer"
 # --background-color is required by annealer's CLI but unused for this
