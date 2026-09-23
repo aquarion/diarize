@@ -21,6 +21,8 @@ APP_BUNDLE="$BIN_DIR/DiarizeApp.app"
 APP_BIN="$BIN_DIR/DiarizeApp"
 CLI_BIN="$BIN_DIR/diarize"
 BUNDLE_VERSION="${DIARIZE_APP_VERSION:-1.0}"
+ICON_DIR="../docs/branding/diarize.icon"
+ICON_GLYPH="$ICON_DIR/Assets/noun_transcript_8458812_FFFFFF.svg"
 
 # CFBundleVersion/CFBundleShortVersionString both go straight into the
 # Info.plist XML below, and CFBundleVersion is specifically required by
@@ -38,6 +40,14 @@ if [ ! -f "$APP_BIN" ]; then
 fi
 if [ ! -f "$CLI_BIN" ]; then
     echo "!! Expected CLI binary not found at $CLI_BIN" >&2
+    exit 1
+fi
+if [ ! -f "$ICON_GLYPH" ]; then
+    echo "!! Expected app icon glyph not found at $ICON_GLYPH" >&2
+    exit 1
+fi
+if ! command -v npx >/dev/null 2>&1; then
+    echo "!! npx not found - this script renders the app icon via annealer (https://github.com/istic/annealer), which needs Node.js. Install Node (e.g. 'brew install node') and re-run." >&2
     exit 1
 fi
 
@@ -61,6 +71,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
     <string>Diarize</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleShortVersionString</key>
     <string>$BUNDLE_VERSION</string>
     <key>CFBundleVersion</key>
@@ -76,4 +88,55 @@ PLIST
 echo "==> Embedding diarize CLI into DiarizeApp.app/Contents/Resources"
 cp "$CLI_BIN" "$APP_BUNDLE/Contents/Resources/diarize"
 
-echo "==> Done: $APP_BUNDLE now bundles the diarize CLI"
+# Icon Composer's Liquid Glass .icon format has no public CLI compiler
+# (xcrun actool silently ignores it outside an Xcode-project asset-catalog
+# build - see #45) - annealer (https://github.com/istic/annealer) is a
+# from-scratch reimplementation that renders it to a flat PNG in plain
+# Node, which sips/iconutil (both ship with the Xcode CLT) then turn into a
+# classic .icns, same as a flat source image would.
+#
+# Pinned to a tag, not a floating semver range: this icon's fill is a
+# designer-authored multi-stop "linear-gradient" (see
+# docs/branding/diarize.icon/icon.json), which needs annealer's multi-stop-
+# gradient support (added in v1.1.0). Bump ANNEALER_REF once a newer
+# annealer release fixes something this icon needs.
+ANNEALER_REF="github:istic/annealer#v1.1.0"
+
+ICON_TMP="$(mktemp -d)"
+trap 'rm -rf "$ICON_TMP"' EXIT
+ICON_RENDER_DIR="$ICON_TMP/render"
+ICONSET_DIR="$ICON_TMP/AppIcon.iconset"
+mkdir -p "$ICON_RENDER_DIR" "$ICONSET_DIR"
+
+echo "==> Rendering AppIcon source from $ICON_DIR via annealer"
+# --background-color is required by annealer's CLI but unused for this
+# icon: it's only consulted for "automatic-gradient"/"flat-color" fills,
+# and this icon's fill is an explicit "linear-gradient".
+npx --yes "$ANNEALER_REF" \
+    --icon-path "$ICON_DIR" \
+    --glyph "$ICON_GLYPH" \
+    --background-color "#0AC1DB" \
+    --target apple \
+    --output-dir "$ICON_RENDER_DIR"
+ICON_SRC="$ICON_RENDER_DIR/apple-touch-icon.png"
+# Existence alone doesn't rule out annealer exiting 0 with a truncated or
+# malformed write (e.g. a network hiccup fetching the pinned annealer
+# version) - check it's actually a decodable, square image before
+# sips/iconutil treat it as a trusted source for every icon size in the
+# bundle.
+ICON_WIDTH="$(sips -g pixelWidth "$ICON_SRC" 2>/dev/null | awk '/pixelWidth:/{print $2}')"
+ICON_HEIGHT="$(sips -g pixelHeight "$ICON_SRC" 2>/dev/null | awk '/pixelHeight:/{print $2}')"
+if [ -z "$ICON_WIDTH" ] || [ "$ICON_WIDTH" != "$ICON_HEIGHT" ]; then
+    echo "!! annealer output at $ICON_SRC is not a valid square image (got ${ICON_WIDTH:-?}x${ICON_HEIGHT:-?})" >&2
+    exit 1
+fi
+
+echo "==> Generating AppIcon.icns from $ICON_SRC"
+for size in 16 32 128 256 512; do
+    sips -z "$size" "$size" "$ICON_SRC" --out "$ICONSET_DIR/icon_${size}x${size}.png" >/dev/null
+    double=$((size * 2))
+    sips -z "$double" "$double" "$ICON_SRC" --out "$ICONSET_DIR/icon_${size}x${size}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET_DIR" -o "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+
+echo "==> Done: $APP_BUNDLE now bundles the diarize CLI and app icon"

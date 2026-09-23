@@ -13,6 +13,10 @@ repos:
       - id: check-json
       - id: check-shebang-scripts-are-executable
       - id: pretty-format-json
+        # icon.json is Icon Composer's own file format (space-before-colon),
+        # not hand-edited JSON - Icon Composer rewrites it to its own style
+        # on every save regardless, so reformatting here just adds noise.
+        exclude: '\.icon/icon\.json$'
       - id: check-merge-conflict
       - id: check-symlinks
       - id: check-toml
