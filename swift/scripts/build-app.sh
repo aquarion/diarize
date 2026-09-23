@@ -21,7 +21,8 @@ APP_BUNDLE="$BIN_DIR/DiarizeApp.app"
 APP_BIN="$BIN_DIR/DiarizeApp"
 CLI_BIN="$BIN_DIR/diarize"
 BUNDLE_VERSION="${DIARIZE_APP_VERSION:-1.0}"
-ICON_SRC="../docs/branding/noun_transcript_8458812_FFFFFF_@1200.png"
+ICON_DIR="../docs/branding/diarize.icon"
+ICON_GLYPH="$ICON_DIR/Assets/noun_transcript_8458812_FFFFFF.svg"
 
 # CFBundleVersion/CFBundleShortVersionString both go straight into the
 # Info.plist XML below, and CFBundleVersion is specifically required by
@@ -41,8 +42,8 @@ if [ ! -f "$CLI_BIN" ]; then
     echo "!! Expected CLI binary not found at $CLI_BIN" >&2
     exit 1
 fi
-if [ ! -f "$ICON_SRC" ]; then
-    echo "!! Expected app icon source not found at $ICON_SRC" >&2
+if [ ! -f "$ICON_GLYPH" ]; then
+    echo "!! Expected app icon glyph not found at $ICON_GLYPH" >&2
     exit 1
 fi
 
@@ -83,10 +84,36 @@ PLIST
 echo "==> Embedding diarize CLI into DiarizeApp.app/Contents/Resources"
 cp "$CLI_BIN" "$APP_BUNDLE/Contents/Resources/diarize"
 
-# A flat .icns (built here with sips/iconutil, both ship with the Xcode CLT)
-# works in a hand-assembled bundle same as an Xcode-built one - no need for
-# Icon Composer's .icon format or an xcodebuild-based asset-catalog compile,
-# which only matter for the newer Xcode-project-only icon workflow.
+# Icon Composer's Liquid Glass .icon format has no public CLI compiler
+# (xcrun actool silently ignores it outside an Xcode-project asset-catalog
+# build - see #45) - annealer (https://github.com/istic/annealer) is a
+# from-scratch reimplementation that renders it to a flat PNG in plain
+# Node, which sips/iconutil (both ship with the Xcode CLT) then turn into a
+# classic .icns, same as a flat source image would.
+#
+# Pinned to a commit, not a semver tag: this icon's fill is a designer-authored
+# multi-stop "linear-gradient" (see docs/branding/diarize.icon/icon.json),
+# and annealer's multi-stop-gradient support hasn't shipped in a numbered
+# release yet (only on main). Switch ANNEALER_REF to e.g.
+# "@istic-co/annealer@^1.1.0" once it has.
+ANNEALER_REF="github:istic/annealer#0fa06bb2c156ecbb5199616cfe0c04fb5e868077"
+ICON_RENDER_DIR="$(mktemp -d)"
+echo "==> Rendering AppIcon source from $ICON_DIR via annealer"
+# --background-color is required by annealer's CLI but unused for this
+# icon: it's only consulted for "automatic-gradient"/"flat-color" fills,
+# and this icon's fill is an explicit "linear-gradient".
+npx --yes "$ANNEALER_REF" \
+    --icon-path "$ICON_DIR" \
+    --glyph "$ICON_GLYPH" \
+    --background-color "#0AC1DB" \
+    --target apple \
+    --output-dir "$ICON_RENDER_DIR"
+ICON_SRC="$ICON_RENDER_DIR/apple-touch-icon.png"
+if [ ! -f "$ICON_SRC" ]; then
+    echo "!! annealer did not produce $ICON_SRC" >&2
+    exit 1
+fi
+
 echo "==> Generating AppIcon.icns from $ICON_SRC"
 ICONSET_DIR="$(mktemp -d)/AppIcon.iconset"
 mkdir -p "$ICONSET_DIR"
