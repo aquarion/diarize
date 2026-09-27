@@ -235,6 +235,40 @@ def test_prompt_for_required_config_assemblyai_backend_requires_its_key(tmp_path
         config.prompt_for_required_config(cfg_path, data, non_interactive=True)
 
 
+def test_prompt_for_required_config_aws_backend_requires_bucket(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    data = dict(config.DEFAULTS)
+    data["backend"] = "aws"
+    data["vault_path"] = "/set"
+    data["hf_token"] = "irrelevant-for-aws"
+    with pytest.raises(SystemExit):
+        config.prompt_for_required_config(cfg_path, data, non_interactive=True)
+
+
+def test_prompt_for_required_config_aws_backend_passes_with_bucket_set(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    data = dict(config.DEFAULTS)
+    data["backend"] = "aws"
+    data["vault_path"] = "/set"
+    data["aws_s3_bucket"] = "my-bucket"
+    result = config.prompt_for_required_config(cfg_path, data, non_interactive=True)
+    assert result["aws_s3_bucket"] == "my-bucket"
+
+
+def test_prompt_for_required_config_backend_override_requires_aws_bucket(tmp_path):
+    """A per-call backend override must drive the required-field check, not
+    just the persisted config's own 'backend' value - callers can request a
+    one-off engine without having globally switched to it."""
+    cfg_path = tmp_path / "config.json"
+    data = dict(config.DEFAULTS)
+    data["backend"] = "whisperx"
+    data["vault_path"] = "/set"
+    with pytest.raises(SystemExit):
+        config.prompt_for_required_config(
+            cfg_path, data, non_interactive=True, backend_override="aws"
+        )
+
+
 def test_prompt_for_required_config_interactive_fills_and_saves(tmp_path, monkeypatch):
     cfg_path = tmp_path / "config.json"
     data = dict(config.DEFAULTS)
@@ -315,3 +349,24 @@ def test_load_config_missing_file_uses_defaults(tmp_path, monkeypatch):
     cfg = config.load_config(tmp_path / "missing.json")
     assert cfg.backend == config.DEFAULTS["backend"]
     assert cfg.num_speakers == config.DEFAULTS["num_speakers"]
+
+
+def test_load_config_reads_aws_fields(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "_REPO_DEFAULTS", tmp_path / "does_not_exist.json")
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "backend": "aws",
+                "aws_s3_bucket": "my-bucket",
+                "aws_region": "eu-west-2",
+                "aws_profile": "personal",
+                "aws_s3_prefix": "diarize/",
+            }
+        )
+    )
+    cfg = config.load_config(cfg_path)
+    assert cfg.aws_s3_bucket == "my-bucket"
+    assert cfg.aws_region == "eu-west-2"
+    assert cfg.aws_profile == "personal"
+    assert cfg.aws_s3_prefix == "diarize/"

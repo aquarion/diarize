@@ -81,6 +81,16 @@ def test_parse_args_transcribe_short_yes_flag():
     assert args.yes is True
 
 
+def test_parse_args_transcribe_backend_defaults_to_none():
+    args = app.parse_args(["prog", "file.wav", "3"])
+    assert args.backend is None
+
+
+def test_parse_args_transcribe_backend_flag_overrides_configured_engine():
+    args = app.parse_args(["prog", "file.wav", "3", "--backend", "aws"])
+    assert args.backend == "aws"
+
+
 def test_parse_args_config_show():
     args = app.parse_args(["prog", "config", "show"])
     assert args.command == "config"

@@ -394,12 +394,16 @@ class BackendUnavailableError(Exception):
     selected (not just a generic "no backend available")."""
 
 
-def select_backend() -> tuple[str, list[str]]:
+def select_backend(force_python: bool = False) -> tuple[str, list[str]]:
     """Return (backend_name, argv_prefix).
+
+    force_python skips the swift-first shortcut on Darwin - needed when the
+    caller requested a python-only engine (e.g. aws), which swift has no
+    equivalent of.
 
     Raises BackendUnavailableError if no backend can be used.
     """
-    if platform.system() == "Darwin":
+    if platform.system() == "Darwin" and not force_python:
         swift_cli = REPO_ROOT / "swift" / ".build" / "release" / "diarize"
         if swift_cli.exists():
             return "swift", [str(swift_cli)]
@@ -720,7 +724,10 @@ def _reap_caffeinate(watcher: subprocess.Popen, pid: int) -> None:
 
 @mcp.tool()
 def transcribe(
-    file_path: str, num_speakers: int, output_path: str | None = None
+    file_path: str,
+    num_speakers: int,
+    output_path: str | None = None,
+    engine: str | None = None,
 ) -> dict:
     """Start a transcription and diarization job.
 
@@ -729,6 +736,11 @@ def transcribe(
     config is untouched) - the transcript is written exactly there instead
     of being templated from config. Parent directories are created as
     needed.
+
+    engine, if given (e.g. "aws"), overrides the configured transcription
+    engine for this job only (stored config is untouched) and forces
+    selection of the python backend, since engine choice is a python-backend
+    concept that the swift backend has no equivalent of.
 
     Returns {"job_id": "<uuid>", "backend": "swift"|"python"} on success,
     or {"error": "<message>"} on failure.
@@ -746,13 +758,15 @@ def transcribe(
         # the other.
         resolved_output = str(Path(output_path).expanduser().resolve())
     try:
-        backend_name, cmd = select_backend()
+        backend_name, cmd = select_backend(force_python=engine is not None)
     except BackendUnavailableError as e:
         logger.error("no backend available for %s: %s", p, e)
         return {"error": f"no backend available: {e}"}
     argv = cmd + [str(p), str(num_speakers), "--yes"]
     if resolved_output is not None:
         argv += ["--vault-output", resolved_output]
+    if engine is not None:
+        argv += ["--backend", engine]
     proc = subprocess.Popen(
         argv,
         stdout=subprocess.PIPE,
@@ -1193,6 +1207,71 @@ def list_jobs(limit: int = 20) -> dict:
     return {"jobs": entries[: max(limit, 0)]}
 
 
+def _run_config_subcommand(
+    args: list[str], timeout_action: str
+) -> tuple[str, subprocess.CompletedProcess] | dict:
+    """Run a `config get`/`config set` subcommand, retrying on the python
+    backend if swift rejects the key as unknown.
+
+    Swift's AppConfig only knows a subset of the keys python's config.py
+    supports (e.g. the assemblyai/aws fields), even though both backends
+    read and write the same config.json file - so a key swift doesn't
+    recognize may still be a perfectly good python-only key.
+
+    Returns (backend_name, result) on a completed run (which may still have
+    a non-zero returncode), or {"error": "<message>"} if no backend/run
+    could be attempted at all.
+    """
+    try:
+        backend_name, cmd = select_backend()
+    except BackendUnavailableError as e:
+        logger.error("no backend available for config %s: %s", timeout_action, e)
+        return {"error": f"no backend available: {e}"}
+    try:
+        result = subprocess.run(
+            cmd + args,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            cwd=str(REPO_ROOT),
+            timeout=CONFIG_COMMAND_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("config %s timed out (backend=%s)", timeout_action, backend_name)
+        return {"error": f"config {timeout_action} timed out after {CONFIG_COMMAND_TIMEOUT}s"}
+
+    if (
+        result.returncode != 0
+        and backend_name == "swift"
+        and "Unknown config key" in result.stderr
+    ):
+        try:
+            backend_name, cmd = select_backend(force_python=True)
+        except BackendUnavailableError as e:
+            logger.error(
+                "no python backend available for config %s: %s", timeout_action, e
+            )
+            return {"error": f"no backend available: {e}"}
+        try:
+            result = subprocess.run(
+                cmd + args,
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                cwd=str(REPO_ROOT),
+                timeout=CONFIG_COMMAND_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error(
+                "config %s timed out (backend=%s)", timeout_action, backend_name
+            )
+            return {
+                "error": f"config {timeout_action} timed out after {CONFIG_COMMAND_TIMEOUT}s"
+            }
+
+    return backend_name, result
+
+
 @mcp.tool()
 def get_config(key: str) -> dict:
     """Get a diarize config value (e.g. "vault_path", "model", "language").
@@ -1201,23 +1280,10 @@ def get_config(key: str) -> dict:
     or {"error": "<message>"} on failure (e.g. unknown key - the error
     lists the valid keys).
     """
-    try:
-        backend_name, cmd = select_backend()
-    except BackendUnavailableError as e:
-        logger.error("no backend available for get_config(%s): %s", key, e)
-        return {"error": f"no backend available: {e}"}
-    try:
-        result = subprocess.run(
-            cmd + ["config", "get", key],
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            cwd=str(REPO_ROOT),
-            timeout=CONFIG_COMMAND_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        logger.error("get_config(%s) timed out (backend=%s)", key, backend_name)
-        return {"error": f"config get timed out after {CONFIG_COMMAND_TIMEOUT}s"}
+    outcome = _run_config_subcommand(["config", "get", key], "get")
+    if isinstance(outcome, dict):
+        return outcome
+    backend_name, result = outcome
     if result.returncode != 0:
         logger.error(
             "get_config(%s) failed (backend=%s): %s", key, backend_name, result.stderr
@@ -1235,23 +1301,10 @@ def set_config(key: str, value: str) -> dict:
     or {"error": "<message>"} on failure (e.g. unknown key, wrong type -
     the error explains which).
     """
-    try:
-        backend_name, cmd = select_backend()
-    except BackendUnavailableError as e:
-        logger.error("no backend available for set_config(%s): %s", key, e)
-        return {"error": f"no backend available: {e}"}
-    try:
-        result = subprocess.run(
-            cmd + ["config", "set", key, value],
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            cwd=str(REPO_ROOT),
-            timeout=CONFIG_COMMAND_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        logger.error("set_config(%s) timed out (backend=%s)", key, backend_name)
-        return {"error": f"config set timed out after {CONFIG_COMMAND_TIMEOUT}s"}
+    outcome = _run_config_subcommand(["config", "set", key, value], "set")
+    if isinstance(outcome, dict):
+        return outcome
+    backend_name, result = outcome
     if result.returncode != 0:
         logger.error(
             "set_config(%s) failed (backend=%s): %s", key, backend_name, result.stderr
