@@ -604,6 +604,46 @@ def test_get_transcript_done(tmp_path):
     assert result["output_path"] == str(transcript)
 
 
+def test_get_transcript_done_surfaces_warning_line(tmp_path):
+    transcript = tmp_path / "transcript.md"
+    transcript.write_text("# Meeting\n\nSPEAKER_00: Hello.")
+
+    proc = _make_proc(
+        (
+            f"!! --claude-guess requested but anthropic_api_key is not configured;"
+            f" skipping guesses\n"
+            f"==> Complete\n    local       : {transcript}\n"
+        ).encode(),
+        b"",
+        0,
+    )
+    job = server.Job(proc=proc, backend="swift")
+    server.jobs["warning-id"] = job
+    _wait(job)
+
+    result = server.get_transcript("warning-id")
+    assert result["status"] == "done"
+    assert result["warnings"] == [
+        "--claude-guess requested but anthropic_api_key is not configured;"
+        " skipping guesses"
+    ]
+
+
+def test_get_transcript_done_omits_warnings_key_by_default(tmp_path):
+    transcript = tmp_path / "transcript.md"
+    transcript.write_text("# Meeting\n\nAlice: Hello.")
+
+    proc = _make_proc(
+        f"==> Complete\n    local       : {transcript}\n".encode(), b"", 0
+    )
+    job = server.Job(proc=proc, backend="swift")
+    server.jobs["no-warning-id"] = job
+    _wait(job)
+
+    result = server.get_transcript("no-warning-id")
+    assert "warnings" not in result
+
+
 def test_get_transcript_failed():
     proc = _make_proc(b"", b"WhisperKit load error\n", 1)
     job = server.Job(proc=proc, backend="swift")

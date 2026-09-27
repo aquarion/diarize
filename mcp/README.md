@@ -89,10 +89,10 @@ works, and what it requires, differs by backend (see above for which one
   key is read from config).
 - **Swift** calls the Anthropic API directly via the `anthropic_api_key`
   config value (`get_config`/`set_config`) instead of the `claude` CLI.
-  If that key isn't set, it silently skips guessing rather than
-  erroring - the job still succeeds, just with unresolved speakers, so
-  an empty-looking guess on macOS likely means the key needs setting,
-  not that guessing failed.
+  If that key isn't set, it doesn't error - the job still succeeds, just
+  with unresolved speakers - but `get_transcript`'s `"warnings"` reports
+  it (e.g. an empty-looking guess on macOS likely means the key needs
+  setting, not that guessing failed).
 
 If the calling agent already has richer context (e.g. it is itself
 Claude, or knows the participants some other way), reading the returned
@@ -112,7 +112,12 @@ Returns one of:
 - `{"status": "running"}` — still processing. May also include `"message"`
   (last human-readable stage description) and, once the transcription stage
   reports fine-grained progress, `"fraction"` (0-1) and `"stage"`.
-- `{"status": "done", "transcript": "<markdown>", "output_path": "<path>"}` — finished
+- `{"status": "done", "transcript": "<markdown>", "output_path": "<path>"}` — finished.
+  May also include `"warnings"` (a list of strings) if the backend reported
+  a soft-fail condition that didn't stop the job (e.g. `claude_guess` finding
+  nothing because a prerequisite wasn't met - see above). Only populated
+  while this job is still live-tracked (not after a server restart or once
+  pruned from the registry - same as `"message"`/`"fraction"`/`"stage"` above).
 - `{"status": "failed", "error": "<message>"}` — something went wrong
 - `{"status": "interrupted", "error": "<message>"}` — the MCP server
   restarted while this job was running, so its actual outcome is unknown;
@@ -143,7 +148,8 @@ whether this server is still tracking the job: it converts every persisted
 backend child can outlive a crashed/restarted server and a live pid doesn't
 prove anything is still watching it. A job still running also carries
 `"message"` and, once available, `"fraction"` / `"stage"` - the same fields
-`get_transcript` reports for it.
+`get_transcript` reports for it. A live-tracked job that's done also carries
+`"warnings"` if the backend reported one - see `transcribe`'s `claude_guess`.
 
 ### `get_config(key)`
 
