@@ -18,18 +18,21 @@ not a shared/CI-managed one.
 
 ## After applying
 
-1. Attach the `iam_policy_arn` output to whatever IAM user/role you'll
+1. Install the `aws` extra (`boto3`), which the app only imports lazily
+   when the `aws` backend actually runs: `uv sync --extra aws` (or
+   `pip install boto3`/`pip install ".[aws]"` outside uv).
+2. Attach the `iam_policy_arn` output to whatever IAM user/role you'll
    authenticate as (the app itself relies on boto3's normal credential chain
    - env vars, `~/.aws/credentials`, SSO profile, etc; it doesn't manage
    credentials).
-2. Set the bucket in diarize's config:
+3. Set the bucket in diarize's config:
 
    ```sh
    diarize config set aws_s3_bucket <bucket_name output>
    diarize config set aws_region <aws_region>
    ```
 
-3. Run a transcription with the `aws` engine, either as the default backend
+4. Run a transcription with the `aws` engine, either as the default backend
    (`diarize config set backend aws`) or per-call (`--backend aws`).
 
 ## Teardown

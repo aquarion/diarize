@@ -555,6 +555,40 @@ def _write_segment_outputs(
 # streamed progress - this is how often we ask.
 AWS_POLL_INTERVAL_SECONDS = 5.0
 
+# AWS Transcribe's LanguageCode requires a full locale (e.g. "en-US"), while
+# `cfg.language` (shared with the other backends) is normally a bare ISO
+# code like "en" - most visibly the repo's own default, which would
+# otherwise make the very first job on a default config fail. Maps each
+# bare code to one commonly-used locale; a value that already contains a
+# region (has a "-") is assumed to be a valid AWS locale and passed through.
+_AWS_LANGUAGE_CODE_DEFAULTS: dict[str, str] = {
+    "en": "en-US",
+    "es": "es-US",
+    "fr": "fr-FR",
+    "de": "de-DE",
+    "it": "it-IT",
+    "pt": "pt-BR",
+    "nl": "nl-NL",
+    "ja": "ja-JP",
+    "ko": "ko-KR",
+    "zh": "zh-CN",
+    "hi": "hi-IN",
+    "ar": "ar-SA",
+}
+
+
+def _aws_language_code(language: str) -> str:
+    if "-" in language:
+        return language
+    return _AWS_LANGUAGE_CODE_DEFAULTS.get(language, language)
+
+
+# AWS Transcribe's ShowSpeakerLabels only accepts a MaxSpeakerLabels of 2-10;
+# a value outside that range fails server-side with a much less legible
+# ValidationException, so it's checked locally for an earlier, clearer error.
+AWS_MIN_SPEAKER_LABELS = 2
+AWS_MAX_SPEAKER_LABELS = 10
+
 
 def _aws_word_speakers(speaker_segments: list[dict[str, Any]]) -> dict[str, str]:
     """Map each pronunciation item's start_time (AWS's own string key) to a
@@ -612,6 +646,13 @@ def run_aws_transcribe_pipeline(wav_path: Path, cfg: AppConfig, out_dir: Path) -
             "boto3 package is not installed. Run: pip install boto3"
         ) from err
 
+    max_speaker_labels = max(cfg.num_speakers, AWS_MIN_SPEAKER_LABELS)
+    if max_speaker_labels > AWS_MAX_SPEAKER_LABELS:
+        raise RuntimeError(
+            f"AWS Transcribe supports at most {AWS_MAX_SPEAKER_LABELS} speakers "
+            f"(num_speakers={cfg.num_speakers} requested)."
+        )
+
     session = boto3.Session(
         profile_name=cfg.aws_profile or None,
         region_name=cfg.aws_region or None,
@@ -630,10 +671,10 @@ def run_aws_transcribe_pipeline(wav_path: Path, cfg: AppConfig, out_dir: Path) -
         transcribe_client.start_transcription_job(
             TranscriptionJobName=job_name,
             Media={"MediaFileUri": f"s3://{cfg.aws_s3_bucket}/{key}"},
-            LanguageCode=cfg.language,
+            LanguageCode=_aws_language_code(cfg.language),
             Settings={
                 "ShowSpeakerLabels": True,
-                "MaxSpeakerLabels": max(cfg.num_speakers, 2),
+                "MaxSpeakerLabels": max_speaker_labels,
             },
         )
 
@@ -654,7 +695,25 @@ def run_aws_transcribe_pipeline(wav_path: Path, cfg: AppConfig, out_dir: Path) -
         with urllib.request.urlopen(transcript_uri) as resp:
             transcript = json.loads(resp.read())
     finally:
-        s3.delete_object(Bucket=cfg.aws_s3_bucket, Key=key)
+        # Swallow (rather than raise) a cleanup failure here: it must never
+        # replace a real exception from the try body above (e.g. the job
+        # FAILED, or urlopen/json errors) with a less useful one about a
+        # leftover S3 object.
+        try:
+            s3.delete_object(Bucket=cfg.aws_s3_bucket, Key=key)
+        except Exception as cleanup_err:  # noqa: BLE001
+            print(
+                f"!! Failed to delete temporary S3 object s3://{cfg.aws_s3_bucket}/{key}: "
+                f"{cleanup_err}",
+                file=sys.stderr,
+            )
+
+    if not transcript.get("results", {}).get("speaker_labels", {}).get("segments"):
+        print(
+            "!! AWS Transcribe returned no speaker labels - diarization did not"
+            " run, and the whole transcript will be attributed to SPEAKER_00.",
+            file=sys.stderr,
+        )
 
     segments = _aws_segments_from_transcript(transcript)
     if not segments:

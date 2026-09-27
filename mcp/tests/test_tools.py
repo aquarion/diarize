@@ -2198,6 +2198,64 @@ def test_get_config_unknown_key():
     assert "Valid keys" in result["error"]
 
 
+def test_get_config_falls_back_to_python_for_key_swift_does_not_know():
+    """aws_s3_bucket (and other python-only keys) aren't in swift's
+    AppConfig.validKeys, even though both backends share the same
+    config.json - get_config should retry on python rather than surfacing
+    swift's "unknown key" error for a key that's perfectly valid there."""
+    unknown_key_result = MagicMock(
+        stdout="",
+        stderr="!! Unknown config key: aws_s3_bucket\n    Valid keys: language\n",
+        returncode=2,
+    )
+    python_success_result = MagicMock(stdout="my-bucket\n", stderr="", returncode=0)
+    with patch(
+        "server.select_backend",
+        side_effect=[
+            ("swift", ["/bin/echo"]),
+            ("python", ["/usr/bin/uv", "run", "app.py"]),
+        ],
+    ), patch(
+        "subprocess.run", side_effect=[unknown_key_result, python_success_result]
+    ) as mock_run:
+        result = server.get_config("aws_s3_bucket")
+
+    assert result == {"key": "aws_s3_bucket", "value": "my-bucket"}
+    assert mock_run.call_count == 2
+    assert mock_run.call_args_list[1][0][0] == [
+        "/usr/bin/uv",
+        "run",
+        "app.py",
+        "config",
+        "get",
+        "aws_s3_bucket",
+    ]
+
+
+def test_set_config_falls_back_to_python_for_key_swift_does_not_know():
+    unknown_key_result = MagicMock(
+        stdout="",
+        stderr="!! Unknown config key: aws_s3_bucket\n    Valid keys: language\n",
+        returncode=2,
+    )
+    python_success_result = MagicMock(
+        stdout="==> Set aws_s3_bucket = my-bucket in /tmp/config.json\n",
+        stderr="",
+        returncode=0,
+    )
+    with patch(
+        "server.select_backend",
+        side_effect=[
+            ("swift", ["/bin/echo"]),
+            ("python", ["/usr/bin/uv", "run", "app.py"]),
+        ],
+    ), patch("subprocess.run", side_effect=[unknown_key_result, python_success_result]):
+        result = server.set_config("aws_s3_bucket", "my-bucket")
+
+    assert result["status"] == "ok"
+    assert "aws_s3_bucket = my-bucket" in result["message"]
+
+
 def test_get_config_no_backend(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "REPO_ROOT", tmp_path)
     with patch("platform.system", return_value="Linux"):

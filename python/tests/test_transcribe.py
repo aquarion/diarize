@@ -737,3 +737,142 @@ def test_run_aws_transcribe_pipeline_raises_on_failed_job_and_still_cleans_up(
         transcribe.run_aws_transcribe_pipeline(wav_path, cfg, out_dir)
 
     s3_client.delete_object.assert_called_once()
+
+
+def test_run_aws_transcribe_pipeline_uses_full_locale_for_bare_language_default(
+    tmp_path, monkeypatch
+):
+    """cfg.language defaults to the bare "en", which AWS Transcribe's
+    LanguageCode rejects outright - it needs a full locale like "en-US"."""
+    transcript_payload = _aws_transcript(
+        items=[
+            {
+                "type": "pronunciation",
+                "start_time": "0.0",
+                "end_time": "0.5",
+                "alternatives": [{"content": "Hello"}],
+            }
+        ],
+        speaker_segments=[
+            {
+                "speaker_label": "spk_0",
+                "start_time": "0.0",
+                "end_time": "0.5",
+                "items": [
+                    {"start_time": "0.0", "end_time": "0.5", "speaker_label": "spk_0"}
+                ],
+            }
+        ],
+    )
+    fake_boto3, s3_client, transcribe_client = _fake_boto3_session(
+        job_status="COMPLETED", transcript_payload=transcript_payload
+    )
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+    monkeypatch.setattr(transcribe.time, "sleep", lambda _seconds: None)
+
+    fake_response = MagicMock()
+    fake_response.read.return_value = json.dumps(transcript_payload).encode()
+    fake_response.__enter__.return_value = fake_response
+    monkeypatch.setattr("transcribe.urllib.request.urlopen", lambda _url: fake_response)
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    wav_path = tmp_path / "a.wav"
+    wav_path.write_bytes(b"fake-audio")
+    cfg = _cfg(backend="aws", aws_s3_bucket="my-bucket", language="en")
+
+    transcribe.run_aws_transcribe_pipeline(wav_path, cfg, out_dir)
+
+    start_kwargs = transcribe_client.start_transcription_job.call_args.kwargs
+    assert start_kwargs["LanguageCode"] == "en-US"
+
+
+def test_aws_language_code_passes_through_an_already_full_locale():
+    assert transcribe._aws_language_code("pt-PT") == "pt-PT"
+
+
+def test_aws_language_code_passes_through_an_unmapped_bare_code():
+    assert transcribe._aws_language_code("xx") == "xx"
+
+
+def test_run_aws_transcribe_pipeline_rejects_too_many_speakers_before_uploading(
+    tmp_path, monkeypatch
+):
+    fake_boto3, s3_client, transcribe_client = _fake_boto3_session(
+        job_status="COMPLETED", transcript_payload={}
+    )
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    wav_path = tmp_path / "a.wav"
+    wav_path.write_bytes(b"fake-audio")
+    cfg = _cfg(backend="aws", aws_s3_bucket="my-bucket", num_speakers=11)
+
+    with pytest.raises(RuntimeError, match="at most 10 speakers"):
+        transcribe.run_aws_transcribe_pipeline(wav_path, cfg, out_dir)
+
+    s3_client.upload_file.assert_not_called()
+    transcribe_client.start_transcription_job.assert_not_called()
+
+
+def test_run_aws_transcribe_pipeline_cleanup_failure_does_not_mask_job_failure(
+    tmp_path, monkeypatch, capsys
+):
+    """A delete_object failure during cleanup must not replace the real
+    AWS Transcribe job failure with a less useful cleanup error."""
+    fake_boto3, s3_client, transcribe_client = _fake_boto3_session(
+        job_status="FAILED",
+        transcript_payload={},
+        failure_reason="Unsupported media format",
+    )
+    s3_client.delete_object.side_effect = RuntimeError("AccessDenied")
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+    monkeypatch.setattr(transcribe.time, "sleep", lambda _seconds: None)
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    wav_path = tmp_path / "a.wav"
+    wav_path.write_bytes(b"fake-audio")
+    cfg = _cfg(backend="aws", aws_s3_bucket="my-bucket")
+
+    with pytest.raises(RuntimeError, match="Unsupported media format"):
+        transcribe.run_aws_transcribe_pipeline(wav_path, cfg, out_dir)
+
+    assert "Failed to delete temporary S3 object" in capsys.readouterr().err
+
+
+def test_run_aws_transcribe_pipeline_warns_when_speaker_labels_are_empty(
+    tmp_path, monkeypatch, capsys
+):
+    transcript_payload = _aws_transcript(
+        items=[
+            {
+                "type": "pronunciation",
+                "start_time": "0.0",
+                "end_time": "0.5",
+                "alternatives": [{"content": "Hello"}],
+            }
+        ],
+        speaker_segments=[],
+    )
+    fake_boto3, s3_client, transcribe_client = _fake_boto3_session(
+        job_status="COMPLETED", transcript_payload=transcript_payload
+    )
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+    monkeypatch.setattr(transcribe.time, "sleep", lambda _seconds: None)
+
+    fake_response = MagicMock()
+    fake_response.read.return_value = json.dumps(transcript_payload).encode()
+    fake_response.__enter__.return_value = fake_response
+    monkeypatch.setattr("transcribe.urllib.request.urlopen", lambda _url: fake_response)
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    wav_path = tmp_path / "a.wav"
+    wav_path.write_bytes(b"fake-audio")
+    cfg = _cfg(backend="aws", aws_s3_bucket="my-bucket")
+
+    transcribe.run_aws_transcribe_pipeline(wav_path, cfg, out_dir)
+
+    assert "no speaker labels" in capsys.readouterr().err

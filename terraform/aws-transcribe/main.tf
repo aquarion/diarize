@@ -40,6 +40,13 @@ resource "aws_s3_bucket_lifecycle_configuration" "audio_staging" {
     expiration {
       days = 1
     }
+
+    # A crashed upload_file call can leave an incomplete multipart upload,
+    # which isn't a regular object and so isn't covered by the expiration
+    # rule above - it would otherwise accumulate storage cost forever.
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 1
+    }
   }
 }
 
@@ -51,6 +58,7 @@ data "aws_iam_policy_document" "diarize_aws_transcribe" {
       "s3:PutObject",
       "s3:GetObject",
       "s3:DeleteObject",
+      "s3:AbortMultipartUpload",
     ]
     resources = ["${aws_s3_bucket.audio_staging.arn}/*"]
   }
