@@ -181,6 +181,27 @@ def test_transcribe_omits_claude_guess_flag_by_default(tmp_path):
     assert "--claude-guess" not in mock_popen.call_args_list[0].args[0]
 
 
+def test_transcribe_positional_third_argument_is_still_output_path(tmp_path):
+    # Regression test: output_path must stay the third positional
+    # parameter (claude_guess fourth) so a caller using the pre-existing
+    # transcribe(file_path, num_speakers, output_path) positional form
+    # keeps writing to output_path, rather than that value silently
+    # binding to claude_guess instead.
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    target = tmp_path / "elsewhere" / "transcript.md"
+    mock_proc = _make_proc(b"", b"", 0)
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ) as mock_popen:
+        server.transcribe(str(audio), 2, str(target))
+
+    argv = mock_popen.call_args_list[0].args[0]
+    assert "--claude-guess" not in argv
+    assert argv[-2:] == ["--vault-output", str(target.resolve())]
+
+
 def test_transcribe_forwards_both_claude_guess_and_output_path(tmp_path):
     audio = tmp_path / "audio.wav"
     audio.touch()

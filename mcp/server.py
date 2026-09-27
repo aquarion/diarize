@@ -722,27 +722,37 @@ def _reap_caffeinate(watcher: subprocess.Popen, pid: int) -> None:
 def transcribe(
     file_path: str,
     num_speakers: int,
-    claude_guess: bool = False,
     output_path: str | None = None,
+    claude_guess: bool = False,
 ) -> dict:
     """Start a transcription and diarization job.
-
-    claude_guess, if true, asks the Claude CLI (which must be installed and
-    on PATH) to guess a real name or role for each detected speaker from
-    context clues in the transcript itself (introductions, names/roles
-    mentioned, etc.), instead of leaving speakers labeled with opaque
-    backend IDs (e.g. "SPEAKER_00"). Best-effort: unresolved speakers keep
-    their opaque label. Adds a `claude -p` call over roughly the first
-    2000 characters of the transcript, so it's slower and not
-    guaranteed - if the calling agent already has richer context (e.g. it
-    is itself Claude, or knows the participants some other way), reading
-    the returned transcript directly may work better than this flag.
 
     output_path, if given, overrides the configured vault destination for
     this job only (stored vault_path/vault_subdir/vault_filename_template
     config is untouched) - the transcript is written exactly there instead
     of being templated from config. Parent directories are created as
     needed.
+
+    claude_guess, if true, asks Claude to guess a real name or role for
+    each detected speaker from context clues in the transcript itself
+    (introductions, names/roles mentioned, etc.), instead of leaving
+    speakers labeled with opaque backend IDs (e.g. "SPEAKER_00").
+    Best-effort: unresolved speakers keep their opaque label. How this
+    works, and what it requires, differs by backend - select_backend()
+    picks Swift on macOS when built, otherwise Python:
+      - Python calls the `claude` CLI (`claude -p <prompt>`) over roughly
+        the first 2000 characters of the transcript, so it needs `claude`
+        installed and on the *server's* PATH (already authenticated -
+        no API key is read from config).
+      - Swift calls the Anthropic API directly via the `anthropic_api_key`
+        config value (see get_config/set_config) instead of the `claude`
+        CLI. If that key isn't set, it silently skips guessing rather
+        than erroring - the job still succeeds, just with unresolved
+        speakers, so an empty-looking guess on macOS likely means the
+        key needs setting, not that guessing failed.
+    If the calling agent already has richer context (e.g. it is itself
+    Claude, or knows the participants some other way), reading the
+    returned transcript directly may work better than this flag either way.
 
     Returns {"job_id": "<uuid>", "backend": "swift"|"python"} on success,
     or {"error": "<message>"} on failure.
