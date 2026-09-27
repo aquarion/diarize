@@ -728,10 +728,14 @@ def transcribe(
     """Start a transcription and diarization job.
 
     speaker_names, if given, assigns each name to a detected speaker in
-    speaker-index order (the first name to the first detected speaker
-    label, sorted, and so on) instead of leaving speakers labeled with
-    opaque backend IDs (e.g. "SPEAKER_00"). Fewer names than detected
-    speakers leaves the remainder unmapped; extra names are ignored.
+    order of first appearance in the recording (the first name to whoever
+    speaks first, and so on) instead of leaving speakers labeled with
+    opaque backend IDs (e.g. "SPEAKER_00") - those IDs do not reflect
+    speaking order themselves (WhisperX/mlx-whisper's come from
+    pyannote.audio's internal clustering, not chronological order), so
+    this is computed independently from each segment's start time. Fewer
+    names than detected speakers leaves the remainder unmapped; extra
+    names are ignored.
 
     output_path, if given, overrides the configured vault destination for
     this job only (stored vault_path/vault_subdir/vault_filename_template

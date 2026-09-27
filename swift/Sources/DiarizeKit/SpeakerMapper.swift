@@ -12,13 +12,29 @@ public enum SpeakerMapper {
         }
     }
 
-    /// Maps sorted detected speaker labels to caller-supplied names in
-    /// order, e.g. detected[0] -> names[0]. Extra names beyond
-    /// detected.count are ignored; fewer names than detected speakers
-    /// leaves the remainder unmapped, for the caller to merge over an
+    /// Returns each detected speaker label once, ordered by that speaker's
+    /// earliest segment start time in the audio. Deliberately independent
+    /// of SpeakerKit's own raw label values, so "the first speaker to
+    /// talk" means the same thing here as it does for the Python backend
+    /// (whose pyannote.audio-based labels come from clustering-internal
+    /// cluster indices, not chronological order).
+    public static func speakersByFirstAppearance(segments: [Segment]) -> [String] {
+        var seen = Set<String>()
+        var order: [String] = []
+        for seg in segments.sorted(by: { $0.start < $1.start }) where !seen.contains(seg.speaker) {
+            seen.insert(seg.speaker)
+            order.append(seg.speaker)
+        }
+        return order
+    }
+
+    /// Maps speaker labels to caller-supplied names in order, e.g.
+    /// orderedLabels[0] -> names[0]. Extra names beyond orderedLabels.count
+    /// are ignored; fewer names than detected speakers leaves the
+    /// remainder unmapped, for the caller to merge over an
     /// existing/default mapping.
-    public static func assignNames(detected: [String], names: [String]) -> [String: String] {
-        Dictionary(uniqueKeysWithValues: zip(detected, names))
+    public static func assignNames(detected orderedLabels: [String], names: [String]) -> [String: String] {
+        Dictionary(uniqueKeysWithValues: zip(orderedLabels, names))
     }
 
     public static func coalesce(segments: [Segment], mapping: [String: String]) -> [Block] {

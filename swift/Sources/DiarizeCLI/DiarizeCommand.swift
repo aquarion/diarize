@@ -30,8 +30,9 @@ struct Transcribe: AsyncParsableCommand {
     @Option(
         name: .long,
         help: ArgumentHelp(
-            "Display name to assign to a detected speaker, in speaker-index order - repeat"
-                + " for each speaker (e.g. --speaker-names Alice --speaker-names Bob)"
+            "Display name to assign to a detected speaker, in order of first appearance"
+                + " in the recording - repeat for each speaker (e.g. --speaker-names Alice"
+                + " --speaker-names Bob)"
         )
     ) var speakerNames: [String] = []
 
@@ -99,7 +100,8 @@ struct Transcribe: AsyncParsableCommand {
         let detected = Array(Set(pipelineResult.segments.map(\.speaker))).sorted()
 
         if !speakerNames.isEmpty {
-            for (label, name) in SpeakerMapper.assignNames(detected: detected, names: speakerNames) {
+            let chronological = SpeakerMapper.speakersByFirstAppearance(segments: pipelineResult.segments)
+            for (label, name) in SpeakerMapper.assignNames(detected: chronological, names: speakerNames) {
                 mapping[label] = name
             }
         }

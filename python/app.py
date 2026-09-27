@@ -30,6 +30,7 @@ from speakers import (
     load_speaker_mapping,
     prompt_for_speakers,
     save_speaker_mapping,
+    speakers_by_first_appearance,
 )
 from transcribe import load_segments, run_transcription_and_diarization
 
@@ -95,9 +96,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--speaker-names",
         metavar="NAME",
         action="append",
-        help="Display name to assign to a detected speaker, in speaker-index"
-        " order - repeat for each speaker (e.g. --speaker-names Alice"
-        " --speaker-names Bob)",
+        help="Display name to assign to a detected speaker, in order of"
+        " first appearance in the recording - repeat for each speaker"
+        " (e.g. --speaker-names Alice --speaker-names Bob)",
     )
     transcribe_parser.add_argument(
         "--yes",
@@ -289,7 +290,8 @@ def run_transcribe(args: argparse.Namespace) -> int:
 
     existing_map = load_speaker_mapping(speakers_path)
     if args.speaker_names:
-        existing_map.update(assign_speaker_names(detected, args.speaker_names))
+        chronological = speakers_by_first_appearance(segments)
+        existing_map.update(assign_speaker_names(chronological, args.speaker_names))
     if args.claude_guess:
         guesses = guess_speakers_with_claude(detected, segments, ctime_dt)
         for label, name in guesses.items():

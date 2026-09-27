@@ -137,10 +137,47 @@ def test_coalesce_segments_missing_speaker_key_defaults_to_unknown():
     assert blocks == [("UNKNOWN", 0.0, "hi")]
 
 
+# --- speakers_by_first_appearance ---
+
+
+def test_speakers_by_first_appearance_orders_by_earliest_start():
+    segments = [
+        {"speaker": "SPEAKER_01", "start": 0.0, "text": "hi"},
+        {"speaker": "SPEAKER_00", "start": 5.0, "text": "hello"},
+        {"speaker": "SPEAKER_01", "start": 10.0, "text": "again"},
+    ]
+    assert speakers.speakers_by_first_appearance(segments) == [
+        "SPEAKER_01",
+        "SPEAKER_00",
+    ]
+
+
+def test_speakers_by_first_appearance_ignores_input_order():
+    # Out-of-order segments (e.g. from a backend that doesn't emit them
+    # chronologically) must still be ranked by actual start time.
+    segments = [
+        {"speaker": "SPEAKER_00", "start": 5.0, "text": "second"},
+        {"speaker": "SPEAKER_01", "start": 1.0, "text": "first"},
+    ]
+    assert speakers.speakers_by_first_appearance(segments) == [
+        "SPEAKER_01",
+        "SPEAKER_00",
+    ]
+
+
+def test_speakers_by_first_appearance_missing_speaker_key_defaults_to_unknown():
+    segments = [{"start": 0.0, "text": "hi"}]
+    assert speakers.speakers_by_first_appearance(segments) == ["UNKNOWN"]
+
+
+def test_speakers_by_first_appearance_empty_segments_returns_empty():
+    assert speakers.speakers_by_first_appearance([]) == []
+
+
 # --- assign_speaker_names ---
 
 
-def test_assign_speaker_names_maps_in_sorted_index_order():
+def test_assign_speaker_names_maps_in_given_order():
     result = speakers.assign_speaker_names(
         ["SPEAKER_00", "SPEAKER_01", "SPEAKER_02"], ["Alice", "Bob", "Chris"]
     )

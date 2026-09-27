@@ -44,7 +44,28 @@ final class SpeakerMapperTests: XCTestCase {
         XCTAssertEqual(blocks[0].text, "Hello.")
     }
 
-    func testAssignNamesMapsInSortedIndexOrder() {
+    func testSpeakersByFirstAppearanceOrdersByEarliestStart() {
+        let segments = [
+            Segment(start: 0, end: 1, text: "hi", speaker: "SPEAKER_01"),
+            Segment(start: 5, end: 6, text: "hello", speaker: "SPEAKER_00"),
+            Segment(start: 10, end: 11, text: "again", speaker: "SPEAKER_01")
+        ]
+        XCTAssertEqual(SpeakerMapper.speakersByFirstAppearance(segments: segments), ["SPEAKER_01", "SPEAKER_00"])
+    }
+
+    func testSpeakersByFirstAppearanceIgnoresInputOrder() {
+        let segments = [
+            Segment(start: 5, end: 6, text: "second", speaker: "SPEAKER_00"),
+            Segment(start: 1, end: 2, text: "first", speaker: "SPEAKER_01")
+        ]
+        XCTAssertEqual(SpeakerMapper.speakersByFirstAppearance(segments: segments), ["SPEAKER_01", "SPEAKER_00"])
+    }
+
+    func testSpeakersByFirstAppearanceEmptySegmentsReturnsEmpty() {
+        XCTAssertEqual(SpeakerMapper.speakersByFirstAppearance(segments: []), [])
+    }
+
+    func testAssignNamesMapsInGivenOrder() {
         let result = SpeakerMapper.assignNames(
             detected: ["SPEAKER_00", "SPEAKER_01", "SPEAKER_02"],
             names: ["Alice", "Bob", "Chris"]
