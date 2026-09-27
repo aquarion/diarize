@@ -477,6 +477,13 @@ class Job:
     last_message: str = field(default="", init=False)
     last_fraction: float | None = field(default=None, init=False)
     last_stage: str | None = field(default=None, init=False)
+    # Soft-fail warnings emitted as "!! ..." lines (both CLIs' convention for
+    # a problem that doesn't fail the job, e.g. a missing claude_guess
+    # prerequisite, a CUDA fallback) - otherwise invisible to an MCP caller,
+    # since a successful job's stdout is never returned, only scraped for
+    # "==>"/"progress:" lines. Live-tracked only (see get_transcript) - not
+    # persisted to the registry, matching last_message/last_fraction/last_stage.
+    warnings: list[str] = field(default_factory=list, init=False)
     collector_error: str = field(default="", init=False)
     _stdout_done: threading.Event = field(default_factory=threading.Event, init=False)
     _stderr_done: threading.Event = field(default_factory=threading.Event, init=False)
@@ -642,6 +649,8 @@ class Job:
                             if 0.0 <= fraction <= 1.0:
                                 self.last_fraction = fraction
                                 self.last_stage = parts[2]
+                elif stripped.startswith("!!"):
+                    self.warnings.append(stripped[2:].strip())
             self.proc.stdout.close()
             self.proc.wait()
         except Exception as e:
@@ -727,6 +736,7 @@ def transcribe(
     file_path: str,
     num_speakers: int,
     output_path: str | None = None,
+    claude_guess: bool = False,
     engine: str | None = None,
 ) -> dict:
     """Start a transcription and diarization job.
@@ -736,6 +746,27 @@ def transcribe(
     config is untouched) - the transcript is written exactly there instead
     of being templated from config. Parent directories are created as
     needed.
+
+    claude_guess, if true, asks Claude to guess a real name or role for
+    each detected speaker from context clues in the transcript itself
+    (introductions, names/roles mentioned, etc.), instead of leaving
+    speakers labeled with opaque backend IDs (e.g. "SPEAKER_00").
+    Best-effort: unresolved speakers keep their opaque label. How this
+    works, and what it requires, differs by backend - select_backend()
+    picks Swift on macOS when built, otherwise Python:
+      - Python calls the `claude` CLI (`claude -p <prompt>`) over roughly
+        the first 2000 characters of the transcript, so it needs `claude`
+        installed and on the *server's* PATH (already authenticated -
+        no API key is read from config).
+      - Swift calls the Anthropic API directly via the `anthropic_api_key`
+        config value (see get_config/set_config) instead of the `claude`
+        CLI. If that key isn't set, it doesn't error - the job still
+        succeeds, just with unresolved speakers - but get_transcript's
+        "warnings" reports it (e.g. an empty-looking guess on macOS
+        likely means the key needs setting, not that guessing failed).
+    If the calling agent already has richer context (e.g. it is itself
+    Claude, or knows the participants some other way), reading the
+    returned transcript directly may work better than this flag either way.
 
     engine, if given (e.g. "aws"), overrides the configured transcription
     engine for this job only (stored config is untouched) and forces
@@ -763,6 +794,8 @@ def transcribe(
         logger.error("no backend available for %s: %s", p, e)
         return {"error": f"no backend available: {e}"}
     argv = cmd + [str(p), str(num_speakers), "--yes"]
+    if claude_guess:
+        argv.append("--claude-guess")
     if resolved_output is not None:
         argv += ["--vault-output", resolved_output]
     if engine is not None:
@@ -953,7 +986,10 @@ def _resolve_job_outcome(job: Job) -> dict:
         # see a permanently wrong "done" no live poll ever actually returned.
         logger.error("job %s: transcript at %s is not readable: %s", job_id, path, e)
         return {"status": "failed", "error": str(e)}
-    return {"status": "done", "output_path": path}
+    outcome: dict = {"status": "done", "output_path": path}
+    if job.warnings:
+        outcome["warnings"] = list(job.warnings)
+    return outcome
 
 
 # How hard Job._finalize_and_persist tries to ride out a transient registry
@@ -1042,7 +1078,13 @@ def get_transcript(job_id: str) -> dict:
       transcription stage reports fine-grained progress, "fraction" (0-1)
       and "stage".
       {"status": "done", "transcript": "<markdown>", "output_path": "<path>"}
-      on success.
+      on success. May also include "warnings" (a list of strings) if the
+      backend reported a soft-fail condition that didn't stop the job -
+      e.g. claude_guess silently finding nothing because a prerequisite
+      (the `claude` CLI, or Swift's anthropic_api_key config) wasn't met.
+      Only populated when this job_id is still live-tracked (not after a
+      server restart or once pruned from the registry - same as
+      "message"/"fraction"/"stage" above).
       {"status": "failed", "error": "<message>"} on failure.
       {"status": "interrupted", "error": "<message>"} if the MCP server
       restarted while this job was running - its actual outcome is unknown.
@@ -1073,7 +1115,10 @@ def get_transcript(job_id: str) -> dict:
     _persist_terminal_outcome(job, outcome)
     if outcome["status"] != "done":
         return outcome
-    return _read_transcript_result(outcome["output_path"], job_id)
+    result = _read_transcript_result(outcome["output_path"], job_id)
+    if result["status"] == "done" and outcome.get("warnings"):
+        result["warnings"] = outcome["warnings"]
+    return result
 
 
 def _read_transcript_result(path: str, job_id: str) -> dict:
@@ -1128,7 +1173,9 @@ def list_jobs(limit: int = 20) -> dict:
     Returns {"jobs": [{"job_id", "backend", "input_path", "num_speakers",
     "pid", "status", "output_path", "error", "started_at", "finished_at"}, ...]}.
     A job still tracked live also carries "message" and, once transcription
-    reports fine-grained progress, "fraction"/"stage" - see get_transcript.
+    reports fine-grained progress, "fraction"/"stage", and - once done -
+    "warnings" if the backend reported a soft-fail condition - see
+    get_transcript.
     """
     # Both read together under _registry_lock: transcribe() writes a job's
     # registry record and inserts it into `jobs` as one atomic unit under
@@ -1191,6 +1238,8 @@ def list_jobs(limit: int = 20) -> dict:
             )
             record["error"] = outcome.get("error", record.get("error"))
             record["finished_at"] = record.get("finished_at") or _now_iso()
+            if outcome.get("warnings"):
+                record["warnings"] = outcome["warnings"]
         registry[job_id] = record
     for job_id, record in registry.items():
         # Same fail-safe as _get_transcript_from_registry: a registry-only

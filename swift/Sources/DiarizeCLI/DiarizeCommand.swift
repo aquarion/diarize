@@ -91,7 +91,9 @@ struct Transcribe: AsyncParsableCommand {
         var mapping = SpeakerMapper.loadMapping(from: mappingURL)
         let detected = Array(Set(pipelineResult.segments.map(\.speaker))).sorted()
 
-        if claudeGuess && !cfg.anthropicAPIKey.isEmpty {
+        if claudeGuess && cfg.anthropicAPIKey.isEmpty {
+            print("!! --claude-guess requested but anthropic_api_key is not configured; skipping guesses")
+        } else if claudeGuess {
             print("==> Asking Claude to guess speaker names...")
             let attrs = try? FileManager.default.attributesOfItem(atPath: audioURL.path)
             let date = (attrs?[.creationDate] as? Date) ?? Date()
