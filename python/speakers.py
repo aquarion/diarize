@@ -120,35 +120,6 @@ def guess_speakers_with_claude(
     return guesses
 
 
-def speakers_by_first_appearance(segments: list[dict[str, Any]]) -> list[str]:
-    """Returns each detected speaker label once, ordered by that speaker's
-    earliest segment start time in the audio.
-
-    This is deliberately independent of the backend's own raw label values
-    (e.g. WhisperX/mlx-whisper's "SPEAKER_00", "SPEAKER_01", ... via
-    pyannote.audio come from clustering-internal cluster indices, not
-    chronological or speaking-time order - see the diarize.py source of
-    that pipeline) so that "the first speaker to talk" reliably means the
-    same thing to a caller regardless of which backend produced the
-    transcript."""
-    order: list[str] = []
-    seen: set[str] = set()
-    for seg in sorted(segments, key=lambda s: float(s.get("start", 0.0))):
-        label = str(seg.get("speaker") or "UNKNOWN")
-        if label not in seen:
-            seen.add(label)
-            order.append(label)
-    return order
-
-
-def assign_speaker_names(ordered_labels: list[str], names: list[str]) -> dict[str, str]:
-    """Map speaker labels to caller-supplied names in order, e.g.
-    ordered_labels[0] -> names[0]. Extra names beyond len(ordered_labels)
-    are ignored; fewer names than detected speakers leaves the remainder
-    unmapped, for the caller to merge over an existing/default mapping."""
-    return dict(zip(ordered_labels, names))
-
-
 def prompt_for_speakers(
     detected: list[str],
     existing: dict[str, str],

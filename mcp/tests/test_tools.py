@@ -155,7 +155,7 @@ def test_transcribe_resolves_relative_output_path_against_server_cwd(
     assert argv[-2:] == ["--vault-output", expected]
 
 
-def test_transcribe_forwards_speaker_names_as_repeated_flags(tmp_path):
+def test_transcribe_forwards_claude_guess_flag(tmp_path):
     audio = tmp_path / "audio.wav"
     audio.touch()
     mock_proc = _make_proc(b"", b"", 0)
@@ -163,27 +163,12 @@ def test_transcribe_forwards_speaker_names_as_repeated_flags(tmp_path):
     with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
         "subprocess.Popen", return_value=mock_proc
     ) as mock_popen:
-        server.transcribe(str(audio), 2, speaker_names=["Alice", "Bob"])
+        server.transcribe(str(audio), 2, claude_guess=True)
 
-    argv = mock_popen.call_args_list[0].args[0]
-    assert argv[-4:] == ["--speaker-names", "Alice", "--speaker-names", "Bob"]
-
-
-def test_transcribe_forwards_speaker_name_containing_comma_intact(tmp_path):
-    audio = tmp_path / "audio.wav"
-    audio.touch()
-    mock_proc = _make_proc(b"", b"", 0)
-
-    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
-        "subprocess.Popen", return_value=mock_proc
-    ) as mock_popen:
-        server.transcribe(str(audio), 2, speaker_names=["Smith, John"])
-
-    argv = mock_popen.call_args_list[0].args[0]
-    assert argv[-2:] == ["--speaker-names", "Smith, John"]
+    assert "--claude-guess" in mock_popen.call_args_list[0].args[0]
 
 
-def test_transcribe_omits_speaker_names_flag_by_default(tmp_path):
+def test_transcribe_omits_claude_guess_flag_by_default(tmp_path):
     audio = tmp_path / "audio.wav"
     audio.touch()
     mock_proc = _make_proc(b"", b"", 0)
@@ -193,10 +178,10 @@ def test_transcribe_omits_speaker_names_flag_by_default(tmp_path):
     ) as mock_popen:
         server.transcribe(str(audio), 2)
 
-    assert "--speaker-names" not in mock_popen.call_args_list[0].args[0]
+    assert "--claude-guess" not in mock_popen.call_args_list[0].args[0]
 
 
-def test_transcribe_forwards_both_speaker_names_and_output_path(tmp_path):
+def test_transcribe_forwards_both_claude_guess_and_output_path(tmp_path):
     audio = tmp_path / "audio.wav"
     audio.touch()
     target = tmp_path / "elsewhere" / "transcript.md"
@@ -205,13 +190,11 @@ def test_transcribe_forwards_both_speaker_names_and_output_path(tmp_path):
     with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
         "subprocess.Popen", return_value=mock_proc
     ) as mock_popen:
-        server.transcribe(
-            str(audio), 2, speaker_names=["Alice", "Bob"], output_path=str(target)
-        )
+        server.transcribe(str(audio), 2, claude_guess=True, output_path=str(target))
 
     argv = mock_popen.call_args_list[0].args[0]
-    assert "--speaker-names" in argv
-    assert argv.index("--speaker-names") < argv.index("--vault-output")
+    assert "--claude-guess" in argv
+    assert argv.index("--claude-guess") < argv.index("--vault-output")
     assert argv[-2:] == ["--vault-output", str(target.resolve())]
 
 

@@ -722,20 +722,21 @@ def _reap_caffeinate(watcher: subprocess.Popen, pid: int) -> None:
 def transcribe(
     file_path: str,
     num_speakers: int,
-    speaker_names: list[str] | None = None,
+    claude_guess: bool = False,
     output_path: str | None = None,
 ) -> dict:
     """Start a transcription and diarization job.
 
-    speaker_names, if given, assigns each name to a detected speaker in
-    order of first appearance in the recording (the first name to whoever
-    speaks first, and so on) instead of leaving speakers labeled with
-    opaque backend IDs (e.g. "SPEAKER_00") - those IDs do not reflect
-    speaking order themselves (WhisperX/mlx-whisper's come from
-    pyannote.audio's internal clustering, not chronological order), so
-    this is computed independently from each segment's start time. Fewer
-    names than detected speakers leaves the remainder unmapped; extra
-    names are ignored.
+    claude_guess, if true, asks the Claude CLI (which must be installed and
+    on PATH) to guess a real name or role for each detected speaker from
+    context clues in the transcript itself (introductions, names/roles
+    mentioned, etc.), instead of leaving speakers labeled with opaque
+    backend IDs (e.g. "SPEAKER_00"). Best-effort: unresolved speakers keep
+    their opaque label. Adds a `claude -p` call over roughly the first
+    2000 characters of the transcript, so it's slower and not
+    guaranteed - if the calling agent already has richer context (e.g. it
+    is itself Claude, or knows the participants some other way), reading
+    the returned transcript directly may work better than this flag.
 
     output_path, if given, overrides the configured vault destination for
     this job only (stored vault_path/vault_subdir/vault_filename_template
@@ -764,12 +765,8 @@ def transcribe(
         logger.error("no backend available for %s: %s", p, e)
         return {"error": f"no backend available: {e}"}
     argv = cmd + [str(p), str(num_speakers), "--yes"]
-    if speaker_names:
-        # Repeated flags rather than a joined string: a name containing a
-        # comma would otherwise be silently split into two names by the
-        # backend CLI's own comma-separated parsing.
-        for name in speaker_names:
-            argv += ["--speaker-names", name]
+    if claude_guess:
+        argv.append("--claude-guess")
     if resolved_output is not None:
         argv += ["--vault-output", resolved_output]
     proc = subprocess.Popen(

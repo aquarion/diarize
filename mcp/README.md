@@ -63,18 +63,20 @@ Windows — edit `%APPDATA%\Claude\claude_desktop_config.json`:
 
 ## Tools
 
-### `transcribe(file_path, num_speakers, speaker_names=None, output_path=None)`
+### `transcribe(file_path, num_speakers, claude_guess=False, output_path=None)`
 
 Starts a transcription job. Picks the Swift CLI on macOS (if built), otherwise the Python CLI.
 
-`speaker_names`, if given, assigns each name to a detected speaker in
-order of first appearance in the recording (the first name to whoever
-speaks first, and so on) instead of leaving speakers labeled with opaque
-backend IDs (e.g. `SPEAKER_00`) - those IDs do not reflect speaking order
-themselves (WhisperX/mlx-whisper's come from pyannote.audio's internal
-clustering, not chronological order), so this is computed independently
-from each segment's start time. Fewer names than detected speakers leaves
-the remainder unmapped; extra names are ignored.
+`claude_guess`, if true, asks the Claude CLI (which must be installed and
+on `PATH`) to guess a real name or role for each detected speaker from
+context clues in the transcript itself, instead of leaving speakers
+labeled with opaque backend IDs (e.g. `SPEAKER_00`). Best-effort -
+unresolved speakers keep their opaque label - and adds a `claude -p` call
+over roughly the first 2000 characters of the transcript, so it's slower
+and not guaranteed. If the calling agent already has richer context (e.g.
+it is itself Claude, or knows the participants some other way), reading
+the returned transcript directly and relabeling from that may work
+better than this flag.
 
 `output_path`, if given, overrides the configured vault destination for
 this job only - the transcript is written exactly there instead of being

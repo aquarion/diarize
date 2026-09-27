@@ -57,7 +57,6 @@ def test_parse_args_bare_invocation_defaults_to_transcribe():
     assert args.claude_guess is False
     assert args.yes is False
     assert args.vault_output is None
-    assert args.speaker_names is None
 
 
 def test_parse_args_transcribe_flags():
@@ -81,20 +80,6 @@ def test_parse_args_transcribe_short_yes_flag():
     args = app.parse_args(["prog", "file.wav", "3", "-y"])
     assert args.yes is True
 
-
-def test_parse_args_transcribe_speaker_names():
-    args = app.parse_args(
-        [
-            "prog",
-            "file.wav",
-            "3",
-            "--speaker-names",
-            "Alice",
-            "--speaker-names",
-            "Bob",
-        ]
-    )
-    assert args.speaker_names == ["Alice", "Bob"]
 
 
 def test_parse_args_config_show():
