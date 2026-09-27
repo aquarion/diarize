@@ -93,9 +93,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     transcribe_parser.add_argument(
         "--speaker-names",
-        metavar="NAME1,NAME2,...",
-        help="Comma-separated display names to assign to detected speakers,"
-        " in speaker-index order",
+        metavar="NAME",
+        action="append",
+        help="Display name to assign to a detected speaker, in speaker-index"
+        " order - repeat for each speaker (e.g. --speaker-names Alice"
+        " --speaker-names Bob)",
     )
     transcribe_parser.add_argument(
         "--yes",
@@ -287,8 +289,7 @@ def run_transcribe(args: argparse.Namespace) -> int:
 
     existing_map = load_speaker_mapping(speakers_path)
     if args.speaker_names:
-        names = [n.strip() for n in args.speaker_names.split(",") if n.strip()]
-        existing_map.update(assign_speaker_names(detected, names))
+        existing_map.update(assign_speaker_names(detected, args.speaker_names))
     if args.claude_guess:
         guesses = guess_speakers_with_claude(detected, segments, ctime_dt)
         for label, name in guesses.items():

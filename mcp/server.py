@@ -761,7 +761,11 @@ def transcribe(
         return {"error": f"no backend available: {e}"}
     argv = cmd + [str(p), str(num_speakers), "--yes"]
     if speaker_names:
-        argv += ["--speaker-names", ",".join(speaker_names)]
+        # Repeated flags rather than a joined string: a name containing a
+        # comma would otherwise be silently split into two names by the
+        # backend CLI's own comma-separated parsing.
+        for name in speaker_names:
+            argv += ["--speaker-names", name]
     if resolved_output is not None:
         argv += ["--vault-output", resolved_output]
     proc = subprocess.Popen(

@@ -155,7 +155,7 @@ def test_transcribe_resolves_relative_output_path_against_server_cwd(
     assert argv[-2:] == ["--vault-output", expected]
 
 
-def test_transcribe_forwards_speaker_names_as_comma_separated_flag(tmp_path):
+def test_transcribe_forwards_speaker_names_as_repeated_flags(tmp_path):
     audio = tmp_path / "audio.wav"
     audio.touch()
     mock_proc = _make_proc(b"", b"", 0)
@@ -166,7 +166,21 @@ def test_transcribe_forwards_speaker_names_as_comma_separated_flag(tmp_path):
         server.transcribe(str(audio), 2, speaker_names=["Alice", "Bob"])
 
     argv = mock_popen.call_args_list[0].args[0]
-    assert argv[-2:] == ["--speaker-names", "Alice,Bob"]
+    assert argv[-4:] == ["--speaker-names", "Alice", "--speaker-names", "Bob"]
+
+
+def test_transcribe_forwards_speaker_name_containing_comma_intact(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    mock_proc = _make_proc(b"", b"", 0)
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ) as mock_popen:
+        server.transcribe(str(audio), 2, speaker_names=["Smith, John"])
+
+    argv = mock_popen.call_args_list[0].args[0]
+    assert argv[-2:] == ["--speaker-names", "Smith, John"]
 
 
 def test_transcribe_omits_speaker_names_flag_by_default(tmp_path):

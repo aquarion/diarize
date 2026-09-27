@@ -63,9 +63,15 @@ Windows — edit `%APPDATA%\Claude\claude_desktop_config.json`:
 
 ## Tools
 
-### `transcribe(file_path, num_speakers, output_path=None)`
+### `transcribe(file_path, num_speakers, speaker_names=None, output_path=None)`
 
 Starts a transcription job. Picks the Swift CLI on macOS (if built), otherwise the Python CLI.
+
+`speaker_names`, if given, assigns each name to a detected speaker in
+speaker-index order (the first name to the first detected speaker label,
+sorted, and so on) instead of leaving speakers labeled with opaque backend
+IDs (e.g. `SPEAKER_00`). Fewer names than detected speakers leaves the
+remainder unmapped; extra names are ignored.
 
 `output_path`, if given, overrides the configured vault destination for
 this job only - the transcript is written exactly there instead of being

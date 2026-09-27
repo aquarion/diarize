@@ -84,9 +84,17 @@ def test_parse_args_transcribe_short_yes_flag():
 
 def test_parse_args_transcribe_speaker_names():
     args = app.parse_args(
-        ["prog", "file.wav", "3", "--speaker-names", "Alice,Bob,Chris"]
+        [
+            "prog",
+            "file.wav",
+            "3",
+            "--speaker-names",
+            "Alice",
+            "--speaker-names",
+            "Bob",
+        ]
     )
-    assert args.speaker_names == "Alice,Bob,Chris"
+    assert args.speaker_names == ["Alice", "Bob"]
 
 
 def test_parse_args_config_show():

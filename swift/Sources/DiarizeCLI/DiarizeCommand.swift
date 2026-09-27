@@ -29,8 +29,9 @@ struct Transcribe: AsyncParsableCommand {
     @Option(name: .long, help: "Path to config JSON file") var config: String?
     @Option(
         name: .long,
-        help: "Comma-separated display names to assign to detected speakers, in speaker-index order"
-    ) var speakerNames: String?
+        help: "Display name to assign to a detected speaker, in speaker-index order - repeat"
+            + " for each speaker (e.g. --speaker-names Alice --speaker-names Bob)"
+    ) var speakerNames: [String] = []
 
     mutating func run() async throws {
         // Line-buffer stdout instead of the libc default of full block
@@ -95,12 +96,8 @@ struct Transcribe: AsyncParsableCommand {
         var mapping = SpeakerMapper.loadMapping(from: mappingURL)
         let detected = Array(Set(pipelineResult.segments.map(\.speaker))).sorted()
 
-        if let speakerNames = speakerNames {
-            let names = speakerNames
-                .split(separator: ",")
-                .map { $0.trimmingCharacters(in: .whitespaces) }
-                .filter { !$0.isEmpty }
-            for (label, name) in SpeakerMapper.assignNames(detected: detected, names: names) {
+        if !speakerNames.isEmpty {
+            for (label, name) in SpeakerMapper.assignNames(detected: detected, names: speakerNames) {
                 mapping[label] = name
             }
         }
