@@ -29,8 +29,10 @@ struct Transcribe: AsyncParsableCommand {
     @Option(name: .long, help: "Path to config JSON file") var config: String?
     @Option(
         name: .long,
-        help: "Display name to assign to a detected speaker, in speaker-index order - repeat"
-            + " for each speaker (e.g. --speaker-names Alice --speaker-names Bob)"
+        help: ArgumentHelp(
+            "Display name to assign to a detected speaker, in speaker-index order - repeat"
+                + " for each speaker (e.g. --speaker-names Alice --speaker-names Bob)"
+        )
     ) var speakerNames: [String] = []
 
     mutating func run() async throws {
