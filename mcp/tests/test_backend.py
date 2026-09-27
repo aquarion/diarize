@@ -69,6 +69,27 @@ def test_raises_precise_error_when_python_found_but_uv_missing(tmp_path, monkeyp
             server.select_backend()
 
 
+def test_force_python_skips_swift_even_when_built(tmp_path, monkeypatch):
+    """An explicit engine override (e.g. aws) only exists in the python
+    backend, so it must bypass the swift-first shortcut on Darwin even when
+    the swift CLI is built."""
+    swift_cli = tmp_path / "swift" / ".build" / "release" / "diarize"
+    swift_cli.parent.mkdir(parents=True)
+    swift_cli.touch()
+    app_py = tmp_path / "python" / "app.py"
+    app_py.parent.mkdir(parents=True)
+    app_py.touch()
+    monkeypatch.setattr(server, "REPO_ROOT", tmp_path)
+
+    with patch("platform.system", return_value="Darwin"), patch(
+        "shutil.which", return_value="/usr/local/bin/uv"
+    ):
+        name, cmd = server.select_backend(force_python=True)
+
+    assert name == "python"
+    assert cmd[0] == "/usr/local/bin/uv"
+
+
 def test_raises_precise_error_when_nothing_available(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "REPO_ROOT", tmp_path)
 

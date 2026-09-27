@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -30,6 +31,10 @@ def _cfg(**overrides) -> AppConfig:
         extra_path=[],
         extra_lib_path=[],
         num_speakers=2,
+        aws_s3_bucket="",
+        aws_region="",
+        aws_profile="",
+        aws_s3_prefix="",
     )
     base.update(overrides)
     return AppConfig(**base)
@@ -510,3 +515,389 @@ def test_run_transcription_fatal_pipeline_error_propagates_without_fallback(
         transcribe.run_transcription_and_diarization(
             tmp_path / "a.wav", _cfg(backend="auto"), tmp_path / "out"
         )
+
+
+def test_run_transcription_dispatches_to_aws(tmp_path, monkeypatch):
+    called = {}
+    monkeypatch.setattr(
+        transcribe,
+        "run_aws_transcribe_pipeline",
+        lambda w, c, o: called.setdefault("ran", True),
+    )
+    transcribe.run_transcription_and_diarization(
+        tmp_path / "a.wav", _cfg(backend="aws"), tmp_path / "out"
+    )
+    assert called.get("ran") is True
+
+
+# --- _aws_segments_from_transcript ---
+
+
+def _aws_transcript(items, speaker_segments):
+    return {
+        "results": {
+            "items": items,
+            "speaker_labels": {"segments": speaker_segments},
+        }
+    }
+
+
+def test_aws_segments_from_transcript_merges_words_into_speaker_turns():
+    transcript = _aws_transcript(
+        items=[
+            {
+                "type": "pronunciation",
+                "start_time": "0.0",
+                "end_time": "0.5",
+                "alternatives": [{"content": "Hello"}],
+            },
+            {
+                "type": "pronunciation",
+                "start_time": "0.5",
+                "end_time": "1.0",
+                "alternatives": [{"content": "world"}],
+            },
+            {
+                "type": "pronunciation",
+                "start_time": "1.2",
+                "end_time": "1.5",
+                "alternatives": [{"content": "Hi"}],
+            },
+        ],
+        speaker_segments=[
+            {
+                "speaker_label": "spk_0",
+                "start_time": "0.0",
+                "end_time": "1.0",
+                "items": [
+                    {"start_time": "0.0", "end_time": "0.5", "speaker_label": "spk_0"},
+                    {"start_time": "0.5", "end_time": "1.0", "speaker_label": "spk_0"},
+                ],
+            },
+            {
+                "speaker_label": "spk_1",
+                "start_time": "1.2",
+                "end_time": "1.5",
+                "items": [
+                    {"start_time": "1.2", "end_time": "1.5", "speaker_label": "spk_1"},
+                ],
+            },
+        ],
+    )
+
+    segments = transcribe._aws_segments_from_transcript(transcript)
+
+    assert segments == [
+        {"start": 0.0, "end": 1.0, "text": "Hello world", "speaker": "SPEAKER_00"},
+        {"start": 1.2, "end": 1.5, "text": "Hi", "speaker": "SPEAKER_01"},
+    ]
+
+
+def test_aws_segments_from_transcript_attaches_punctuation_without_leading_space():
+    transcript = _aws_transcript(
+        items=[
+            {
+                "type": "pronunciation",
+                "start_time": "0.0",
+                "end_time": "0.5",
+                "alternatives": [{"content": "Hello"}],
+            },
+            {"type": "punctuation", "alternatives": [{"content": "."}]},
+        ],
+        speaker_segments=[
+            {
+                "speaker_label": "spk_0",
+                "start_time": "0.0",
+                "end_time": "0.5",
+                "items": [
+                    {"start_time": "0.0", "end_time": "0.5", "speaker_label": "spk_0"}
+                ],
+            }
+        ],
+    )
+
+    segments = transcribe._aws_segments_from_transcript(transcript)
+
+    assert segments == [
+        {"start": 0.0, "end": 0.5, "text": "Hello.", "speaker": "SPEAKER_00"}
+    ]
+
+
+# --- run_aws_transcribe_pipeline ---
+
+
+def _fake_boto3_session(*, job_status, transcript_payload, failure_reason=None):
+    """Build a MagicMock standing in for boto3, wired so
+    Session().client("s3"/"transcribe") return mocks whose calls we can
+    assert on, and get_transcription_job reports `job_status` immediately
+    (no real polling delay)."""
+    s3_client = MagicMock()
+    transcribe_client = MagicMock()
+
+    job_detail = {"TranscriptionJobStatus": job_status}
+    if job_status == "COMPLETED":
+        job_detail["Transcript"] = {"TranscriptFileUri": "https://example.com/t.json"}
+    if job_status == "FAILED":
+        job_detail["FailureReason"] = failure_reason
+    transcribe_client.get_transcription_job.return_value = {
+        "TranscriptionJob": job_detail
+    }
+
+    fake_boto3 = MagicMock()
+    session = MagicMock()
+    session.client.side_effect = lambda name: {
+        "s3": s3_client,
+        "transcribe": transcribe_client,
+    }[name]
+    fake_boto3.Session.return_value = session
+    return fake_boto3, s3_client, transcribe_client
+
+
+def test_run_aws_transcribe_pipeline_happy_path_writes_outputs_and_cleans_up(
+    tmp_path, monkeypatch
+):
+    transcript_payload = _aws_transcript(
+        items=[
+            {
+                "type": "pronunciation",
+                "start_time": "0.0",
+                "end_time": "0.5",
+                "alternatives": [{"content": "Hello"}],
+            }
+        ],
+        speaker_segments=[
+            {
+                "speaker_label": "spk_0",
+                "start_time": "0.0",
+                "end_time": "0.5",
+                "items": [
+                    {"start_time": "0.0", "end_time": "0.5", "speaker_label": "spk_0"}
+                ],
+            }
+        ],
+    )
+    fake_boto3, s3_client, transcribe_client = _fake_boto3_session(
+        job_status="COMPLETED", transcript_payload=transcript_payload
+    )
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+    monkeypatch.setattr(transcribe.time, "sleep", lambda _seconds: None)
+
+    fake_response = MagicMock()
+    fake_response.read.return_value = json.dumps(transcript_payload).encode()
+    fake_response.__enter__.return_value = fake_response
+    monkeypatch.setattr("transcribe.urllib.request.urlopen", lambda _url: fake_response)
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    wav_path = tmp_path / "a.wav"
+    wav_path.write_bytes(b"fake-audio")
+    cfg = _cfg(backend="aws", aws_s3_bucket="my-bucket", aws_s3_prefix="prefix/")
+
+    transcribe.run_aws_transcribe_pipeline(wav_path, cfg, out_dir)
+
+    s3_client.upload_file.assert_called_once()
+    upload_args = s3_client.upload_file.call_args[0]
+    assert upload_args[0] == str(wav_path)
+    assert upload_args[1] == "my-bucket"
+    uploaded_key = upload_args[2]
+    assert uploaded_key.startswith("prefix/")
+
+    s3_client.delete_object.assert_called_once_with(
+        Bucket="my-bucket", Key=uploaded_key
+    )
+
+    start_kwargs = transcribe_client.start_transcription_job.call_args.kwargs
+    assert start_kwargs["Media"]["MediaFileUri"] == f"s3://my-bucket/{uploaded_key}"
+    assert start_kwargs["Settings"]["ShowSpeakerLabels"] is True
+
+    json_path = out_dir / "a.json"
+    assert json.loads(json_path.read_text())["segments"] == [
+        {"start": 0.0, "end": 0.5, "text": "Hello", "speaker": "SPEAKER_00"}
+    ]
+
+
+def test_run_aws_transcribe_pipeline_raises_on_failed_job_and_still_cleans_up(
+    tmp_path, monkeypatch
+):
+    fake_boto3, s3_client, transcribe_client = _fake_boto3_session(
+        job_status="FAILED",
+        transcript_payload={},
+        failure_reason="Unsupported media format",
+    )
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+    monkeypatch.setattr(transcribe.time, "sleep", lambda _seconds: None)
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    wav_path = tmp_path / "a.wav"
+    wav_path.write_bytes(b"fake-audio")
+    cfg = _cfg(backend="aws", aws_s3_bucket="my-bucket")
+
+    with pytest.raises(RuntimeError, match="Unsupported media format"):
+        transcribe.run_aws_transcribe_pipeline(wav_path, cfg, out_dir)
+
+    s3_client.delete_object.assert_called_once()
+
+
+def test_run_aws_transcribe_pipeline_times_out_on_a_stuck_job_and_still_cleans_up(
+    tmp_path, monkeypatch
+):
+    """AWS Transcribe has no cancel API, so a job wedged server-side (never
+    reaching COMPLETED/FAILED) must not block this forever - it should give
+    up after AWS_POLL_TIMEOUT_SECONDS and still clean up the S3 upload."""
+    fake_boto3, s3_client, transcribe_client = _fake_boto3_session(
+        job_status="IN_PROGRESS", transcript_payload={}
+    )
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+    monkeypatch.setattr(transcribe.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(transcribe, "AWS_POLL_TIMEOUT_SECONDS", 0.0)
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    wav_path = tmp_path / "a.wav"
+    wav_path.write_bytes(b"fake-audio")
+    cfg = _cfg(backend="aws", aws_s3_bucket="my-bucket")
+
+    with pytest.raises(RuntimeError, match="did not complete within"):
+        transcribe.run_aws_transcribe_pipeline(wav_path, cfg, out_dir)
+
+    s3_client.delete_object.assert_called_once()
+
+
+def test_run_aws_transcribe_pipeline_uses_full_locale_for_bare_language_default(
+    tmp_path, monkeypatch
+):
+    """cfg.language defaults to the bare "en", which AWS Transcribe's
+    LanguageCode rejects outright - it needs a full locale like "en-US"."""
+    transcript_payload = _aws_transcript(
+        items=[
+            {
+                "type": "pronunciation",
+                "start_time": "0.0",
+                "end_time": "0.5",
+                "alternatives": [{"content": "Hello"}],
+            }
+        ],
+        speaker_segments=[
+            {
+                "speaker_label": "spk_0",
+                "start_time": "0.0",
+                "end_time": "0.5",
+                "items": [
+                    {"start_time": "0.0", "end_time": "0.5", "speaker_label": "spk_0"}
+                ],
+            }
+        ],
+    )
+    fake_boto3, s3_client, transcribe_client = _fake_boto3_session(
+        job_status="COMPLETED", transcript_payload=transcript_payload
+    )
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+    monkeypatch.setattr(transcribe.time, "sleep", lambda _seconds: None)
+
+    fake_response = MagicMock()
+    fake_response.read.return_value = json.dumps(transcript_payload).encode()
+    fake_response.__enter__.return_value = fake_response
+    monkeypatch.setattr("transcribe.urllib.request.urlopen", lambda _url: fake_response)
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    wav_path = tmp_path / "a.wav"
+    wav_path.write_bytes(b"fake-audio")
+    cfg = _cfg(backend="aws", aws_s3_bucket="my-bucket", language="en")
+
+    transcribe.run_aws_transcribe_pipeline(wav_path, cfg, out_dir)
+
+    start_kwargs = transcribe_client.start_transcription_job.call_args.kwargs
+    assert start_kwargs["LanguageCode"] == "en-US"
+
+
+def test_aws_language_code_passes_through_an_already_full_locale():
+    assert transcribe._aws_language_code("pt-PT") == "pt-PT"
+
+
+def test_aws_language_code_passes_through_an_unmapped_bare_code():
+    assert transcribe._aws_language_code("xx") == "xx"
+
+
+def test_run_aws_transcribe_pipeline_rejects_too_many_speakers_before_uploading(
+    tmp_path, monkeypatch
+):
+    fake_boto3, s3_client, transcribe_client = _fake_boto3_session(
+        job_status="COMPLETED", transcript_payload={}
+    )
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    wav_path = tmp_path / "a.wav"
+    wav_path.write_bytes(b"fake-audio")
+    cfg = _cfg(backend="aws", aws_s3_bucket="my-bucket", num_speakers=11)
+
+    with pytest.raises(RuntimeError, match="at most 10 speakers"):
+        transcribe.run_aws_transcribe_pipeline(wav_path, cfg, out_dir)
+
+    s3_client.upload_file.assert_not_called()
+    transcribe_client.start_transcription_job.assert_not_called()
+
+
+def test_run_aws_transcribe_pipeline_cleanup_failure_does_not_mask_job_failure(
+    tmp_path, monkeypatch, capsys
+):
+    """A delete_object failure during cleanup must not replace the real
+    AWS Transcribe job failure with a less useful cleanup error."""
+    fake_boto3, s3_client, transcribe_client = _fake_boto3_session(
+        job_status="FAILED",
+        transcript_payload={},
+        failure_reason="Unsupported media format",
+    )
+    s3_client.delete_object.side_effect = RuntimeError("AccessDenied")
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+    monkeypatch.setattr(transcribe.time, "sleep", lambda _seconds: None)
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    wav_path = tmp_path / "a.wav"
+    wav_path.write_bytes(b"fake-audio")
+    cfg = _cfg(backend="aws", aws_s3_bucket="my-bucket")
+
+    with pytest.raises(RuntimeError, match="Unsupported media format"):
+        transcribe.run_aws_transcribe_pipeline(wav_path, cfg, out_dir)
+
+    assert "Failed to delete temporary S3 object" in capsys.readouterr().err
+
+
+def test_run_aws_transcribe_pipeline_warns_when_speaker_labels_are_empty(
+    tmp_path, monkeypatch, capsys
+):
+    transcript_payload = _aws_transcript(
+        items=[
+            {
+                "type": "pronunciation",
+                "start_time": "0.0",
+                "end_time": "0.5",
+                "alternatives": [{"content": "Hello"}],
+            }
+        ],
+        speaker_segments=[],
+    )
+    fake_boto3, s3_client, transcribe_client = _fake_boto3_session(
+        job_status="COMPLETED", transcript_payload=transcript_payload
+    )
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+    monkeypatch.setattr(transcribe.time, "sleep", lambda _seconds: None)
+
+    fake_response = MagicMock()
+    fake_response.read.return_value = json.dumps(transcript_payload).encode()
+    fake_response.__enter__.return_value = fake_response
+    monkeypatch.setattr("transcribe.urllib.request.urlopen", lambda _url: fake_response)
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    wav_path = tmp_path / "a.wav"
+    wav_path.write_bytes(b"fake-audio")
+    cfg = _cfg(backend="aws", aws_s3_bucket="my-bucket")
+
+    transcribe.run_aws_transcribe_pipeline(wav_path, cfg, out_dir)
+
+    assert "no speaker labels" in capsys.readouterr().err

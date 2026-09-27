@@ -7,6 +7,9 @@ import platform
 import re
 import subprocess
 import sys
+import time
+import urllib.request
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
@@ -500,13 +503,22 @@ def run_assemblyai_pipeline(wav_path: Path, cfg: AppConfig, out_dir: Path) -> No
             }
         )
 
-    base_name = wav_path.stem
+    json_path = _write_segment_outputs(segments, cfg.language, out_dir, wav_path.stem)
+    print(f"    saved: {json_path}")
+
+
+def _write_segment_outputs(
+    segments: list[dict[str, Any]], language: str, out_dir: Path, base_name: str
+) -> Path:
+    """Write the json/txt/srt/vtt artifacts shared by every cloud-API backend
+    (AssemblyAI, AWS Transcribe) from a list of {"start", "end", "text",
+    "speaker"} segments. Returns the json path."""
     json_path = out_dir / f"{base_name}.json"
     txt_path = out_dir / f"{base_name}.txt"
     srt_path = out_dir / f"{base_name}.srt"
     vtt_path = out_dir / f"{base_name}.vtt"
 
-    payload = {"segments": segments, "language": cfg.language}
+    payload = {"segments": segments, "language": language}
     json_path.write_text(json.dumps(payload, indent=2) + "\n")
     txt_path.write_text("\n".join(seg["text"] for seg in segments) + "\n")
 
@@ -536,6 +548,193 @@ def run_assemblyai_pipeline(wav_path: Path, cfg: AppConfig, out_dir: Path) -> No
 
     srt_path.write_text("\n".join(srt_lines).rstrip() + "\n")
     vtt_path.write_text("\n".join(vtt_lines).rstrip() + "\n")
+    return json_path
+
+
+# AWS Transcribe reports job status via polling rather than a callback or
+# streamed progress - this is how often we ask.
+AWS_POLL_INTERVAL_SECONDS = 5.0
+
+# AWS Transcribe has no API to cancel a running job, so this can't stop the
+# job itself - only how long the local process waits for it. Without this,
+# a job wedged server-side (or one that never reaches a terminal status)
+# would block the MCP subprocess/CLI forever. Generous, since a long
+# recording can legitimately take a while to transcribe.
+AWS_POLL_TIMEOUT_SECONDS = 7200.0
+
+# AWS Transcribe's LanguageCode requires a full locale (e.g. "en-US"), while
+# `cfg.language` (shared with the other backends) is normally a bare ISO
+# code like "en" - most visibly the repo's own default, which would
+# otherwise make the very first job on a default config fail. Maps each
+# bare code to one commonly-used locale; a value that already contains a
+# region (has a "-") is assumed to be a valid AWS locale and passed through.
+_AWS_LANGUAGE_CODE_DEFAULTS: dict[str, str] = {
+    "en": "en-US",
+    "es": "es-US",
+    "fr": "fr-FR",
+    "de": "de-DE",
+    "it": "it-IT",
+    "pt": "pt-BR",
+    "nl": "nl-NL",
+    "ja": "ja-JP",
+    "ko": "ko-KR",
+    "zh": "zh-CN",
+    "hi": "hi-IN",
+    "ar": "ar-SA",
+}
+
+
+def _aws_language_code(language: str) -> str:
+    if "-" in language:
+        return language
+    return _AWS_LANGUAGE_CODE_DEFAULTS.get(language, language)
+
+
+# AWS Transcribe's ShowSpeakerLabels only accepts a MaxSpeakerLabels of 2-10;
+# a value outside that range fails server-side with a much less legible
+# ValidationException, so it's checked locally for an earlier, clearer error.
+AWS_MIN_SPEAKER_LABELS = 2
+AWS_MAX_SPEAKER_LABELS = 10
+
+
+def _aws_word_speakers(speaker_segments: list[dict[str, Any]]) -> dict[str, str]:
+    """Map each pronunciation item's start_time (AWS's own string key) to a
+    normalized SPEAKER_NN label, numbered in order of first appearance."""
+    label_index: dict[str, int] = {}
+    mapping: dict[str, str] = {}
+    for seg in speaker_segments:
+        raw_label = seg["speaker_label"]
+        if raw_label not in label_index:
+            label_index[raw_label] = len(label_index)
+        norm_label = f"SPEAKER_{label_index[raw_label]:02d}"
+        for item in seg.get("items", []):
+            mapping[item["start_time"]] = norm_label
+    return mapping
+
+
+def _aws_segments_from_transcript(transcript: dict[str, Any]) -> list[dict[str, Any]]:
+    """Merge AWS Transcribe's word-level items and speaker-label segments into
+    per-speaker-turn segments shaped like run_assemblyai_pipeline's, so both
+    can share _write_segment_outputs."""
+    results = transcript.get("results", {})
+    items = results.get("items", [])
+    word_speakers = _aws_word_speakers(
+        results.get("speaker_labels", {}).get("segments", [])
+    )
+
+    segments: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for item in items:
+        content = item["alternatives"][0]["content"]
+        if item.get("type") == "punctuation":
+            if current is not None:
+                current["text"] += content
+            continue
+        start = float(item["start_time"])
+        end = float(item["end_time"])
+        speaker = word_speakers.get(item["start_time"], "SPEAKER_00")
+        if current is None or current["speaker"] != speaker:
+            if current is not None:
+                segments.append(current)
+            current = {"start": start, "end": end, "text": content, "speaker": speaker}
+        else:
+            current["text"] += " " + content
+            current["end"] = end
+    if current is not None:
+        segments.append(current)
+    return segments
+
+
+def run_aws_transcribe_pipeline(wav_path: Path, cfg: AppConfig, out_dir: Path) -> None:
+    try:
+        import boto3  # type: ignore
+    except ImportError as err:
+        raise RuntimeError(
+            "boto3 package is not installed. Run: pip install boto3"
+        ) from err
+
+    max_speaker_labels = max(cfg.num_speakers, AWS_MIN_SPEAKER_LABELS)
+    if max_speaker_labels > AWS_MAX_SPEAKER_LABELS:
+        raise RuntimeError(
+            f"AWS Transcribe supports at most {AWS_MAX_SPEAKER_LABELS} speakers "
+            f"(num_speakers={cfg.num_speakers} requested)."
+        )
+
+    session = boto3.Session(
+        profile_name=cfg.aws_profile or None,
+        region_name=cfg.aws_region or None,
+    )
+    s3 = session.client("s3")
+    transcribe_client = session.client("transcribe")
+
+    job_name = f"diarize-{uuid.uuid4()}"
+    key = f"{cfg.aws_s3_prefix}{job_name}{wav_path.suffix}"
+
+    print("==> Uploading audio to S3 for AWS Transcribe")
+    print(f"    s3://{cfg.aws_s3_bucket}/{key}")
+    s3.upload_file(str(wav_path), cfg.aws_s3_bucket, key)
+
+    try:
+        transcribe_client.start_transcription_job(
+            TranscriptionJobName=job_name,
+            Media={"MediaFileUri": f"s3://{cfg.aws_s3_bucket}/{key}"},
+            LanguageCode=_aws_language_code(cfg.language),
+            Settings={
+                "ShowSpeakerLabels": True,
+                "MaxSpeakerLabels": max_speaker_labels,
+            },
+        )
+
+        print("==> Waiting for AWS Transcribe job to complete")
+        deadline = time.monotonic() + AWS_POLL_TIMEOUT_SECONDS
+        while True:
+            job = transcribe_client.get_transcription_job(
+                TranscriptionJobName=job_name
+            )["TranscriptionJob"]
+            status = job["TranscriptionJobStatus"]
+            if status == "COMPLETED":
+                break
+            if status == "FAILED":
+                reason = job.get("FailureReason", "unknown error")
+                raise RuntimeError(f"AWS Transcribe job failed: {reason}")
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"AWS Transcribe job {job_name} did not complete within "
+                    f"{AWS_POLL_TIMEOUT_SECONDS:.0f}s (last status: {status}). "
+                    "The job may still be running in AWS - check/delete it "
+                    "manually if needed."
+                )
+            time.sleep(AWS_POLL_INTERVAL_SECONDS)
+
+        transcript_uri = job["Transcript"]["TranscriptFileUri"]
+        with urllib.request.urlopen(transcript_uri) as resp:
+            transcript = json.loads(resp.read())
+    finally:
+        # Swallow (rather than raise) a cleanup failure here: it must never
+        # replace a real exception from the try body above (e.g. the job
+        # FAILED, or urlopen/json errors) with a less useful one about a
+        # leftover S3 object.
+        try:
+            s3.delete_object(Bucket=cfg.aws_s3_bucket, Key=key)
+        except Exception as cleanup_err:  # noqa: BLE001
+            print(
+                f"!! Failed to delete temporary S3 object s3://{cfg.aws_s3_bucket}/{key}: "
+                f"{cleanup_err}",
+                file=sys.stderr,
+            )
+
+    if not transcript.get("results", {}).get("speaker_labels", {}).get("segments"):
+        print(
+            "!! AWS Transcribe returned no speaker labels - diarization did not"
+            " run, and the whole transcript will be attributed to SPEAKER_00.",
+            file=sys.stderr,
+        )
+
+    segments = _aws_segments_from_transcript(transcript)
+    if not segments:
+        raise RuntimeError("AWS Transcribe returned no segments.")
+
+    json_path = _write_segment_outputs(segments, cfg.language, out_dir, wav_path.stem)
     print(f"    saved: {json_path}")
 
 
@@ -546,6 +745,10 @@ def run_transcription_and_diarization(
 
     if backend == "assemblyai":
         run_assemblyai_pipeline(wav_path, cfg, out_dir)
+        return
+
+    if backend == "aws":
+        run_aws_transcribe_pipeline(wav_path, cfg, out_dir)
         return
 
     prefer_mlx = backend == "mlx" or (backend == "auto" and is_apple_silicon())

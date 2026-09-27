@@ -232,6 +232,34 @@ def test_transcribe_omits_vault_output_flag_by_default(tmp_path):
     assert "--vault-output" not in mock_popen.call_args_list[0].args[0]
 
 
+def test_transcribe_engine_override_forces_python_and_appends_backend_flag(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    mock_proc = _make_proc(b"", b"", 0)
+
+    with patch(
+        "server.select_backend", return_value=("python", ["/usr/bin/uv"])
+    ) as mock_select, patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+        server.transcribe(str(audio), 2, engine="aws")
+
+    mock_select.assert_called_once_with(force_python=True)
+    argv = mock_popen.call_args_list[0].args[0]
+    assert argv[-2:] == ["--backend", "aws"]
+
+
+def test_transcribe_without_engine_does_not_force_python(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    mock_proc = _make_proc(b"", b"", 0)
+
+    with patch(
+        "server.select_backend", return_value=("swift", ["/bin/echo"])
+    ) as mock_select, patch("subprocess.Popen", return_value=mock_proc):
+        server.transcribe(str(audio), 2)
+
+    mock_select.assert_called_once_with(force_python=False)
+
+
 def test_kill_after_collector_error_signals_process_group(monkeypatch):
     # os.killpg/getpgid and signal.SIGKILL are all POSIX-only, so this test
     # forces the POSIX branch and fakes all three into existence (create=True)
@@ -2272,6 +2300,64 @@ def test_get_config_unknown_key():
 
     assert "error" in result
     assert "Valid keys" in result["error"]
+
+
+def test_get_config_falls_back_to_python_for_key_swift_does_not_know():
+    """aws_s3_bucket (and other python-only keys) aren't in swift's
+    AppConfig.validKeys, even though both backends share the same
+    config.json - get_config should retry on python rather than surfacing
+    swift's "unknown key" error for a key that's perfectly valid there."""
+    unknown_key_result = MagicMock(
+        stdout="",
+        stderr="!! Unknown config key: aws_s3_bucket\n    Valid keys: language\n",
+        returncode=2,
+    )
+    python_success_result = MagicMock(stdout="my-bucket\n", stderr="", returncode=0)
+    with patch(
+        "server.select_backend",
+        side_effect=[
+            ("swift", ["/bin/echo"]),
+            ("python", ["/usr/bin/uv", "run", "app.py"]),
+        ],
+    ), patch(
+        "subprocess.run", side_effect=[unknown_key_result, python_success_result]
+    ) as mock_run:
+        result = server.get_config("aws_s3_bucket")
+
+    assert result == {"key": "aws_s3_bucket", "value": "my-bucket"}
+    assert mock_run.call_count == 2
+    assert mock_run.call_args_list[1][0][0] == [
+        "/usr/bin/uv",
+        "run",
+        "app.py",
+        "config",
+        "get",
+        "aws_s3_bucket",
+    ]
+
+
+def test_set_config_falls_back_to_python_for_key_swift_does_not_know():
+    unknown_key_result = MagicMock(
+        stdout="",
+        stderr="!! Unknown config key: aws_s3_bucket\n    Valid keys: language\n",
+        returncode=2,
+    )
+    python_success_result = MagicMock(
+        stdout="==> Set aws_s3_bucket = my-bucket in /tmp/config.json\n",
+        stderr="",
+        returncode=0,
+    )
+    with patch(
+        "server.select_backend",
+        side_effect=[
+            ("swift", ["/bin/echo"]),
+            ("python", ["/usr/bin/uv", "run", "app.py"]),
+        ],
+    ), patch("subprocess.run", side_effect=[unknown_key_result, python_success_result]):
+        result = server.set_config("aws_s3_bucket", "my-bucket")
+
+    assert result["status"] == "ok"
+    assert "aws_s3_bucket = my-bucket" in result["message"]
 
 
 def test_get_config_no_backend(tmp_path, monkeypatch):
