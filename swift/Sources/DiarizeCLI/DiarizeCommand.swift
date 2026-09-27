@@ -27,6 +27,10 @@ struct Transcribe: AsyncParsableCommand {
     @Flag(name: [.customShort("y"), .long], help: "Non-interactive: accept all defaults") var yes = false
     @Option(name: .long, help: "Override vault output path for this file") var vaultOutput: String?
     @Option(name: .long, help: "Path to config JSON file") var config: String?
+    @Option(
+        name: .long,
+        help: "Comma-separated display names to assign to detected speakers, in speaker-index order"
+    ) var speakerNames: String?
 
     mutating func run() async throws {
         // Line-buffer stdout instead of the libc default of full block
@@ -90,6 +94,16 @@ struct Transcribe: AsyncParsableCommand {
         let mappingURL = pipelineResult.outputDirectoryURL.appendingPathComponent("speakers.json")
         var mapping = SpeakerMapper.loadMapping(from: mappingURL)
         let detected = Array(Set(pipelineResult.segments.map(\.speaker))).sorted()
+
+        if let speakerNames = speakerNames {
+            let names = speakerNames
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            for (label, name) in SpeakerMapper.assignNames(detected: detected, names: names) {
+                mapping[label] = name
+            }
+        }
 
         if claudeGuess && !cfg.anthropicAPIKey.isEmpty {
             print("==> Asking Claude to guess speaker names...")

@@ -720,9 +720,18 @@ def _reap_caffeinate(watcher: subprocess.Popen, pid: int) -> None:
 
 @mcp.tool()
 def transcribe(
-    file_path: str, num_speakers: int, output_path: str | None = None
+    file_path: str,
+    num_speakers: int,
+    speaker_names: list[str] | None = None,
+    output_path: str | None = None,
 ) -> dict:
     """Start a transcription and diarization job.
+
+    speaker_names, if given, assigns each name to a detected speaker in
+    speaker-index order (the first name to the first detected speaker
+    label, sorted, and so on) instead of leaving speakers labeled with
+    opaque backend IDs (e.g. "SPEAKER_00"). Fewer names than detected
+    speakers leaves the remainder unmapped; extra names are ignored.
 
     output_path, if given, overrides the configured vault destination for
     this job only (stored vault_path/vault_subdir/vault_filename_template
@@ -751,6 +760,8 @@ def transcribe(
         logger.error("no backend available for %s: %s", p, e)
         return {"error": f"no backend available: {e}"}
     argv = cmd + [str(p), str(num_speakers), "--yes"]
+    if speaker_names:
+        argv += ["--speaker-names", ",".join(speaker_names)]
     if resolved_output is not None:
         argv += ["--vault-output", resolved_output]
     proc = subprocess.Popen(

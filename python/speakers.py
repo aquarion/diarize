@@ -120,6 +120,14 @@ def guess_speakers_with_claude(
     return guesses
 
 
+def assign_speaker_names(detected: list[str], names: list[str]) -> dict[str, str]:
+    """Map sorted detected speaker labels to caller-supplied names in order,
+    e.g. detected[0] -> names[0]. Extra names beyond len(detected) are
+    ignored; fewer names than detected speakers leaves the remainder
+    unmapped, for the caller to merge over an existing/default mapping."""
+    return dict(zip(detected, names))
+
+
 def prompt_for_speakers(
     detected: list[str],
     existing: dict[str, str],

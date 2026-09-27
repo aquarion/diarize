@@ -12,6 +12,15 @@ public enum SpeakerMapper {
         }
     }
 
+    /// Maps sorted detected speaker labels to caller-supplied names in
+    /// order, e.g. detected[0] -> names[0]. Extra names beyond
+    /// detected.count are ignored; fewer names than detected speakers
+    /// leaves the remainder unmapped, for the caller to merge over an
+    /// existing/default mapping.
+    public static func assignNames(detected: [String], names: [String]) -> [String: String] {
+        Dictionary(uniqueKeysWithValues: zip(detected, names))
+    }
+
     public static func coalesce(segments: [Segment], mapping: [String: String]) -> [Block] {
         var blocks: [Block] = []
         for seg in segments {

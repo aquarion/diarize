@@ -155,6 +155,52 @@ def test_transcribe_resolves_relative_output_path_against_server_cwd(
     assert argv[-2:] == ["--vault-output", expected]
 
 
+def test_transcribe_forwards_speaker_names_as_comma_separated_flag(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    mock_proc = _make_proc(b"", b"", 0)
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ) as mock_popen:
+        server.transcribe(str(audio), 2, speaker_names=["Alice", "Bob"])
+
+    argv = mock_popen.call_args_list[0].args[0]
+    assert argv[-2:] == ["--speaker-names", "Alice,Bob"]
+
+
+def test_transcribe_omits_speaker_names_flag_by_default(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    mock_proc = _make_proc(b"", b"", 0)
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ) as mock_popen:
+        server.transcribe(str(audio), 2)
+
+    assert "--speaker-names" not in mock_popen.call_args_list[0].args[0]
+
+
+def test_transcribe_forwards_both_speaker_names_and_output_path(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    target = tmp_path / "elsewhere" / "transcript.md"
+    mock_proc = _make_proc(b"", b"", 0)
+
+    with patch("server.select_backend", return_value=("swift", ["/bin/echo"])), patch(
+        "subprocess.Popen", return_value=mock_proc
+    ) as mock_popen:
+        server.transcribe(
+            str(audio), 2, speaker_names=["Alice", "Bob"], output_path=str(target)
+        )
+
+    argv = mock_popen.call_args_list[0].args[0]
+    assert "--speaker-names" in argv
+    assert argv.index("--speaker-names") < argv.index("--vault-output")
+    assert argv[-2:] == ["--vault-output", str(target.resolve())]
+
+
 def test_transcribe_omits_vault_output_flag_by_default(tmp_path):
     audio = tmp_path / "audio.wav"
     audio.touch()

@@ -44,6 +44,24 @@ final class SpeakerMapperTests: XCTestCase {
         XCTAssertEqual(blocks[0].text, "Hello.")
     }
 
+    func testAssignNamesMapsInSortedIndexOrder() {
+        let result = SpeakerMapper.assignNames(
+            detected: ["SPEAKER_00", "SPEAKER_01", "SPEAKER_02"],
+            names: ["Alice", "Bob", "Chris"]
+        )
+        XCTAssertEqual(result, ["SPEAKER_00": "Alice", "SPEAKER_01": "Bob", "SPEAKER_02": "Chris"])
+    }
+
+    func testAssignNamesFewerNamesThanDetectedLeavesRemainderUnmapped() {
+        let result = SpeakerMapper.assignNames(detected: ["SPEAKER_00", "SPEAKER_01"], names: ["Alice"])
+        XCTAssertEqual(result, ["SPEAKER_00": "Alice"])
+    }
+
+    func testAssignNamesExtraNamesAreIgnored() {
+        let result = SpeakerMapper.assignNames(detected: ["SPEAKER_00"], names: ["Alice", "Bob"])
+        XCTAssertEqual(result, ["SPEAKER_00": "Alice"])
+    }
+
     func testSpeakerMappingRoundTrip() throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("speakers_test.json")
         defer { try? FileManager.default.removeItem(at: url) }

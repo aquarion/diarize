@@ -24,6 +24,7 @@ from pathlib import Path
 from media import MediaProbeError, extract_audio, has_video_stream
 from render import make_vault_target, render_markdown, terminal_link
 from speakers import (
+    assign_speaker_names,
     coalesce_segments,
     guess_speakers_with_claude,
     load_speaker_mapping,
@@ -89,6 +90,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--claude-guess",
         action="store_true",
         help="Ask the Claude CLI to guess speaker names from the transcript",
+    )
+    transcribe_parser.add_argument(
+        "--speaker-names",
+        metavar="NAME1,NAME2,...",
+        help="Comma-separated display names to assign to detected speakers,"
+        " in speaker-index order",
     )
     transcribe_parser.add_argument(
         "--yes",
@@ -279,6 +286,9 @@ def run_transcribe(args: argparse.Namespace) -> int:
     detected = sorted({str(seg.get("speaker") or "UNKNOWN") for seg in segments})
 
     existing_map = load_speaker_mapping(speakers_path)
+    if args.speaker_names:
+        names = [n.strip() for n in args.speaker_names.split(",") if n.strip()]
+        existing_map.update(assign_speaker_names(detected, names))
     if args.claude_guess:
         guesses = guess_speakers_with_claude(detected, segments, ctime_dt)
         for label, name in guesses.items():

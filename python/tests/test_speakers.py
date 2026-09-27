@@ -137,6 +137,34 @@ def test_coalesce_segments_missing_speaker_key_defaults_to_unknown():
     assert blocks == [("UNKNOWN", 0.0, "hi")]
 
 
+# --- assign_speaker_names ---
+
+
+def test_assign_speaker_names_maps_in_sorted_index_order():
+    result = speakers.assign_speaker_names(
+        ["SPEAKER_00", "SPEAKER_01", "SPEAKER_02"], ["Alice", "Bob", "Chris"]
+    )
+    assert result == {
+        "SPEAKER_00": "Alice",
+        "SPEAKER_01": "Bob",
+        "SPEAKER_02": "Chris",
+    }
+
+
+def test_assign_speaker_names_fewer_names_than_detected_leaves_remainder_unmapped():
+    result = speakers.assign_speaker_names(["SPEAKER_00", "SPEAKER_01"], ["Alice"])
+    assert result == {"SPEAKER_00": "Alice"}
+
+
+def test_assign_speaker_names_extra_names_are_ignored():
+    result = speakers.assign_speaker_names(["SPEAKER_00"], ["Alice", "Bob"])
+    assert result == {"SPEAKER_00": "Alice"}
+
+
+def test_assign_speaker_names_empty_names_returns_empty_mapping():
+    assert speakers.assign_speaker_names(["SPEAKER_00", "SPEAKER_01"], []) == {}
+
+
 # --- prompt_for_speakers (non-interactive) ---
 
 
