@@ -739,6 +739,31 @@ def test_run_aws_transcribe_pipeline_raises_on_failed_job_and_still_cleans_up(
     s3_client.delete_object.assert_called_once()
 
 
+def test_run_aws_transcribe_pipeline_times_out_on_a_stuck_job_and_still_cleans_up(
+    tmp_path, monkeypatch
+):
+    """AWS Transcribe has no cancel API, so a job wedged server-side (never
+    reaching COMPLETED/FAILED) must not block this forever - it should give
+    up after AWS_POLL_TIMEOUT_SECONDS and still clean up the S3 upload."""
+    fake_boto3, s3_client, transcribe_client = _fake_boto3_session(
+        job_status="IN_PROGRESS", transcript_payload={}
+    )
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+    monkeypatch.setattr(transcribe.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(transcribe, "AWS_POLL_TIMEOUT_SECONDS", 0.0)
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    wav_path = tmp_path / "a.wav"
+    wav_path.write_bytes(b"fake-audio")
+    cfg = _cfg(backend="aws", aws_s3_bucket="my-bucket")
+
+    with pytest.raises(RuntimeError, match="did not complete within"):
+        transcribe.run_aws_transcribe_pipeline(wav_path, cfg, out_dir)
+
+    s3_client.delete_object.assert_called_once()
+
+
 def test_run_aws_transcribe_pipeline_uses_full_locale_for_bare_language_default(
     tmp_path, monkeypatch
 ):

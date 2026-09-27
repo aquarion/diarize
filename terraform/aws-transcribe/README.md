@@ -19,21 +19,30 @@ not a shared/CI-managed one.
 ## After applying
 
 1. Install the `aws` extra (`boto3`), which the app only imports lazily
-   when the `aws` backend actually runs: `uv sync --extra aws` (or
-   `pip install boto3`/`pip install ".[aws]"` outside uv).
+   when the `aws` backend actually runs, from the `python/` project (there's
+   no Python project under `terraform/aws-transcribe/` itself):
+
+   ```sh
+   cd ../../python && uv sync --extra aws
+   ```
+
+   (or `pip install boto3`/`pip install ".[aws]"` from `python/` outside uv).
 2. Attach the `iam_policy_arn` output to whatever IAM user/role you'll
    authenticate as (the app itself relies on boto3's normal credential chain
    - env vars, `~/.aws/credentials`, SSO profile, etc; it doesn't manage
    credentials).
-3. Set the bucket in diarize's config:
+3. Set the bucket in diarize's config (there's no installed `diarize`
+   executable for the python backend - invoke `app.py` via `uv run`, as
+   documented in `python/README.md`):
 
    ```sh
-   diarize config set aws_s3_bucket <bucket_name output>
-   diarize config set aws_region <aws_region>
+   uv run --directory ../../python app.py config set aws_s3_bucket <bucket_name output>
+   uv run --directory ../../python app.py config set aws_region <aws_region>
    ```
 
 4. Run a transcription with the `aws` engine, either as the default backend
-   (`diarize config set backend aws`) or per-call (`--backend aws`).
+   (`uv run --directory ../../python app.py config set backend aws`) or
+   per-call (`uv run --directory ../../python app.py ... --backend aws`).
 
 ## Teardown
 

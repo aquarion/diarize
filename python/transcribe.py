@@ -555,6 +555,13 @@ def _write_segment_outputs(
 # streamed progress - this is how often we ask.
 AWS_POLL_INTERVAL_SECONDS = 5.0
 
+# AWS Transcribe has no API to cancel a running job, so this can't stop the
+# job itself - only how long the local process waits for it. Without this,
+# a job wedged server-side (or one that never reaches a terminal status)
+# would block the MCP subprocess/CLI forever. Generous, since a long
+# recording can legitimately take a while to transcribe.
+AWS_POLL_TIMEOUT_SECONDS = 7200.0
+
 # AWS Transcribe's LanguageCode requires a full locale (e.g. "en-US"), while
 # `cfg.language` (shared with the other backends) is normally a bare ISO
 # code like "en" - most visibly the repo's own default, which would
@@ -679,6 +686,7 @@ def run_aws_transcribe_pipeline(wav_path: Path, cfg: AppConfig, out_dir: Path) -
         )
 
         print("==> Waiting for AWS Transcribe job to complete")
+        deadline = time.monotonic() + AWS_POLL_TIMEOUT_SECONDS
         while True:
             job = transcribe_client.get_transcription_job(
                 TranscriptionJobName=job_name
@@ -689,6 +697,13 @@ def run_aws_transcribe_pipeline(wav_path: Path, cfg: AppConfig, out_dir: Path) -
             if status == "FAILED":
                 reason = job.get("FailureReason", "unknown error")
                 raise RuntimeError(f"AWS Transcribe job failed: {reason}")
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"AWS Transcribe job {job_name} did not complete within "
+                    f"{AWS_POLL_TIMEOUT_SECONDS:.0f}s (last status: {status}). "
+                    "The job may still be running in AWS - check/delete it "
+                    "manually if needed."
+                )
             time.sleep(AWS_POLL_INTERVAL_SECONDS)
 
         transcript_uri = job["Transcript"]["TranscriptFileUri"]

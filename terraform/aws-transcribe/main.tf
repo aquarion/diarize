@@ -59,6 +59,7 @@ data "aws_iam_policy_document" "diarize_aws_transcribe" {
       "s3:GetObject",
       "s3:DeleteObject",
       "s3:AbortMultipartUpload",
+      "s3:ListMultipartUploadParts",
     ]
     resources = ["${aws_s3_bucket.audio_staging.arn}/*"]
   }
