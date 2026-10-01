@@ -37,7 +37,7 @@ public final class AppState: ObservableObject {
         Task { @MainActor in
             do {
                 let transcriber = WhisperKitTranscriber()
-                try await transcriber.loadModel(config.whisperkitModel)
+                try await transcriber.loadModel(config.whisperkitModel, language: config.language)
                 let diarizer = SpeakerKitDiarizer()
                 try await diarizer.loadModel()
                 let pipeline = Pipeline(transcriber: transcriber, diarizer: diarizer)

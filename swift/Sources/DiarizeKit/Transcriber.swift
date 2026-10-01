@@ -3,11 +3,15 @@ import WhisperKit
 
 public actor WhisperKitTranscriber: TranscriberProtocol {
     private var whisperKit: WhisperKit?
+    private var language: String?
 
     public init() {}
 
-    public func loadModel(_ model: String) async throws {
+    /// - Parameter language: Language code to force decoding into (e.g. "en"). Empty or
+    ///   `nil` leaves WhisperKit's own default in effect.
+    public func loadModel(_ model: String, language: String? = nil) async throws {
         whisperKit = try await WhisperKit(model: model, downloadBase: ConfigLoader.modelCacheURL)
+        self.language = (language?.isEmpty ?? true) ? nil : language
     }
 
     public func transcribe(audioURL: URL, onProgress: (@Sendable (Double) -> Void)?) async throws -> [Segment] {
@@ -30,7 +34,7 @@ public actor WhisperKitTranscriber: TranscriberProtocol {
         let lastReported = LastReportedFraction()
         let results: [TranscriptionResult] = try await wk.transcribe(
             audioPath: audioURL.path,
-            decodeOptions: DecodingOptions(skipSpecialTokens: true),
+            decodeOptions: DecodingOptions(language: language, skipSpecialTokens: true),
             callback: { _ in
                 let fraction = progressBox.fractionCompleted
                 if lastReported.update(to: fraction) {

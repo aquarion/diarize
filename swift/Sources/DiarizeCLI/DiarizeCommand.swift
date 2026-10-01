@@ -56,7 +56,7 @@ struct Transcribe: AsyncParsableCommand {
         // Load models before pipeline so we can report progress accurately
         let transcriber = WhisperKitTranscriber()
         print("==> Loading WhisperKit model: \(cfg.whisperkitModel)")
-        try await transcriber.loadModel(cfg.whisperkitModel)
+        try await transcriber.loadModel(cfg.whisperkitModel, language: cfg.language)
 
         let diarizer = SpeakerKitDiarizer()
         print("==> Loading SpeakerKit model")
