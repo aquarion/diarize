@@ -28,6 +28,17 @@ jobs: dict[str, Job] = {}
 
 LOG_DIR = Path(os.environ.get("DIARIZE_LOG_DIR", user_log_dir("diarize")))
 LOG_FILE = LOG_DIR / "mcp.log"
+
+
+class _ScrubbingFormatter(logging.Formatter):
+    """Log records routinely embed child-process stderr/stdout and exception
+    text, and mcp.log outlives everything else, so scrub the final rendered
+    record (tracebacks included) rather than every call site."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return scrub_secrets(super().format(record))
+
+
 logger = logging.getLogger("diarize.mcp")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
@@ -37,7 +48,7 @@ if not logger.handlers:
             LOG_FILE, maxBytes=5_000_000, backupCount=3
         )
         _handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+            _ScrubbingFormatter("%(asctime)s %(levelname)s %(message)s")
         )
     except OSError:
         # Diagnostic logging must never take down the server - fall back to
@@ -421,13 +432,18 @@ def select_backend(force_python: bool = False) -> tuple[str, list[str]]:
     return "python", [uv_exe, "run", "--directory", str(python_dir), "app.py"]
 
 
-# HuggingFace user access tokens. Defence in depth: the python backend no
-# longer puts the token on the whisperx command line, but any error text that
-# ever does mention one must not leave this process.
+# HuggingFace user access tokens are "hf_" plus ~34 alphanumerics.
 _HF_TOKEN_RE = re.compile(r"hf_[A-Za-z0-9]{30,}")
 
 
 def scrub_secrets(text: str) -> str:
+    """Redact HuggingFace tokens from child-process output and error text.
+
+    Defence in depth only: the python backend no longer puts the token on the
+    whisperx command line, so this is a backstop. It matches the standard
+    token shape and nothing else (not other credentials, e.g. the AssemblyAI
+    key). Applied to the job error/warnings returned to MCP clients and
+    persisted in the registry, and to everything written to mcp.log."""
     return _HF_TOKEN_RE.sub("hf_***", text)
 
 
@@ -448,7 +464,13 @@ def parse_transcript_path(stdout: str, backend: str) -> str | None:
             if "local transcript" in line:
                 m = re.search(r"\x1b\]8;;(file://[^\x1b]+)\x1b\\", line)
                 if m:
-                    return _file_uri_to_path(m.group(1))
+                    try:
+                        return _file_uri_to_path(m.group(1))
+                    except (ValueError, OSError) as e:
+                        # A malformed link must read as "no path found", not
+                        # raise out of the job resolver.
+                        logger.error("bad transcript link %r: %s", m.group(1), e)
+                        return None
     else:
         for line in stdout.splitlines():
             s = line.strip()
@@ -644,7 +666,7 @@ class Job:
                 self.stdout += line
                 stripped = line.strip()
                 if stripped.startswith("==>"):
-                    self.last_message = stripped[3:].strip()
+                    self.last_message = scrub_secrets(stripped[3:].strip())
                     # Every "==>" line is a stage transition in both CLIs'
                     # output convention, so any fraction/stage from the
                     # previous stage no longer applies (e.g. don't keep
@@ -671,7 +693,7 @@ class Job:
                                 self.last_fraction = fraction
                                 self.last_stage = parts[2]
                 elif stripped.startswith("!!"):
-                    self.warnings.append(stripped[2:].strip())
+                    self.warnings.append(scrub_secrets(stripped[2:].strip()))
             self.proc.stdout.close()
             self.proc.wait()
         except Exception as e:

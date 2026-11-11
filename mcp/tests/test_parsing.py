@@ -115,3 +115,27 @@ def test_scrub_secrets_leaves_ordinary_text_alone():
     from server import scrub_secrets
 
     assert scrub_secrets("exit code 1: no such file") == "exit code 1: no such file"
+
+
+def test_parse_python_malformed_uri_returns_none_not_raise(monkeypatch):
+    import server
+
+    def boom(path):
+        raise OSError("Bad URL: " + path)
+
+    monkeypatch.setattr(server, "url2pathname", boom)
+    uri = "file:///C:/x/transcript.md"
+    assert parse_transcript_path(_windows_stdout(uri), "python") is None
+
+
+def test_parse_python_ignores_non_file_hyperlink():
+    uri = "https://example.com/transcript.md"
+    assert parse_transcript_path(_windows_stdout(uri), "python") is None
+
+
+def test_parse_python_localhost_netloc_is_not_unc(monkeypatch):
+    _use_posix_paths(monkeypatch)
+    uri = "file://localhost/tmp/out/transcript.md"
+    assert parse_transcript_path(_windows_stdout(uri), "python") == (
+        "/tmp/out/transcript.md"
+    )

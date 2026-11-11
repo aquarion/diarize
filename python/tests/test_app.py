@@ -434,11 +434,23 @@ def test_allocate_out_dir_rerun_never_reuses_existing_dir(tmp_path):
     assert list(second.iterdir()) == []  # no stale checkpoints inherited
 
 
-def test_allocate_out_dir_skip_whisperx_reuses_latest_existing(tmp_path):
-    app._allocate_out_dir(tmp_path, "rec", "2026-01-01_10-00-00", False)
-    app._allocate_out_dir(tmp_path, "rec", "2026-01-01_10-00-00", False)
-    reused = app._allocate_out_dir(tmp_path, "rec", "2026-01-01_10-00-00", True)
-    assert reused == tmp_path / "rec_2026-01-01_10-00-00-2"
+def test_allocate_out_dir_skip_whisperx_reuses_latest_with_output(tmp_path):
+    stamp = "2026-01-01_10-00-00"
+    for _ in range(3):
+        d = app._allocate_out_dir(tmp_path, "rec", stamp, False)
+        (d / "rec.json").write_text("{}")
+    reused = app._allocate_out_dir(tmp_path, "rec", stamp, True)
+    assert reused == tmp_path / f"rec_{stamp}-3"
+
+
+def test_allocate_out_dir_skip_whisperx_skips_failed_empty_run(tmp_path):
+    # A later run that failed before WhisperX wrote anything must not shadow
+    # the last good run when the user falls back to --skip-whisperx.
+    stamp = "2026-01-01_10-00-00"
+    good = app._allocate_out_dir(tmp_path, "rec", stamp, False)
+    (good / "rec.json").write_text("{}")
+    app._allocate_out_dir(tmp_path, "rec", stamp, False)  # failed, empty
+    assert app._allocate_out_dir(tmp_path, "rec", stamp, True) == good
 
 
 def test_allocate_out_dir_skip_whisperx_with_nothing_existing(tmp_path):
@@ -464,3 +476,61 @@ def test_file_timestamp_prefers_birthtime_then_mtime():
 
     assert app._file_timestamp(St()) == 100.0
     assert app._file_timestamp(NoBirth()) == 200.0
+
+
+# --- run_transcribe output-directory wiring (#64) ---
+
+
+def _run_transcribe_harness(tmp_path, monkeypatch):
+    """Drive the real run_transcribe with only the heavy steps stubbed."""
+    wav = tmp_path / "rec.wav"
+    wav.write_bytes(b"RIFF")
+    out_root = tmp_path / "out"
+    calls = []
+
+    monkeypatch.setattr(
+        app,
+        "prompt_for_required_config",
+        lambda path, data, **kw: {
+            **data,
+            "output_dir": str(out_root),
+            "vault_path": str(tmp_path / "vault"),
+            "hf_token": "tok",
+        },
+    )
+    monkeypatch.setattr(app, "has_video_stream", lambda p: False)
+    monkeypatch.setattr(app, "prompt_for_speakers", lambda det, m, *a, **k: m)
+
+    def fake_whisperx(wav_path, cfg, out_dir):
+        calls.append(out_dir)
+        (out_dir / "rec.json").write_text(
+            json.dumps(
+                {"segments": [{"start": 0, "end": 1, "text": "hi", "speaker": "S0"}]}
+            )
+        )
+
+    monkeypatch.setattr(app, "run_transcription_and_diarization", fake_whisperx)
+
+    def run(*extra):
+        argv = ["prog", str(wav), "2", "--yes", "--config", str(tmp_path / "c.json")]
+        return app.run_transcribe(app.parse_args(argv + list(extra)))
+
+    return run, out_root, calls
+
+
+def test_run_transcribe_reruns_get_distinct_dirs_and_skip_reuses_latest(
+    tmp_path, monkeypatch
+):
+    run, out_root, calls = _run_transcribe_harness(tmp_path, monkeypatch)
+
+    assert run() == 0
+    assert run() == 0
+    first, second = calls
+    assert first != second
+    assert (first / "transcript.md").exists() and (second / "transcript.md").exists()
+
+    (second / "transcript.md").unlink()
+    assert run("--skip-whisperx") == 0
+    assert len(calls) == 2  # whisperx was not run again
+    assert (second / "transcript.md").exists()  # relabelled the latest dir
+    assert len(list(out_root.iterdir())) == 2  # and made no new directory

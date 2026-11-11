@@ -237,16 +237,22 @@ def _allocate_out_dir(
     of that file. A fresh run must never write into an earlier run's directory
     - that silently overwrites its outputs and resumes from its stale
     checkpoints - so it gets the next free "-N" suffix instead. A run that is
-    relabelling existing output (--skip-whisperx) reuses the latest one."""
+    relabelling existing output (--skip-whisperx) reuses the latest directory
+    that holds WhisperX output."""
     first = base_out_dir / f"{stem}_{stamp}"
     if reuse_existing:
-        latest = first
+        # A run that failed part-way leaves an empty or partial directory
+        # behind, so relabel the latest one that actually has WhisperX
+        # output, not merely the highest-numbered.
+        existing = [first]
         n = 2
         while (candidate := base_out_dir / f"{first.name}-{n}").exists():
-            latest = candidate
+            existing.append(candidate)
             n += 1
-        latest.mkdir(parents=True, exist_ok=True)
-        return latest
+        with_output = [d for d in existing if (d / f"{stem}.json").is_file()]
+        chosen = with_output[-1] if with_output else first
+        chosen.mkdir(parents=True, exist_ok=True)
+        return chosen
     base_out_dir.mkdir(parents=True, exist_ok=True)
     candidate = first
     n = 2
@@ -291,6 +297,7 @@ def run_transcribe(args: argparse.Namespace) -> int:
     out_dir = _allocate_out_dir(
         base_out_dir, wav_path.stem, ctime_str, reuse_existing=args.skip_whisperx
     )
+    print(f"==> Output directory: {out_dir}")
     speakers_path = out_dir / Path(cfg.speakers_file).name
     whisper_json = out_dir / f"{wav_path.stem}.json"
 

@@ -170,9 +170,14 @@ def _build_whisperx_cmd(
 def _whisperx_env(cfg: AppConfig) -> dict[str, str]:
     """Environment for the whisperx child process. The HuggingFace token goes
     here rather than on the command line: a failing run's CalledProcessError
-    (and our own "command:" echo) stringify the full argv, which would leak
-    the token to whoever reads the job's error or stdout."""
-    return {**os.environ, "HF_TOKEN": cfg.hf_token}
+    (and our own command echo) stringify the full argv, which would leak the
+    token to whoever reads the job's error or stdout. whisperx hands no token
+    to huggingface_hub when --hf_token is absent, and huggingface_hub reads
+    HF_TOKEN from the environment."""
+    env = dict(os.environ)
+    if cfg.hf_token:
+        env["HF_TOKEN"] = cfg.hf_token
+    return env
 
 
 # whisperx's own --print_progress output looks like "Progress: 42.00%..."

@@ -173,8 +173,9 @@ is named with the file's creation time (falling back to its modification
 time) to avoid collisions when the same filename is reused (e.g. SuperWhisper
 always outputs `output.wav`). Re-running the same file never overwrites an
 earlier run: it gets the next free suffix (`..._14-30-00-2`, `-3`, ...) and
-starts from scratch, so checkpoints from a previous run are not picked up.
-`--skip-whisperx` relabels the most recent run's directory instead:
+starts from scratch, so neither its resume checkpoints nor its saved
+`speakers.json` are picked up. `--skip-whisperx` instead relabels the most
+recent run's directory that has WhisperX output. Layout of one run:
 
 ```text
 ./out/my_audio_2026-06-02_14-30-00/
