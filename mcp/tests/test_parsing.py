@@ -1,4 +1,15 @@
+from urllib.parse import unquote
+
 from server import parse_transcript_path
+
+
+def _use_posix_paths(monkeypatch):
+    """Pin URI->path conversion to POSIX rules so these tests mean the same
+    thing on every OS (on Windows it would otherwise yield backslashes)."""
+    import server
+
+    monkeypatch.setattr(server, "url2pathname", unquote)
+
 
 SWIFT_STDOUT = """\
 ==> Loading WhisperKit model: openai_whisper-large-v3-turbo
@@ -25,7 +36,8 @@ def test_parse_swift_stdout():
     assert path == "/tmp/out/audio_2026-06-29_10-00-00/transcript.md"
 
 
-def test_parse_python_stdout():
+def test_parse_python_stdout(monkeypatch):
+    _use_posix_paths(monkeypatch)
     path = parse_transcript_path(PYTHON_STDOUT, "python")
     assert path == "/tmp/out/audio_2026-06-29_10-00-00/transcript.md"
 
@@ -77,7 +89,8 @@ def test_parse_python_windows_unc_uri(monkeypatch):
     )
 
 
-def test_parse_python_posix_uri_with_spaces():
+def test_parse_python_posix_uri_with_spaces(monkeypatch):
+    _use_posix_paths(monkeypatch)
     uri = "file:///tmp/my%20out/transcript.md"
     assert (
         parse_transcript_path(_windows_stdout(uri), "python")
