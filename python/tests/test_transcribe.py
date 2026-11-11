@@ -75,7 +75,8 @@ def test_build_whisperx_cmd_includes_expected_flags(tmp_path):
     assert "--model" in cmd and cmd[cmd.index("--model") + 1] == "large-v3"
     assert "--language" in cmd and cmd[cmd.index("--language") + 1] == "fr"
     assert "--diarize" in cmd
-    assert "--hf_token" in cmd and cmd[cmd.index("--hf_token") + 1] == "tok"
+    assert "--hf_token" not in cmd
+    assert "tok" not in cmd
     assert "--min_speakers" in cmd and cmd[cmd.index("--min_speakers") + 1] == "3"
     assert "--max_speakers" in cmd and cmd[cmd.index("--max_speakers") + 1] == "3"
     assert "--compute_type" in cmd and cmd[cmd.index("--compute_type") + 1] == "int8"
@@ -901,3 +902,87 @@ def test_run_aws_transcribe_pipeline_warns_when_speaker_labels_are_empty(
     transcribe.run_aws_transcribe_pipeline(wav_path, cfg, out_dir)
 
     assert "no speaker labels" in capsys.readouterr().err
+
+
+# --- HF token must never appear in argv or output (#63) ---
+
+
+def test_build_whisperx_cmd_has_no_token_even_as_substring(tmp_path):
+    cmd = transcribe._build_whisperx_cmd(
+        tmp_path / "a.wav", _cfg(hf_token="hf_SECRET"), tmp_path, "int8", None
+    )
+    assert not any("hf_SECRET" in part for part in cmd)
+    assert not any("hf_token" in part for part in cmd)
+
+
+def test_whisperx_env_adds_token_and_keeps_environment(monkeypatch):
+    monkeypatch.setenv("SOME_VAR", "kept")
+    env = transcribe._whisperx_env(_cfg(hf_token="tok"))
+    assert env["HF_TOKEN"] == "tok"
+    assert env["SOME_VAR"] == "kept"
+
+
+def test_whisperx_env_empty_token_does_not_blank_existing(monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "from-env")
+    env = transcribe._whisperx_env(_cfg(hf_token=""))
+    assert env["HF_TOKEN"] == "from-env"
+
+
+def test_run_whisperx_subprocess_passes_env_not_token_in_argv(monkeypatch):
+    seen = {}
+
+    class _Stdout:
+        def __iter__(self):
+            return iter([])
+
+        def close(self):
+            pass
+
+    class _Proc:
+        stdout = _Stdout()
+
+        def wait(self):
+            return 0
+
+    def fake_popen(cmd, **kw):
+        seen["cmd"], seen["env"] = cmd, kw.get("env")
+        return _Proc()
+
+    monkeypatch.setattr(transcribe.subprocess, "Popen", fake_popen)
+    transcribe._run_whisperx_subprocess(["whisperx", "a.wav"], {"HF_TOKEN": "tok"})
+    assert seen["env"] == {"HF_TOKEN": "tok"}
+
+
+def test_run_whisperx_passes_token_env_and_hides_it_from_echo(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        transcribe, "resolve_whisperx_runtime", lambda cfg: (None, "int8")
+    )
+    with patch("transcribe._run_whisperx_subprocess") as mock_run:
+        transcribe.run_whisperx(
+            tmp_path / "a.wav", _cfg(hf_token="hf_SECRET"), tmp_path / "out"
+        )
+    cmd, env = mock_run.call_args[0]
+    assert env["HF_TOKEN"] == "hf_SECRET"
+    assert not any("hf_SECRET" in part for part in cmd)
+    assert "hf_SECRET" not in capsys.readouterr().out
+
+
+def test_run_whisperx_cpu_fallback_keeps_token_env_and_hides_it(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        transcribe, "resolve_whisperx_runtime", lambda cfg: ("cuda", "float16")
+    )
+    fail = subprocess.CalledProcessError(returncode=1, cmd="whisperx")
+    with patch("transcribe._run_whisperx_subprocess") as mock_run:
+        mock_run.side_effect = [fail, None]
+        transcribe.run_whisperx(
+            tmp_path / "a.wav", _cfg(hf_token="hf_SECRET"), tmp_path / "out"
+        )
+    for call in mock_run.call_args_list:
+        cmd, env = call[0]
+        assert env["HF_TOKEN"] == "hf_SECRET"
+        assert not any("hf_SECRET" in part for part in cmd)
+    assert "hf_SECRET" not in capsys.readouterr().out

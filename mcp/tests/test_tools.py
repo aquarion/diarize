@@ -2446,3 +2446,76 @@ def test_collector_error_kills_still_running_process(monkeypatch):
         # The whole process group is signalled (not just proc.pid) so the
         # real worker survives no orphaning when proc is the `uv run` wrapper.
         mock_killpg.assert_called_once_with(4242, 9)
+
+
+# --- HuggingFace token scrubbing (#63) ---
+
+_FAKE_HF_TOKEN = "hf_" + "Zy9Xw8Vu7T" * 4
+
+
+def test_get_transcript_failed_scrubs_token_from_stderr_and_registry():
+    stderr = (
+        f"CalledProcessError: Command '['whisperx', '--hf_token', "
+        f"'{_FAKE_HF_TOKEN}']' returned non-zero exit status 1.\n"
+    ).encode()
+    proc = _make_proc(b"", stderr, 1)
+    job = server.Job(proc=proc, backend="python", job_id="leak-id")
+    server.jobs["leak-id"] = job
+    _wait(job)
+
+    result = server.get_transcript("leak-id")
+    assert result["status"] == "failed"
+    assert _FAKE_HF_TOKEN not in result["error"]
+    assert "whisperx" in result["error"]
+
+    record = _wait_for_terminal_record("leak-id")
+    assert _FAKE_HF_TOKEN not in json.dumps(record)
+
+
+def test_get_transcript_scrubs_token_from_unreadable_output_error(tmp_path):
+    missing = tmp_path / f"{_FAKE_HF_TOKEN}" / "gone.md"
+    proc = _make_proc(f"    local       : {missing}\n".encode(), b"", 0)
+    job = server.Job(proc=proc, backend="swift", job_id="leak2-id")
+    server.jobs["leak2-id"] = job
+    _wait(job)
+
+    result = server.get_transcript("leak2-id")
+    assert result["status"] == "failed"
+    assert _FAKE_HF_TOKEN not in result["error"]
+
+
+def test_job_warnings_and_message_are_scrubbed():
+    out = (
+        f"!! warning mentioning {_FAKE_HF_TOKEN}\n"
+        f"==> status {_FAKE_HF_TOKEN}\n"
+    ).encode()
+    proc = _make_proc(out, b"", 1)
+    job = server.Job(proc=proc, backend="python", job_id="leak3-id")
+    server.jobs["leak3-id"] = job
+    _wait(job)
+
+    assert job.warnings and all(_FAKE_HF_TOKEN not in w for w in job.warnings)
+    assert _FAKE_HF_TOKEN not in job.last_message
+
+
+def test_log_file_scrubs_token(tmp_path):
+    import logging
+
+    log_path = tmp_path / "t.log"
+    handler = logging.FileHandler(log_path)
+    handler.setFormatter(server._ScrubbingFormatter("%(levelname)s %(message)s"))
+    lg = logging.getLogger("diarize.test-scrub")
+    lg.addHandler(handler)
+    lg.propagate = False
+    try:
+        lg.error("stderr:\n%s", f"boom {_FAKE_HF_TOKEN}")
+        try:
+            raise RuntimeError(f"bad {_FAKE_HF_TOKEN}")
+        except RuntimeError:
+            lg.exception("with traceback")
+    finally:
+        handler.close()
+        lg.removeHandler(handler)
+    text = log_path.read_text()
+    assert _FAKE_HF_TOKEN not in text
+    assert "boom" in text and "RuntimeError" in text
