@@ -221,6 +221,44 @@ def run_config_command(args: argparse.Namespace) -> int:
     return handlers[args.config_command](args)
 
 
+def _file_timestamp(st: os.stat_result) -> float:
+    """When the input file was created, falling back to mtime. st_ctime is
+    deliberately not the fallback: on Linux it is the inode *change* time, so
+    a chmod or move would rename the output directory."""
+    return getattr(st, "st_birthtime", st.st_mtime)
+
+
+def _allocate_out_dir(
+    base_out_dir: Path, stem: str, stamp: str, reuse_existing: bool
+) -> Path:
+    """Pick (and create) this run's output directory.
+
+    The name is derived from the input file, so it is the same for every run
+    of that file. A fresh run must never write into an earlier run's directory
+    - that silently overwrites its outputs and resumes from its stale
+    checkpoints - so it gets the next free "-N" suffix instead. A run that is
+    relabelling existing output (--skip-whisperx) reuses the latest one."""
+    first = base_out_dir / f"{stem}_{stamp}"
+    if reuse_existing:
+        latest = first
+        n = 2
+        while (candidate := base_out_dir / f"{first.name}-{n}").exists():
+            latest = candidate
+            n += 1
+        latest.mkdir(parents=True, exist_ok=True)
+        return latest
+    base_out_dir.mkdir(parents=True, exist_ok=True)
+    candidate = first
+    n = 2
+    while True:
+        try:
+            candidate.mkdir()
+            return candidate
+        except FileExistsError:
+            candidate = base_out_dir / f"{first.name}-{n}"
+            n += 1
+
+
 def run_transcribe(args: argparse.Namespace) -> int:
     cfg_path = _resolve_path(HERE, args.config)
     ensure_default_config(cfg_path)
@@ -248,12 +286,11 @@ def run_transcribe(args: argparse.Namespace) -> int:
         return 2
 
     base_out_dir = _resolve_path(HERE, cfg.output_dir)
-    wav_stat = wav_path.stat()
-    ctime = getattr(wav_stat, "st_birthtime", wav_stat.st_ctime)
-    ctime_dt = dt.datetime.fromtimestamp(ctime)
+    ctime_dt = dt.datetime.fromtimestamp(_file_timestamp(wav_path.stat()))
     ctime_str = ctime_dt.strftime("%Y-%m-%d_%H-%M-%S")
-    out_dir = base_out_dir / f"{wav_path.stem}_{ctime_str}"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = _allocate_out_dir(
+        base_out_dir, wav_path.stem, ctime_str, reuse_existing=args.skip_whisperx
+    )
     speakers_path = out_dir / Path(cfg.speakers_file).name
     whisper_json = out_dir / f"{wav_path.stem}.json"
 

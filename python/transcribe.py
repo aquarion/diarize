@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import platform
 import re
 import subprocess
@@ -146,8 +147,6 @@ def _build_whisperx_cmd(
         "--language",
         cfg.language,
         "--diarize",
-        "--hf_token",
-        cfg.hf_token,
         "--min_speakers",
         str(cfg.num_speakers),
         "--max_speakers",
@@ -168,17 +167,32 @@ def _build_whisperx_cmd(
     return cmd
 
 
+def _whisperx_env(cfg: AppConfig) -> dict[str, str]:
+    """Environment for the whisperx child process. The HuggingFace token goes
+    here rather than on the command line: a failing run's CalledProcessError
+    (and our own "command:" echo) stringify the full argv, which would leak
+    the token to whoever reads the job's error or stdout."""
+    return {**os.environ, "HF_TOKEN": cfg.hf_token}
+
+
 # whisperx's own --print_progress output looks like "Progress: 42.00%..."
 _WHISPERX_PROGRESS_RE = re.compile(r"^Progress:\s*([\d.]+)%")
 
 
-def _run_whisperx_subprocess(cmd: list[str]) -> None:
+def _run_whisperx_subprocess(
+    cmd: list[str], env: dict[str, str] | None = None
+) -> None:
     """Runs a whisperx command, relaying its stdout live while translating its
     own "Progress: NN.NN%..." lines (from --print_progress) into the
     "progress:<fraction>:<stage>" lines the MCP server parses - the same
     format the mlx-whisper and Swift/WhisperKit backends emit."""
     proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, text=True, bufsize=1, errors="replace"
+        cmd,
+        stdout=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        errors="replace",
+        env=env,
     )
     assert proc.stdout is not None
     # whisperx (when run with --diarize, as we always do) runs transcription
@@ -212,8 +226,9 @@ def run_whisperx(wav_path: Path, cfg: AppConfig, out_dir: Path) -> None:
     print("==> Running WhisperX")
     print(f"    runtime: device={device or 'cpu'} compute_type={compute_type}")
     print("    command:", " ".join(cmd))
+    env = _whisperx_env(cfg)
     try:
-        _run_whisperx_subprocess(cmd)
+        _run_whisperx_subprocess(cmd, env)
     except subprocess.CalledProcessError:
         if device == "cuda":
             print("!! CUDA WhisperX run failed; retrying on CPU.")
@@ -225,7 +240,7 @@ def run_whisperx(wav_path: Path, cfg: AppConfig, out_dir: Path) -> None:
                 None,
             )
             print("    fallback command:", " ".join(fallback_cmd))
-            _run_whisperx_subprocess(fallback_cmd)
+            _run_whisperx_subprocess(fallback_cmd, env)
             return
         raise
 

@@ -169,8 +169,12 @@ uv run app.py /path/to/audio.wav 3 --vault-output ~/Obsidian/Meetings/standup.md
 ## Output Layout
 
 For input `my_audio.wav` and default `output_dir` of `./out`, the directory
-is named with the file's creation time to avoid collisions when the same
-filename is reused (e.g. SuperWhisper always outputs `output.wav`):
+is named with the file's creation time (falling back to its modification
+time) to avoid collisions when the same filename is reused (e.g. SuperWhisper
+always outputs `output.wav`). Re-running the same file never overwrites an
+earlier run: it gets the next free suffix (`..._14-30-00-2`, `-3`, ...) and
+starts from scratch, so checkpoints from a previous run are not picked up.
+`--skip-whisperx` relabels the most recent run's directory instead:
 
 ```text
 ./out/my_audio_2026-06-02_14-30-00/

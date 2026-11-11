@@ -15,7 +15,8 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 from platformdirs import user_log_dir
 
@@ -420,14 +421,34 @@ def select_backend(force_python: bool = False) -> tuple[str, list[str]]:
     return "python", [uv_exe, "run", "--directory", str(python_dir), "app.py"]
 
 
+# HuggingFace user access tokens. Defence in depth: the python backend no
+# longer puts the token on the whisperx command line, but any error text that
+# ever does mention one must not leave this process.
+_HF_TOKEN_RE = re.compile(r"hf_[A-Za-z0-9]{30,}")
+
+
+def scrub_secrets(text: str) -> str:
+    return _HF_TOKEN_RE.sub("hf_***", text)
+
+
+def _file_uri_to_path(uri: str) -> str:
+    """Convert a file:// URI to a native path. Stripping the scheme is not
+    enough: on Windows file:///C:/x gives "/C:/x", which isn't a valid path."""
+    parsed = urlparse(uri)
+    path = parsed.path
+    if parsed.netloc and parsed.netloc != "localhost":
+        path = f"//{parsed.netloc}{path}"  # UNC share
+    return url2pathname(path)
+
+
 def parse_transcript_path(stdout: str, backend: str) -> str | None:
     """Extract the absolute local transcript path from CLI stdout."""
     if backend == "python":
         for line in stdout.splitlines():
             if "local transcript" in line:
-                m = re.search(r"\x1b\]8;;file://([^\x1b]+)\x1b\\", line)
+                m = re.search(r"\x1b\]8;;(file://[^\x1b]+)\x1b\\", line)
                 if m:
-                    return unquote(m.group(1))
+                    return _file_uri_to_path(m.group(1))
     else:
         for line in stdout.splitlines():
             s = line.strip()
@@ -952,7 +973,7 @@ def _resolve_job_outcome(job: Job) -> dict:
         )
         return {
             "status": "failed",
-            "error": job.stderr or f"exit code {job.proc.returncode}",
+            "error": scrub_secrets(job.stderr or f"exit code {job.proc.returncode}"),
         }
     if job.output_path_override is not None:
         # The backend was told exactly where to write via --vault-output, so
@@ -985,7 +1006,7 @@ def _resolve_job_outcome(job: Job) -> dict:
         # that record, so registry-only readers (list_jobs, a restart) would
         # see a permanently wrong "done" no live poll ever actually returned.
         logger.error("job %s: transcript at %s is not readable: %s", job_id, path, e)
-        return {"status": "failed", "error": str(e)}
+        return {"status": "failed", "error": scrub_secrets(str(e))}
     outcome: dict = {"status": "done", "output_path": path}
     if job.warnings:
         outcome["warnings"] = list(job.warnings)

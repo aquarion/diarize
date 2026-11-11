@@ -411,3 +411,56 @@ def test_main_dispatches_transcribe_by_default(monkeypatch):
 
     assert exit_code == 0
     assert called == {"transcribe": True}
+
+
+# --- _allocate_out_dir (#64) ---
+
+
+def test_allocate_out_dir_fresh_run_uses_plain_name(tmp_path):
+    out = app._allocate_out_dir(tmp_path, "rec", "2026-01-01_10-00-00", False)
+    assert out == tmp_path / "rec_2026-01-01_10-00-00"
+    assert out.is_dir()
+
+
+def test_allocate_out_dir_rerun_never_reuses_existing_dir(tmp_path):
+    first = app._allocate_out_dir(tmp_path, "rec", "2026-01-01_10-00-00", False)
+    (first / "transcript.md").write_text("first")
+    (first / "rec_transcription.json").write_text("{}")
+    second = app._allocate_out_dir(tmp_path, "rec", "2026-01-01_10-00-00", False)
+    third = app._allocate_out_dir(tmp_path, "rec", "2026-01-01_10-00-00", False)
+    assert second == tmp_path / "rec_2026-01-01_10-00-00-2"
+    assert third == tmp_path / "rec_2026-01-01_10-00-00-3"
+    assert (first / "transcript.md").read_text() == "first"
+    assert list(second.iterdir()) == []  # no stale checkpoints inherited
+
+
+def test_allocate_out_dir_skip_whisperx_reuses_latest_existing(tmp_path):
+    app._allocate_out_dir(tmp_path, "rec", "2026-01-01_10-00-00", False)
+    app._allocate_out_dir(tmp_path, "rec", "2026-01-01_10-00-00", False)
+    reused = app._allocate_out_dir(tmp_path, "rec", "2026-01-01_10-00-00", True)
+    assert reused == tmp_path / "rec_2026-01-01_10-00-00-2"
+
+
+def test_allocate_out_dir_skip_whisperx_with_nothing_existing(tmp_path):
+    out = app._allocate_out_dir(tmp_path, "rec", "2026-01-01_10-00-00", True)
+    assert out == tmp_path / "rec_2026-01-01_10-00-00"
+
+
+def test_allocate_out_dir_suffix_not_confused_by_other_stems(tmp_path):
+    (tmp_path / "rec_2026-01-01_10-00-00-extra").mkdir()
+    out = app._allocate_out_dir(tmp_path, "rec", "2026-01-01_10-00-00", True)
+    assert out == tmp_path / "rec_2026-01-01_10-00-00"
+
+
+def test_file_timestamp_prefers_birthtime_then_mtime():
+    class St:
+        st_birthtime = 100.0
+        st_mtime = 200.0
+        st_ctime = 300.0
+
+    class NoBirth:
+        st_mtime = 200.0
+        st_ctime = 300.0
+
+    assert app._file_timestamp(St()) == 100.0
+    assert app._file_timestamp(NoBirth()) == 200.0

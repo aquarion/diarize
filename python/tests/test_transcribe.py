@@ -75,7 +75,8 @@ def test_build_whisperx_cmd_includes_expected_flags(tmp_path):
     assert "--model" in cmd and cmd[cmd.index("--model") + 1] == "large-v3"
     assert "--language" in cmd and cmd[cmd.index("--language") + 1] == "fr"
     assert "--diarize" in cmd
-    assert "--hf_token" in cmd and cmd[cmd.index("--hf_token") + 1] == "tok"
+    assert "--hf_token" not in cmd
+    assert "tok" not in cmd
     assert "--min_speakers" in cmd and cmd[cmd.index("--min_speakers") + 1] == "3"
     assert "--max_speakers" in cmd and cmd[cmd.index("--max_speakers") + 1] == "3"
     assert "--compute_type" in cmd and cmd[cmd.index("--compute_type") + 1] == "int8"
@@ -901,3 +902,56 @@ def test_run_aws_transcribe_pipeline_warns_when_speaker_labels_are_empty(
     transcribe.run_aws_transcribe_pipeline(wav_path, cfg, out_dir)
 
     assert "no speaker labels" in capsys.readouterr().err
+
+
+# --- HF token must never appear in argv or error text (#63) ---
+
+
+def test_whisperx_env_carries_token_not_argv(tmp_path, monkeypatch):
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    env = transcribe._whisperx_env(_cfg())
+    assert env["HF_TOKEN"] == "tok"
+
+
+def test_run_whisperx_subprocess_passes_token_via_env(monkeypatch):
+    seen = {}
+
+    class FakeProc:
+        stdout = iter([])
+        returncode = 0
+
+        def __init__(self):
+            self.stdout = type(
+                "S", (), {"__iter__": lambda s: iter([]), "close": lambda s: None}
+            )()
+
+        def wait(self):
+            return 0
+
+    def fake_popen(cmd, **kw):
+        seen["cmd"], seen["env"] = cmd, kw.get("env")
+        return FakeProc()
+
+    monkeypatch.setattr(transcribe.subprocess, "Popen", fake_popen)
+    transcribe._run_whisperx_subprocess(["whisperx", "a.wav"], {"HF_TOKEN": "tok"})
+    assert seen["env"] == {"HF_TOKEN": "tok"}
+    assert "tok" not in " ".join(seen["cmd"])
+
+
+def test_run_whisperx_output_and_error_do_not_contain_token(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        transcribe, "resolve_whisperx_runtime", lambda cfg: ("cuda", "float16")
+    )
+
+    def boom(cmd, env=None):
+        raise subprocess.CalledProcessError(returncode=1, cmd=cmd)
+
+    with patch("transcribe._run_whisperx_subprocess", side_effect=boom):
+        with pytest.raises(subprocess.CalledProcessError) as ei:
+            transcribe.run_whisperx(
+                tmp_path / "a.wav", _cfg(hf_token="hf_SECRET"), tmp_path
+            )
+    assert "hf_SECRET" not in str(ei.value)
+    assert "hf_SECRET" not in capsys.readouterr().out
